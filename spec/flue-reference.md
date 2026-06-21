@@ -77,6 +77,28 @@ names):**
   layers on top) — directly answers design **Q0.1**.
 - **Routing:** `@flue/runtime/routing` exports exactly `flue`. Mount with
   `app.route('/', flue())`.
+- **Inspection primitives (re-verified 2026-06-21, types + runtime).** From
+  `@flue/runtime`: `listRuns(opts?: ListRunsOpts): Promise<ListRunsResponse>`,
+  `getRun(runId): Promise<RunRecord|null>`, `listAgents():
+  Promise<AgentManifestEntry[]>`. Exact installed shapes (`dist/*.d.mts`):
+  - `ListRunsOpts = { status?: 'active'|'completed'|'errored'; workflowName?;
+    limit?; cursor? }`; `ListRunsResponse = { runs: RunPointer[]; nextCursor? }`.
+  - `RunPointer = { runId; workflowName; status; startedAt; endedAt?;
+    durationMs?; isError? }` — **blob-free** (no payload/result/error). Backs the
+    list path natively (the "list excludes blobs" invariant).
+  - `RunRecord = RunPointer-fields + payload?; result?; error? }`. ⚠ **The blob
+    field is `payload`, NOT `input`** — the data-persistence-api.md *prose* says
+    "input" but the installed TYPE is `payload`. `RunStatus = 'active' |
+    'completed' | 'errored'` (3 values, not the dashboard's 5).
+  - `AgentManifestEntry = { name; description?; transports: { http?: true };
+    created: boolean }` (NOT `defined` as some prose says — it's `created`).
+  - **⚠ All three THROW `"[flue] <fn>() called before runtime was configured…
+    used outside a Flue-built server entry"` when called in-process** (verified
+    via `tsx`), exactly like `flue()` routes. So admin routes that use them must
+    inject them behind a seam (`RunsReader` in `src/admin/runs-reader.ts`) to
+    stay offline-testable; the live wiring passes them through in `app.ts`'s
+    default export and the throw can only surface at request time inside the
+    built server.
 - **Tool:** `@flue/runtime/tool` exports exactly `defineTool` (also re-exported
   from `.`).
 - **CLI (`flue`, verified `--help`):** `dev | run | connect | build | init | add |

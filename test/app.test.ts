@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import type {
+  ListRunsResponse,
+  RunRecord,
+  AgentManifestEntry,
+} from '@flue/runtime';
 import { createApp, healthBody, authRequiredBody } from '../src/app.ts';
+import type { RunsReader } from '../src/admin/runs-reader.ts';
 
 // Phase 2 · slice 1 — contract tests for the APPLICATION-OWNED server surface.
 //
@@ -51,8 +57,13 @@ describe('app-owned surface (createApp, in-process)', () => {
     }
   });
 
-  it('not-yet-ported admin data routes return 501', async () => {
-    for (const path of ['/admin/api/runs', '/admin/api/agents', '/admin/api/stats']) {
+  it('admin data routes 501 with NO reader injected (honest, not fake)', async () => {
+    // createApp() with no opts → admin data routes are not backed; they 501.
+    for (const path of [
+      '/admin/api/runs',
+      '/admin/api/workflow-runs',
+      '/admin/api/agents',
+    ]) {
       const res = await app.request(path);
       expect(res.status).toBe(501);
       const body = (await res.json()) as Record<string, unknown>;
@@ -60,9 +71,144 @@ describe('app-owned surface (createApp, in-process)', () => {
     }
   });
 
+  it('genuinely-Phase-7 admin routes stay 501 (stats/sessions/approvals)', async () => {
+    for (const path of ['/admin/api/stats', '/admin/api/sessions', '/admin/api/approvals']) {
+      const res = await app.request(path);
+      expect(res.status).toBe(501);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body.error).toBe('not_implemented');
+      expect(body.slice).toBe('phase-7');
+    }
+  });
+
   it('unknown route → 404 (Hono default, no flue() mounted)', async () => {
     const res = await app.request('/no-such-route');
     expect(res.status).toBe(404);
+  });
+});
+
+// ── Admin reads backed by an INJECTED fake RunsReader (no live Flue runtime) ──
+// The real listRuns/getRun/listAgents throw "runtime not configured" outside a
+// built server; injecting a fake exercises the routes + the shape mapping fully
+// offline. Asserts status + mapped shape + 404 for a missing run.
+describe('admin reads with injected RunsReader (offline)', () => {
+  const sampleRuns: ListRunsResponse = {
+    runs: [
+      {
+        runId: 'run_a',
+        workflowName: 'build',
+        status: 'active',
+        startedAt: '2026-06-21T10:00:00.000Z',
+      },
+      {
+        runId: 'run_b',
+        workflowName: 'pr-review',
+        status: 'completed',
+        startedAt: '2026-06-21T09:00:00.000Z',
+        endedAt: '2026-06-21T09:05:00.000Z',
+        durationMs: 300000,
+        isError: false,
+      },
+    ],
+    nextCursor: 'cur_next',
+  };
+  const sampleRecord: RunRecord = {
+    runId: 'run_a',
+    workflowName: 'build',
+    status: 'active',
+    startedAt: '2026-06-21T10:00:00.000Z',
+    payload: { repo: 'owner/repo', issue: 7 },
+  };
+  const sampleAgents: AgentManifestEntry[] = [
+    { name: 'hello', transports: { http: true }, created: true },
+  ];
+
+  function makeApp(overrides: Partial<RunsReader> = {}) {
+    const reader: RunsReader = {
+      listRuns: async () => sampleRuns,
+      getRun: async (id) => (id === 'run_a' ? sampleRecord : null),
+      listAgents: async () => sampleAgents,
+      ...overrides,
+    };
+    return { app: createApp({ runsReader: reader }), reader };
+  }
+
+  it('GET /admin/api/workflow-runs → 200 mapped { workflowRuns, total, nextCursor }', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/workflow-runs');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      workflowRuns: Array<Record<string, unknown>>;
+      total: number;
+      nextCursor: string | null;
+    };
+    expect(body.total).toBe(2);
+    expect(body.nextCursor).toBe('cur_next');
+    expect(body.workflowRuns[0]!.id).toBe('run_a'); // runId → id
+    expect(body.workflowRuns[0]!.status).toBe('running'); // active → running
+    expect(body.workflowRuns[1]!.status).toBe('succeeded'); // completed → succeeded
+    // blob-free: no payload/result/error on list rows
+    expect('payload' in body.workflowRuns[0]!).toBe(false);
+    // explicit Phase-7 nulls, not fabricated
+    expect(body.workflowRuns[0]!.currentPhase).toBeNull();
+  });
+
+  it('GET /admin/api/runs is an alias for the same list', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/runs');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { workflowRuns: unknown[] };
+    expect(body.workflowRuns).toHaveLength(2);
+  });
+
+  it('passes limit/workflow/status filters through to listRuns', async () => {
+    let seen: unknown;
+    const { app } = makeApp({
+      listRuns: async (opts) => {
+        seen = opts;
+        return { runs: [] };
+      },
+    });
+    await app.request('/admin/api/workflow-runs?limit=5&workflow=build&status=running');
+    expect(seen).toEqual({
+      limit: 5,
+      workflowName: 'build',
+      status: 'active', // dashboard 'running' → Flue 'active'
+      cursor: undefined,
+    });
+  });
+
+  it('GET /admin/api/workflow-runs/:id → 200 detail with blobs', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/workflow-runs/run_a');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { workflowRun: Record<string, unknown> };
+    expect(body.workflowRun.id).toBe('run_a');
+    expect(body.workflowRun.payload).toEqual({ repo: 'owner/repo', issue: 7 });
+  });
+
+  it('GET /admin/api/runs/:id missing → 404', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/runs/nope');
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('workflow run not found');
+  });
+
+  it('GET /admin/api/agents → 200 mapped agents', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/agents');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { agents: Array<Record<string, unknown>> };
+    expect(body.agents).toEqual([
+      { name: 'hello', description: null, http: true, created: true },
+    ]);
+  });
+
+  it('auth-required stays mounted (unauthenticated) even with a reader', async () => {
+    const { app } = makeApp();
+    const res = await app.request('/admin/api/auth-required');
+    expect(res.status).toBe(200);
   });
 });
 

@@ -16,13 +16,83 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
   Phase 0 ✅ (hard gate cleared).
-- **Slice (this iteration — slice 1, FOUNDATION ✅):** expanded `src/app.ts` into
-  the real composition shape + resolved the shutdown/signal open question. →
-  **NEXT: Phase 2 slice 2 — custom Node entry (`src/server.ts`) owning
-  `serve()`/listen/signal traps for app-owned graceful shutdown** (crons.stop()
-  + drain), since the Flue-generated entry owns the SIGINT/SIGTERM traps (see
-  finding below). Then trigger routes (`/api/run|build|chat` → invoke/dispatch)
-  + thin `/admin/api/*` over listRuns/getRun/listAgents + CLI port + crons.
+- **Slice (this iteration — slice 2, THIN ADMIN READ PASS-THROUGH ✅):**
+  implemented the thin `/admin/api/*` READ routes over Flue's
+  `listRuns`/`getRun`/`listAgents` behind an injectable `RunsReader` seam
+  (`src/admin/runs-reader.ts`) + pure shape adapters, replacing the runs/
+  workflow-runs/agents 501 stubs. → **NEXT: Phase 2 slice 3 — operator-auth
+  middleware** (`requireOperator` on the `/admin/api/*` seam already left in
+  `app.ts`; ports the reference HMAC token scheme from `~/work/lastlight/src/
+  admin/auth.ts`, keeping `auth-required` unauthenticated), then the CLI port
+  (`src/cli.ts`), then the custom Node entry (`src/server.ts`, see slice-1
+  shutdown finding) + crons + trigger routes (BLOCKED on Phase 3 — see below).
+
+### Phase 2 · slice 2 — thin `/admin/api/*` read pass-through ✅
+- **Built:** `src/admin/runs-reader.ts` — the Flue-data **`RunsReader` seam**
+  (`{ listRuns, getRun, listAgents }`, signatures mirroring `@flue/runtime`) +
+  **pure shape adapters** `toRunSummary`/`toRunDetail`/`toAgentSummary` +
+  `mapRunStatus`. `createApp(opts?: { runsReader? })` now mounts the admin DATA
+  reads when a reader is injected; the **default export wires the REAL Flue free
+  functions** (`{ listRuns, getRun, listAgents }`) — passed through, NOT invoked
+  at import. **Routes implemented (replacing 501 stubs):**
+  - `GET /admin/api/workflow-runs` **and** alias `GET /admin/api/runs` →
+    `listRuns({ status?, workflowName?, limit?, cursor? })` → legacy
+    `{ workflowRuns, total, nextCursor }`. **Blob-free** (listRuns excludes
+    payload/result/error natively; NO event streams loaded in the list path).
+    Maps dashboard status filter (`running`/`succeeded`/`failed`/…) → Flue's
+    3-value `active|completed|errored`.
+  - `GET /admin/api/workflow-runs/:id` **and** `GET /admin/api/runs/:id` →
+    `getRun(id)` → `{ workflowRun }`; **404 `{ error:"workflow run not found" }`**
+    when absent (matches the reference shape `~/work/lastlight/src/admin/routes.ts`).
+  - `GET /admin/api/agents` → `listAgents()` → `{ agents }`.
+- **Shape mapping (Flue → dashboard):** `runId`→`id`; status
+  `active→running`/`completed→succeeded`/`errored→failed`; absent optionals
+  coerced to `null`/`false`. **Fields Flue's RunPointer/RunRecord does NOT carry**
+  (`currentPhase`, `repo`, `issueNumber`, `restartCount` — all app-run-store
+  joins) are returned as **explicit `null` with `// TODO(phase-7)`**, never
+  fabricated. `total` = page length (Flue is cursor-paged, not offset/total —
+  `nextCursor` surfaced; true global total is a Phase-7 app-run-store concern).
+- **AUTH SEAM:** routes mounted beneath the `/admin/api/*` seam comment with a
+  clear `// TODO(phase-2/operator-auth): app.use('/admin/api/*', requireOperator)`
+  attach point. **Operator auth NOT built this slice.** `auth-required` kept
+  unauthenticated and mounted ABOVE the (future) middleware.
+- **STILL 501 (genuinely Phase 7, not backable by listRuns/getRun/listAgents):**
+  `GET /admin/api/stats` (per-phase cost/token rollups — app run-store),
+  `/admin/api/sessions` (transcripts — EventStreamStore), `/admin/api/approvals`
+  (pendingGate queue — app run-store). Tagged `slice:'phase-7'`.
+- **Offline-testability:** the real `listRuns`/`getRun`/`listAgents` **THROW
+  `"runtime not configured"` in-process** (verified via `tsx` — same failure as
+  `flue()`), so they're injected via `RunsReader`; tests pass a **fake reader**
+  returning sample data — NO live runtime, NO build. Adapter tested with sample
+  Flue records; routes tested via `app.request('/admin/api/...')` asserting
+  status + mapped shape + 404 for a missing run + filter pass-through + the
+  blob-free invariant + the explicit Phase-7 nulls.
+- **DEFERRED + RECORDED this slice:**
+  - **(a) Trigger routes `/api/run|build|chat` are BLOCKED until Phase 3** —
+    `dispatch`/`invokeWorkflowAttached` need real workflows to target, which
+    don't exist yet. Their `501` stubs are KEPT (tagged `phase-2/trigger-routes`).
+  - **(b) Graceful shutdown — leaning toward a SIMPLE additive
+    `process.on('SIGTERM', () => crons.stop())`** registered when crons land,
+    **NOT** a forked custom server entry. flue-reference §0 shows Flue's
+    generated `dist/server.mjs` already owns `serve()` + the SIGINT/SIGTERM traps
+    + `db.close()`; Node signal handlers are additive, so a plain handler that
+    calls `crons.stop()` fires alongside Flue's (and runs to completion before
+    Flue's async `agentCoordinator.shutdown()` resolves and exits). Forking the
+    entry to own `serve()` is risky (re-implements Flue's listen+shutdown) and
+    unnecessary for the only app-owned shutdown need (stop crons). **Decision
+    leaning recorded; finalize when crons are built** (revises slice-1's
+    "custom Node entry needed" toward the simpler additive handler).
+- **Flue signatures re-verified (beta.2):** `RunRecord`'s blob field is
+  **`payload`** (not `input` as the docs prose says); `AgentManifestEntry` =
+  `{ name, description?, transports:{http?}, created }` (field is `created`, not
+  `defined`); `RunStatus` = 3 values. **flue-reference §0 updated** (new
+  "Inspection primitives" sub-bullet under Routing) + the in-process-throw note.
+  No locked-decision-breaking drift.
+- **Tests:** full suite **184 passed / 3 skipped** (+9 `src/admin/runs-reader.test.ts`
+  adapter, +8 `test/app.test.ts` injected-reader route tests; was 167/3).
+  `pnpm typecheck` clean.
+- **Last commit:** `b8218eb` — Phase 2 slice 2: thin `/admin/api/*` read
+  pass-through over Flue inspection primitives (RunsReader seam + adapters).
 
 ### Phase 2 · slice 1 — app composition + shutdown finding ✅
 - **Built:** `src/app.ts` rewritten from the Phase-0 skeleton into the real
@@ -273,7 +343,7 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding). NEXT slice: custom Node entry `src/server.ts` (owns serve()/listen/signal traps) for app-owned graceful shutdown, then trigger routes + thin admin + CLI + crons.
+- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through over listRuns/getRun/listAgents via injectable RunsReader). NEXT slice: operator-auth middleware (`requireOperator` on the `/admin/api/*` seam), then CLI port, then custom-entry-vs-additive-SIGTERM shutdown + crons. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
