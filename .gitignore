@@ -1,0 +1,26 @@
+# --- Secrets (never commit) ---
+secrets/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.private-key.*
+
+# --- Node / build ---
+node_modules/
+dist/
+*.tsbuildinfo
+.flue/
+coverage/
+
+# --- Local state / runtime ---
+*.db
+*.db-journal
+*.sqlite
+logs/
+.DS_Store
+
+# --- Editor ---
+.idea/
+.vscode/
