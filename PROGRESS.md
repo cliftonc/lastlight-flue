@@ -15,7 +15,7 @@
   target:'node'); **`vitest.config.ts`**; **`test/bootstrap.test.ts`** (4 green —
   pins the installed API surface); `pnpm typecheck` + `pnpm test` green;
   `flue --help` confirms CLI wired.
-- **Last commit:** — (committing now: bootstrap)
+- **Last commit:** `86e4efc` — Phase 0 bootstrap (install, config, API pins).
 
 ## ⚠ BETA DRIFT FOUND & RECORDED (installed 1.0.0-beta.2 vs design docs)
 The design docs / `flue-reference §2–§3` were researched against
