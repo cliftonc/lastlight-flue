@@ -27,3 +27,4 @@ logs/
 
 # --- Claude Code harness (local) ---
 .claude/
+data/
