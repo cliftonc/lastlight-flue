@@ -14,9 +14,52 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase:** 3 — Vertical slice `pr-review` **🔶 STARTING**. Phase 2 ✅ (essentially
-  complete: /health green, dashboard loads, CLI, admin reads, operator auth), Phase
-  1 ✅, Phase 0 ✅. Phase-2 leftovers are later-phase-coupled (trigger routes→P3,
+- **Phase:** 3 — Vertical slice `pr-review` **🔶 IN PROGRESS** (slice 1 done; live
+  acceptance pending). Phase 2 ✅, Phase 1 ✅, Phase 0 ✅.
+
+### Phase 3 · slice 1 — pr-review workflow + reviewer agent + deterministic poster ✅
+- **Built:** `src/workflows/pr-review.ts` (`export async function run(ctx)` — the
+  only beta.2 form), `src/agents/reviewer.ts` (`createReviewerAgent(ref, octokit)`),
+  `src/github-post.ts` (deterministic poster), `src/workflows/pr-review-prompt.ts`
+  (thin prompt assembly via ported `renderTemplate`).
+- **Flow:** mint `review-write` token (ported `configureGitAuth` +
+  `GITHUB_PERMISSION_PROFILES['review-write']`, downscoped to the target repo) →
+  build reviewer (read tools bound to ref+token, `pr-review`/`building`/`code-review`
+  skills, `loadPersona()`, `resolveModel/Thinking('review')`) → `init`→`session.prompt`
+  → `parseReviewerVerdict` → **WORKFLOW posts deterministically** (NOT the model).
+- **Verdict→post mapping** (`mapVerdictToEvent`): `APPROVED→APPROVE`,
+  `REQUEST_CHANGES→REQUEST_CHANGES`; **bot's-own PR → `COMMENT` always**. The poster
+  (`postReviewDeterministically`): formal `pulls.createReview` for non-self PRs;
+  **self-authored → `issues.createComment` fallback** (GitHub forbids reviewing your
+  own PR). `selfAuthored` compares the PR author login to `config.botLogin`.
+  owner/repo/pull_number/token are CLOSED OVER (bound ref), never model-chosen.
+- **DI seam:** `runPrReview(ctx, deps)` with injectable `PrReviewDeps`
+  (mintToken/makeOctokit/botLogin/runReviewer/isSelfAuthored/post); `run()` uses
+  `defaultDeps()`. Lets the run-level test drive the whole flow offline.
+- **DEVIATION (recorded): SANDBOX DEFERRED.** Reviewer is TOOL-ONLY this slice — it
+  reads the PR diff/files via bound read tools, NO Docker sandbox, so the
+  build/test gate (which needs `docker()` wired) is deferred to a later slice. The
+  slice's core (verdict → deterministic post + COMMENT fallback) is fully proven.
+  `agents/reviewer.ts` omits `sandbox` with a header note to wire it later.
+- **Mocked vs live:** ALL GitHub writes MOCKED (fake octokit). `vitest.config.ts`
+  gains a `stub-skill-md` plugin (vite can't parse `with { type:'skill' }` .md
+  imports; the stub keeps agent-importing tests offline). **`test/pr-review-live.ts`
+  is GATED on `PR_REVIEW_LIVE=1` (UNSET) — skipped, never run.**
+- **Tests (+24):** `src/github-post.test.ts` (15: mapping incl. self→COMMENT, body
+  extraction, selfAuthored, poster calls createReview vs createComment with bound
+  ref), `pr-review-prompt.test.ts` (5: context render, trigger-conditional, VERDICT
+  contract parseable, purity), `pr-review.test.ts` (4: full flow APPROVED/REQUEST_
+  CHANGES/self-COMMENT/missing-marker-fallback over fake deps). Suite **264 passed
+  / 4 skipped** (was 240/3). `pnpm typecheck` clean. flue-reference §0 updated
+  (PromptResponse/PromptOptions/skill-md ambient decl).
+- **⚠ LIVE acceptance against `cliftonc/drizzle-cube#941` still PENDING** — run by
+  the MAIN LOOP (user watching), NOT a subagent. Gated test present but UNRUN. No
+  live side effect occurred this slice. Verify the App is installed on
+  drizzle-cube before the live run (token mint fails otherwise → STOP).
+- **Last commit:** see `git log` (Phase 3 slice 1: pr-review workflow).
+
+### (earlier) Phase 3 start note
+- Phase-2 leftovers are later-phase-coupled (trigger routes→P3,
   crons+shutdown→P5, stats/sessions→P7).
 
 ### ⚠ Phase 3 live-acceptance directive (external side effect — read before any live run)
@@ -512,7 +555,7 @@ status`/`/health` green, dashboard loads, runs inspectable" — is **MET**
 → **Verdict: advance to Phase 3 (pr-review vertical slice).** The remaining
 Phase-2 items are all blocked-on or better-built-with Phase 3/5; the compatibility
 surface (server, auth, CLI, admin reads, dashboard) is in place.
-- [ ] 3 — Vertical slice: pr-review
+- [ ] 3 — Vertical slice: pr-review ← **IN PROGRESS.** slice 1 ✅ (workflow + reviewer agent + deterministic poster + COMMENT fallback; sandbox/build-gate deferred; live acceptance PENDING, gated test unrun).
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)

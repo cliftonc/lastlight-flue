@@ -61,6 +61,27 @@ names):**
   ```
   `FlueContext` carries `init`, `payload`, `id`, `runId?`, `dispatchId?`, `env`,
   `req?`, `createDefaultEnv`, `defaultStore`, `log`.
+- **Phase 3 re-verify (2026-06-21, types-CZT-VTDG.d.mts):** `FlueContext` installed
+  shape is `{ id, payload, env, req, log, init(agent, options?) }` (NO top-level
+  `runId`/`dispatchId`/`createDefaultEnv`/`defaultStore` on the beta.2 type — those
+  appear on `main`; do not rely on them). `harness.session(name?) → FlueSession`;
+  `session.prompt(text, opts?) → CallHandle<PromptResponse>` where **`PromptResponse
+  = { text, usage: PromptUsage, model: { provider, id } }`** and `PromptUsage =
+  { input, output, cacheRead, cacheWrite, totalTokens, cost:{ input,output,cacheRead,
+  cacheWrite,total } }` (the native per-phase metrics source — design `10`).
+  **`PromptOptions` per-call overrides confirmed:** `{ result?, tools?, model?,
+  thinkingLevel?, signal?, images? }` — so `session.prompt(text, { model:
+  resolveModel('review'), thinkingLevel: resolveThinking('review') })` is the
+  per-phase override (resolves Q1.1). `createAgent` runtime config accepts
+  `{ model, instructions, tools, skills, thinkingLevel, sandbox, cwd, profile,
+  subagents, compaction, durability }` — no `defineAgent`.
+- **Skill import + typecheck (verified):** `import x from '../skills/<name>/SKILL.md'
+  with { type: 'skill' }` typechecks because `@flue/runtime`'s main types entry
+  (`types/index.d.ts`) triple-slash-references `types/skill-md.d.ts`, which declares
+  `module '*/SKILL.md'` → `SkillReference`. Vite/Vitest CANNOT parse the raw `.md`
+  import, so `vitest.config.ts` adds a `stub-skill-md` plugin mapping `*/SKILL.md`
+  to a stub `SkillReference` for offline unit tests (the real skill loading is a
+  Flue-build/tsx concern, exercised by `flue run`, not by `pnpm test`).
 - **Invocation:** **NO top-level `invoke` export.** Workflows run via the `flue
   run <name>` CLI, over HTTP, or programmatically via `invokeWorkflowAttached` /
   `handleWorkflowRequest` (lower-level). `dispatch(agent, { id, input })` is the
