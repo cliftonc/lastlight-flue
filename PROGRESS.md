@@ -165,7 +165,7 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   agent-context under `src/` + `agents/persona.ts` + frontmatter audit** (this
   slice). Full suite **159 passed / 3 skipped** (+7 persona, +14 skills audit;
   github-tools-live + spike-1 + spike-3-cross-process gated). **Phase 1 COMPLETE.**
-- **Last commit:** `439d140` — Phase 1 (final slice): copy skills/prompts/
+- **Last commit:** `532588b` — Phase 1 (final slice): copy skills/prompts/
   agent-context under src/ + persona.ts + frontmatter audit.
 
 ### Verified runtime facts (add to as spikes land)
