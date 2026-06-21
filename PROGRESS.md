@@ -4,6 +4,15 @@
 > reads this first every iteration. Keep it terse and current: update it at the end
 > of every slice, right after the commit.
 
+## ⚙ Loop execution mode (user directive, 2026-06-21)
+**Run each build slice as ONE fresh subagent**, not inline in the main session —
+to keep the main conversation's context lean over a long build. Each `/loop`
+iteration: dispatch a general-purpose subagent with the build-loop prompt (it
+reads BUILD-LOOP.md + PROGRESS.md, does ONE slice, runs tests, commits, updates
+PROGRESS.md), then relay its short summary and schedule the next wakeup. Do NOT
+do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
+local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
+
 ## Current position
 - **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
 - **Slice:** survey done + first port landed (templates/verdict/loop-eval) →
