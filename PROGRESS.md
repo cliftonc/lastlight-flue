@@ -16,14 +16,49 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
   Phase 0 ✅ (hard gate cleared).
-- **Slice (this iteration — slice 4, CLI PORT ✅):** ported the reference
-  `lastlight` CLI (a framework-independent fetch+chalk HTTP client) near-verbatim
-  into `src/cli.ts` + `src/cli-format.ts` + `src/cli-config.ts` +
-  `src/cli-timeline.ts`. Added `chalk`/`@clack/prompts`/`cli-table3` deps, a
-  `bin.lastlight` launcher + `pnpm cli` script. `--help`/`status` run offline.
-  → **NEXT: Phase 2 slice 5 — crons + the custom-entry-vs-additive-SIGTERM
-  shutdown decision** (finalize the leaning recorded in slice 2). Trigger routes
-  `/api/*` still BLOCKED on Phase 3 (need real workflows).
+- **Slice (this iteration — slice 5, DASHBOARD SPA ✅):** served the prebuilt
+  admin dashboard SPA under `/admin` (`src/admin/dashboard.ts` + `dashboard/dist/`
+  committed). → **NEXT: likely move to Phase 3 (pr-review vertical slice).** The
+  only Phase-2-pure work genuinely left is crons (Phase 5 territory) + the
+  finalize-the-SIGTERM-shutdown decision — both better done with real workflows
+  in hand. Trigger routes `/api/*` BLOCKED on Phase 3. See completeness
+  assessment under "Phase status".
+
+### Phase 2 · slice 5 — admin dashboard SPA served ✅
+- **Assets:** `dashboard/dist/` (4 files, 1.6M: index.html + assets/*.js,*.css +
+  logo.png) copied from `~/work/lastlight/dashboard/dist/` (NOT the SPA source or
+  build pipeline — the Phase-2 deliverable is "dashboard LOADS", so the PREBUILT
+  artifacts are the minimal path; design says serve the dashboard, doesn't mandate
+  a source port). The SPA's Vite `base` is `/admin/` → assets reference
+  `/admin/assets/*` + `/admin/logo.png`, so it MUST mount under `/admin`
+  (preserves `~/work/lastlight/src/admin/index.ts`). **Secret-scanned clean**
+  (only React-internal `__SECRET_INTERNALS`, login `type:password`, a "Secrets
+  omitted" help string — no creds). `.gitignore` `dist/` → `/dist/` (root-scoped)
+  so build output stays ignored but `dashboard/dist/` commits.
+- **Served by** `src/admin/dashboard.ts:mountDashboard(app)` via
+  `@hono/node-server` `serveStatic`: `/admin/*` → assets (strips `/admin`), then
+  `/admin` + `/admin/*` → `index.html` SPA fallback (serveStatic `next()`s on a
+  miss). Mounted in `createApp()` LAST, AFTER `/admin/api/*` + the operator-auth
+  middleware → **does NOT shadow** `/admin/api/*`, `/api/*`, `/health`, or Flue's
+  `/agents,/workflows,/runs,/channels`. **PUBLIC** (the SPA logs in via
+  `/admin/api/login` itself — no `requireOperator` on the shell). `serveDashboard`
+  opt (default on; default export on).
+- **Asset path:** `resolveDashboardRoot()` returns an ABSOLUTE root (serveStatic
+  `join`s it, so absolute is stable) chosen from candidates relative to
+  `import.meta.url` — robust across `flue dev` (tsx, `src/admin/`) and the built
+  `dist/` layout, with a cwd-relative last resort.
+- **Added dep:** `@hono/node-server@^2.0.3` as a DIRECT dep (it's flue's transitive
+  pin but pnpm didn't hoist it → `@hono/node-server/serve-static` wasn't
+  resolvable from root). flue-reference §0 updated with the serveStatic API.
+- **Tests:** `test/dashboard.test.ts` (+11) — all in-process via `app.request`
+  (serveStatic reads `dashboard/dist/` from disk, no listener): `/admin`+`/admin/`
+  +deep `/admin/<view>` → 200 HTML containing `<div id="root"`; real asset
+  `/admin/logo.png` → 200 `image/png`; **`/admin/api/runs` still 401 JSON** +
+  `/admin/api/auth-required` 200 JSON + `/health` 200 JSON (NOT shadowed); pure
+  `isSpaFallbackPath`; `serveDashboard:false` → 404. Full suite **240 passed / 3
+  skipped** (was 229/3). `pnpm typecheck` clean.
+- **Last commit:** `a58f0d7` — Phase 2 slice 5: serve prebuilt admin dashboard
+  SPA under `/admin`.
 
 ### Phase 2 · slice 4 — CLI port ✅
 - **Ported (near-verbatim from `~/work/lastlight/src/`):**
@@ -449,7 +484,29 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through); slice 3 ✅ (operator-auth middleware — `requireOperator` on `/admin/api/*`, stateless HMAC bearer, `auth-required`/`login` public, `auth-required` reports real config); slice 4 ✅ (CLI port — `src/cli.ts` + cli-format/cli-config/cli-timeline, `bin.lastlight` + `pnpm cli`, chalk/@clack/prompts/cli-table3 deps; runs offline). NEXT slice: crons + custom-entry-vs-additive-SIGTERM shutdown decision. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
+- [ ] 2 — Server + preserved API surface ← **IN PROGRESS (essentially complete; see assessment).** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` reads); slice 3 ✅ (operator-auth); slice 4 ✅ (CLI port); slice 5 ✅ (admin dashboard SPA under `/admin`). Trigger routes `/api/*` BLOCKED on Phase 3.
+
+#### Phase 2 completeness assessment (2026-06-21, after slice 5)
+**DONE:** single Hono app + `flue()` mount + one-port invariant (slice 1) ·
+`/health`+`/api/status` green (1) · `/admin/api/*` thin reads over
+listRuns/getRun/listAgents (2) · operator-auth (3) · CLI port (4) · dashboard
+**LOADS** under `/admin` (5). The design's headline deliverable — "`lastlight
+status`/`/health` green, dashboard loads, runs inspectable" — is **MET**
+(modulo live data, which needs runs to exist = Phase 3).
+**REMAINS in Phase 2:**
+  - **Trigger routes `/api/run|build|chat`** — **BLOCKED on Phase 3** (need real
+    workflows to `invoke`/`dispatch`; currently honest 501 stubs).
+  - **Crons** (`croner` + per-repo `invoke`/tick) — **effectively BLOCKED on
+    Phase 5** (no workflows to tick) and is itself a Phase-5 deliverable; doing
+    it now would be a no-op shell.
+  - **`boot.ts` preflight + exit-78 + orphan re-invoke** — UNBLOCKED but thin
+    until there are workflows/run-store to recover; low value pre-Phase-3.
+  - **Graceful-shutdown finalize** (additive `SIGTERM`→`crons.stop()` vs custom
+    entry) — coupled to crons; finalize when crons land.
+  - **`stats/sessions/approvals`** admin routes — genuinely **Phase 7**.
+→ **Verdict: advance to Phase 3 (pr-review vertical slice).** The remaining
+Phase-2 items are all blocked-on or better-built-with Phase 3/5; the compatibility
+surface (server, auth, CLI, admin reads, dashboard) is in place.
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
