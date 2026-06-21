@@ -5,18 +5,37 @@
 > of every slice, right after the commit.
 
 ## Current position
-- **Phase:** 0 — Spike & de-risk ✅ **COMPLETE (HARD GATE CLEARED)**. Next phase: 1.
-- **Slice:** Phase 0 done (all 3 spikes + MIGRATION.md committed) → NEXT: **Phase 1
-  — Shared core port.** Bring across runtime-independent pieces from
-  `~/work/lastlight`: `git-auth.ts` + `profiles.ts` (token downscoping);
-  GitHub tools as bound `defineTool` factories (retire `mcp-github-app`); copy
-  `skills/`, `prompts/`, `agent-context/`; port template engine + `verdict.ts` +
-  `loop-eval.ts`; typed config module + `resolveModel`/`resolveThinking`
-  (variant→`thinkingLevel`). Verify: auth/profile unit tests; a tool mints a
-  scoped token + reads a real issue; every `SKILL.md` frontmatter parses.
-  **Suggested first Phase-1 slice:** survey `~/work/lastlight/src` to map exactly
-  what ports (git-auth/profiles + config/resolveModel first — they unblock tools),
-  then port `git-auth.ts` + `profiles.ts` with unit tests.
+- **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
+- **Slice:** survey done + first port landed (templates/verdict/loop-eval) →
+  NEXT: **config module** (`src/config.ts`: typed loader + `resolveModel(task)` /
+  `resolveThinking(task)` variant→thinkingLevel, `LASTLIGHT_*` env aliases,
+  fail-open JSON parse) — small, unblocks tools/agents. THEN git-auth + profiles
+  (verbatim), THEN GitHub `defineTool` factories, THEN copy skills/prompts/
+  agent-context + persona.ts + a SKILL.md frontmatter-audit test.
+
+### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
+Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/config.ts`
++ `src/tools/` + `src/agents/persona.ts` (per design/phase-1-shared-core.md §layout).
+- [x] `src/engine/templates.ts`  ← `src/workflows/templates.ts` (175L, verbatim) ✅
+- [x] `src/engine/verdict.ts`     ← `src/workflows/verdict.ts` (38L) ✅
+- [x] `src/engine/loop-eval.ts`   ← `src/workflows/loop-eval.ts` (89L) ✅
+- [ ] `src/config.ts`             ← `src/config.ts` (624L) + `src/config-resolve.ts`
+      (68L). Key: `resolveModel(models,task)`, `resolveVariant/resolveThinking`,
+      `LastLightConfig` shape, 3-layer merge (env>overlay>default), tests:
+      config.test.ts / config-resolve.test.ts / config-overlay.test.ts.
+- [ ] `src/engine/git-auth.ts`    ← `src/engine/git-auth.ts` (227L, +test). Node
+      builtins only (crypto JWT RS256 → installation token, downscope). Verbatim.
+      Exports: `configureGitAuth`/`refreshGitAuth`, `GitHubTokenPermissions`.
+- [ ] `src/engine/profiles.ts`    ← `src/engine/profiles.ts` (266L). `GitAccessProfile`
+      (read|issues-write|review-write|repo-write), `GITHUB_PERMISSION_PROFILES`,
+      `GitSandboxAccess`. Re-point `loadAgentContext` → persona.ts. ⚠ keep
+      `GitAccessProfile` distinct from Flue's agent `profile` option.
+- [ ] `src/tools/github.ts` (+`github-read.ts`) ← reimplement `src/engine/github-tools.ts`
+      (354L, pi-ai schema) as Flue `defineTool` factories bound to (ref, token,
+      profile). `src/engine/github-app-client.ts` (Octokit factory) ports ~as-is.
+      Harness `GitHubClient` (postComment/react) in `src/engine/github.ts`.
+- [ ] copy `skills/` (12 SKILL.md dirs) `prompts/` (13 .md) `agent-context/` (3 .md:
+      soul/rules/security) → `src/agents/persona.ts` concat + frontmatter-audit test.
 - **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
   `package.json` (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot +
   hono ^4.12.26 + Vitest); `tsconfig.json`; secrets wired; `pnpm install` ✅;
@@ -49,8 +68,10 @@
   re-invoke RE-RUNS `run()` = YES; (b) session reattach is conditional & not
   load-bearing (run record carries cross-invoke state). `test/spike-3-gated.test.ts`
   (in-process default + `RUN_FLUE_CLI=1` cross-process). `MIGRATION.md` written.
-- **Last commit:** `d5df164` — Phase 0 Spike 3 (durable HITL, PASS) + MIGRATION.md.
-  **Phase 0 HARD GATE is now CLEARED** — Phase 1+ unblocked.
+- **Phase 1 so far:** ported the 3 pure utilities (templates/verdict/loop-eval) →
+  `src/engine/` with co-located tests (56 ported tests green; fidelity to
+  reference confirmed). Full suite 68 passed / 2 skipped.
+- **Last commit:** `e7752f5` — Phase 1 pure utilities ported.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
