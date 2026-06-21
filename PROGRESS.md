@@ -15,11 +15,10 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
-- **Slice:** git-auth + profiles ported ✅ → NEXT: **GitHub `defineTool` factories**
-  (`src/tools/github.ts` + `github-read.ts`) reimplementing `src/engine/github-tools.ts`
-  (354L) as Flue `defineTool` factories bound to (ref, token, profile);
-  `src/engine/github-app-client.ts` (Octokit) ports ~as-is. THEN copy skills/prompts/
-  agent-context + persona.ts + a SKILL.md frontmatter-audit test.
+- **Slice:** GitHub `defineTool` factories ported ✅ → NEXT: **copy skills/prompts/
+  agent-context + persona.ts + a SKILL.md frontmatter-audit test** (design Q1.4,
+  `src/agents/persona.ts:loadPersona()` concatenating `agent-context/{soul,rules,
+  security}.md` into the shared `instructions`).
 
 ### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
 Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/config.ts`
@@ -58,10 +57,44 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
       `workflows/loader.ts`) NOT ported — replaced with a `// TODO(persona)` note;
       superseded by `src/agents/persona.ts:loadPersona()` (later slice, design Q1.4).
       Reference has no profiles test; nothing added (pure types/const maps).
-- [ ] `src/tools/github.ts` (+`github-read.ts`) ← reimplement `src/engine/github-tools.ts`
-      (354L, pi-ai schema) as Flue `defineTool` factories bound to (ref, token,
-      profile). `src/engine/github-app-client.ts` (Octokit factory) ports ~as-is.
-      Harness `GitHubClient` (postComment/react) in `src/engine/github.ts`.
+- [x] `src/tools/github.ts` (+`github-read.ts`) + `src/engine/github-app-client.ts` ✅.
+      Reimplemented the reference `src/engine/github-tools.ts` (354L, pi-ai/typebox
+      schema) as Flue `defineTool` FACTORIES bound to (ref, token, profile).
+      `github-read.ts` = 11 GET-only read tools (getRepository/getIssue/listIssue
+      Comments/listIssues/getPullRequest/getPullRequestDiff/listPullRequests/
+      getFileContents/listCommits/searchIssues/searchCode) — `githubReadTools(ref,
+      octokit)`. `github.ts:githubTools(ref, token, profile)` builds an Octokit from
+      the bound token, ALWAYS includes the read set, pushes write tools by profile:
+      `issues-write`→comment/react(comment+issue)/createIssue; `review-write`+`repo-
+      write`→+createReview (repo-write code mutation is via the sandbox git CLI, NOT
+      a tool, so its model-tool surface == review-write). `github-app-client.ts`
+      (`githubAppClient(config)` via `@octokit/auth-app` createAppAuth + Octokit)
+      ported near-verbatim (`fs`/`path`→`node:` specifiers). **SECURITY INVARIANT
+      enforced:** owner/repo/token/IDs are CLOSED OVER in `execute`, never model
+      `parameters`; every schema is `additionalProperties:false` exposing only safe
+      payload fields (body / reaction `content` enum / review event+body / issue
+      title); search tools FORCE `repo:owner/repo` from the bound ref so the model
+      can't widen scope. Deps added: `octokit@5.0.5` + `@octokit/auth-app@7.2.2`
+      (matching the reference's installed versions). NO pi-ai / @sinclair/typebox.
+      Tests: `src/tools/github.test.ts` (11, mocks `octokit` via `vi.hoisted` →
+      offline; asserts profile gating by tool NAME for read/issues-write/review-
+      write/repo-write, the no-forbidden-param + `additionalProperties:false`
+      security invariant, and that `execute` calls Octokit with the closed-over
+      ref/token not args). **Flue `defineTool` signature re-verified** against
+      `node_modules/@flue/runtime/dist/tool-types-*.d.mts`: `defineTool({ name,
+      description, parameters: <valibot|raw JSON-Schema object>, execute })` →
+      `ToolDefinition`; `execute(args, signal?) => Promise<string>`, JSON-Schema
+      params yield `Record<string,any>` args. **No drift** — flue-reference §0/§4
+      already correct; NOT changed.
+      ⚠ **Harness `GitHubClient` (postComment/updateComment/react/checks/reviews,
+      ~360L) DEFERRED** (scope-note call: it's a deterministic harness client used
+      by the Phase 2+ workflow runner, not a model tool — porting it now would
+      balloon this slice). TODO: port to `src/engine/github.ts` when the runner
+      needs it (it reuses `githubAppClient`). 
+      ⚠ **LIVE acceptance gated & NOT YET RUN:** `test/github-tools-live.test.ts`
+      ("mint a read-scoped token → read a real issue") is gated on `GITHUB_LIVE_TEST=1`
+      + App creds (like spike-1 on `FLUE_SERVER_URL`); default `pnpm test` stays
+      offline/green. Run deliberately before relying on the live path.
 - [ ] copy `skills/` (12 SKILL.md dirs) `prompts/` (13 .md) `agent-context/` (3 .md:
       soul/rules/security) → `src/agents/persona.ts` concat + frontmatter-audit test.
 - **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
@@ -99,9 +132,12 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
 - **Phase 1 so far:** ported the 3 pure utilities (templates/verdict/loop-eval) →
   `src/engine/`, then the config module (`config.ts` + `config-resolve.ts` +
   `engine/egress-allowlist.ts` partial + `config/default.yaml`), then git-auth +
-  profiles (`engine/git-auth.ts` +test, `engine/profiles.ts`) with co-located
-  tests. Full suite **127 passed / 2 skipped** (+9 git-auth).
-- **Last commit:** git-auth + profiles ported (see git log).
+  profiles (`engine/git-auth.ts` +test, `engine/profiles.ts`), then the GitHub
+  `defineTool` factories (`tools/github.ts` + `tools/github-read.ts` +
+  `engine/github-app-client.ts` + `tools/github.test.ts` + gated
+  `test/github-tools-live.test.ts`). Full suite **138 passed / 3 skipped**
+  (+11 github tools; github-tools-live gated).
+- **Last commit:** GitHub `defineTool` factories + app-client ported (see git log).
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;

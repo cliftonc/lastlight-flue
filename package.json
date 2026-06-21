@@ -16,7 +16,9 @@
   "dependencies": {
     "@flue/cli": "1.0.0-beta.1",
     "@flue/runtime": "1.0.0-beta.2",
+    "@octokit/auth-app": "7.2.2",
     "hono": "^4.12.26",
+    "octokit": "5.0.5",
     "valibot": "^1.0.0",
     "yaml": "^2.9.0"
   },
