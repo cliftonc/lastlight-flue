@@ -14,11 +14,73 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase:** 1 — Shared core port **✅ COMPLETE**. Phase 0 ✅ (hard gate cleared).
-- **Slice:** skills/prompts/agent-context copied + `persona.ts` + frontmatter
-  audit ✅ (final Phase-1 slice). → **NEXT: Phase 2 — Server + preserved API
-  surface** (Hono + `flue()` + crons + `/api` + `/admin/api` + CLI). Read
-  `design/phase-2-server-api.md` next iteration.
+- **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
+  Phase 0 ✅ (hard gate cleared).
+- **Slice (this iteration — slice 1, FOUNDATION ✅):** expanded `src/app.ts` into
+  the real composition shape + resolved the shutdown/signal open question. →
+  **NEXT: Phase 2 slice 2 — custom Node entry (`src/server.ts`) owning
+  `serve()`/listen/signal traps for app-owned graceful shutdown** (crons.stop()
+  + drain), since the Flue-generated entry owns the SIGINT/SIGTERM traps (see
+  finding below). Then trigger routes (`/api/run|build|chat` → invoke/dispatch)
+  + thin `/admin/api/*` over listRuns/getRun/listAgents + CLI port + crons.
+
+### Phase 2 · slice 1 — app composition + shutdown finding ✅
+- **Built:** `src/app.ts` rewritten from the Phase-0 skeleton into the real
+  composition the rest of Phase 2 builds on. Exports a **`createApp()` factory**
+  (app-owned routes, mountable WITHOUT `flue()`) + pure shape builders
+  `healthBody()` / `authRequiredBody()`; the **default export** = `createApp()`
+  then `app.route('/', flue())` (one Hono app, one listener, one port —
+  `PORT||3000`, set `PORT=8644` to preserve). Implemented app-owned routes:
+  `GET /health` (preserves legacy `{ status:"ok", … }` shape + `version`+`uptime`;
+  shallow by design — Q2.4), `GET /api/status` (same readiness view),
+  `GET /admin/api/auth-required` (unauthenticated by contract; CLI `status` +
+  dashboard login read it). **Not-yet-ported routes are explicit `501
+  not_implemented` stubs** (NOT fake data) with `slice`/phase tags: POST
+  `/api/run|build|chat` → trigger-routes slice; GET `/admin/api/runs|workflow-runs|
+  agents|stats|sessions|approvals` → Phase 7. Clearly-marked SEAM comments where
+  bearer auth (`/api/*`) and operator auth (`/admin/api/*`) middleware + the real
+  routers attach.
+- **Endpoint shapes confirmed against the reference** (`~/work/lastlight/src`):
+  `/health` legacy body `{ status:"ok", stateDir }` (we keep `status:"ok"`);
+  CLI `cmdStatus` (cli.ts:290) probes `/health` + `/admin/api/auth-required`
+  (`{ required, slackOAuth, githubOAuth }`) + `/admin/api/stats` for token
+  validity; admin `/api/*` (run trigger) mounted on the connector Hono app
+  returning `202 { accepted, … }`.
+- **🔑 SHUTDOWN / SIGNAL FINDING (resolves design Q2.1 + Q2.2; evidence in
+  flue-reference §0):** read the GENERATED `dist/server.mjs` directly. `flue
+  build` **inlines `src/app.ts`** (top-level `await` runs at import → Q2.1
+  resolved: preflight-at-module-eval is viable), sets `var flueApp = app`,
+  asserts `flueApp.fetch` is a function, and **the generated entry — not our
+  `app.ts` — owns the listener and the signal traps**: `serve({ fetch:
+  flueApp.fetch, port: PORT||3000 })` + `process.on('SIGINT'/'SIGTERM', …)` →
+  `agentCoordinator.shutdown()` → `persistenceAdapter.close()` → `server.close()`
+  → `process.exit(130|143)` (60s unref timeout fallback). Node `process.on`
+  handlers are ADDITIVE so an `app.ts`-registered handler would also fire, BUT
+  Flue's handler also runs and calls `process.exit` — **we don't control exit
+  timing and there's no documented app-owned shutdown hook in beta.2.** → To
+  deterministically `crons.stop()` + drain before exit (spec/01), a **custom Node
+  entry (`src/server.ts`) owning serve()/listen/the traps is needed** (build →
+  `app.fetch`, run our entry instead of `dist/server.mjs`). **Decision recorded;
+  build deferred to slice 2.** Flue already closes our `db.ts` `sqlite()` adapter
+  on signal, so a `paused` run's session store flushes cleanly even today.
+- **Testability (chose approach (a) — app-owned surface unit-testable, no build):**
+  verified `flue()` from `@flue/runtime/routing` imports + composes in-process,
+  BUT invoking a Flue route in-process throws *"flue() route invoked before
+  runtime was configured … used outside a Flue-built server entry"* (the spike-1
+  test needed a running `flue dev` for that reason). So `createApp()` deliberately
+  omits `flue()`, making the app-owned routes fully offline-testable via Hono's
+  `app.request(...)`. `test/app.test.ts` (8 tests): /health shape, /api/status,
+  /admin/api/auth-required, the 501 trigger + admin stubs, 404 unknown, and pure
+  `healthBody`/`authRequiredBody` unit tests. The full default export (with
+  `flue()`) stays gated on a running server like spike-1.
+- **Flue signatures re-verified (beta.2):** `flue()` (`@flue/runtime/routing`) →
+  `{ fetch }` Hono sub-app, mount `app.route('/', flue())`; `app.ts` default
+  export consumed as `flueApp = <default>` + `.fetch` assertion; `getRun`/
+  `listRuns`/`listAgents` importable from `@flue/runtime` (confirmed; backbone of
+  the Phase-7 admin re-back). **flue-reference §0 updated** with the built-server
+  entry/listen/shutdown facts. No locked-decision-breaking drift.
+- **Tests:** full suite **167 passed / 3 skipped** (+8 from `test/app.test.ts`;
+  was 159/3). `pnpm typecheck` clean.
 
 ### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
 Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/config.ts`
@@ -165,8 +227,9 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   agent-context under `src/` + `agents/persona.ts` + frontmatter audit** (this
   slice). Full suite **159 passed / 3 skipped** (+7 persona, +14 skills audit;
   github-tools-live + spike-1 + spike-3-cross-process gated). **Phase 1 COMPLETE.**
-- **Last commit:** `532588b` — Phase 1 (final slice): copy skills/prompts/
-  agent-context under src/ + persona.ts + frontmatter audit.
+- **Last commit:** _(set below after the Phase-2 slice-1 commit)_ — Phase 2 slice 1:
+  app.ts composition (createApp + /health + /api/status + /admin/api/auth-required
+  + 501 seams) + shutdown/signal finding.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
@@ -210,7 +273,7 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **NEXT (read design/phase-2-server-api.md)**
+- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding). NEXT slice: custom Node entry `src/server.ts` (owns serve()/listen/signal traps) for app-owned graceful shutdown, then trigger routes + thin admin + CLI + crons.
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat

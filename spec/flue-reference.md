@@ -84,6 +84,39 @@ names):**
   "no `flue logs`"). `flue connect <agent> <instance-id>` **requires** an
   instance-id arg (not `flue connect <agent> local`). `flue run <wf> --payload
   '<json>'`.
+- **Built Node server entry + listen + SHUTDOWN (verified by reading the GENERATED
+  `dist/server.mjs`, 2026-06-21):** `flue build --target node` INLINES `src/app.ts`
+  into `dist/server.mjs` (our `const app = new Hono(); … app.route('/', flue())`
+  appears verbatim as a `//#region src/app.ts` block — so its module-eval code,
+  incl. any top-level `await`, runs at import; **resolves design Q2.1**). The
+  generated entry then does `var flueApp = app;` and asserts `flueApp.fetch` is a
+  function, so **`app.ts`'s default export must be a Hono app / `{ fetch }`** (drift
+  re-confirmed). It owns the listener: `const port = parseInt(process.env.PORT ||
+  "3000",10); const server = serve({ fetch:(req,env)=>flueApp.fetch(req,env), port,
+  serverOptions:{requestTimeout:0} });`. **`app.ts` does NOT and cannot call
+  `listen()`.**
+  - **SIGNAL TRAP IS OWNED BY THE GENERATED ENTRY (resolves design Q2.2):** the
+    built server registers `process.on('SIGINT', …)` / `process.on('SIGTERM', …)`
+    that call an idempotent `stop(sig, exitCode)` →
+    `await agentCoordinator.shutdown()` → `if (persistenceAdapter.close) await
+    persistenceAdapter.close()` → `server.close()` + `server.closeAllConnections()`
+    → `process.exit(130|143)`, with a 60s `setTimeout(...).unref()` hard-exit
+    fallback. **Signal handlers we add in `app.ts` module scope run too (handlers
+    are additive in Node), but the Flue-owned handler also fires and calls
+    `process.exit` once `agentCoordinator.shutdown()`/`db.close()` resolve — so we
+    do NOT control exit timing and there is NO documented app-owned shutdown hook
+    in beta.2.** Flue's handler already closes the persistence adapter (our `db.ts`
+    `sqlite()`), so a `paused` run's session store is flushed cleanly by Flue.
+    **Implication:** to deterministically `crons.stop()` + drain app-owned
+    in-flight `invoke`s BEFORE exit (spec/01 graceful-shutdown), a **custom Node
+    entry that owns `serve()`/`listen()`/the signal traps is required** (build
+    `app.ts` → `app.fetch`, write our own `src/server.ts` that calls
+    `@hono/node-server` `serve()` + registers handlers, and start `node
+    src/server.mjs` instead of `dist/server.mjs`) OR register crons such that a
+    plain `process.on('SIGTERM', ()=>crons.forEach(c=>c.stop()))` (additive, runs
+    before Flue's async work completes) is sufficient. **Decision deferred to the
+    next Phase-2 slice; evidence recorded — do NOT assume `app.ts` can trap signals
+    authoritatively.**
 
 This document is the destination half of the spec: it records *what Flue
 actually provides*, so the per-layer requirement pages (`01`–`11`) can cite a
