@@ -14,11 +14,11 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
-- **Slice:** GitHub `defineTool` factories ported ✅ → NEXT: **copy skills/prompts/
-  agent-context + persona.ts + a SKILL.md frontmatter-audit test** (design Q1.4,
-  `src/agents/persona.ts:loadPersona()` concatenating `agent-context/{soul,rules,
-  security}.md` into the shared `instructions`).
+- **Phase:** 1 — Shared core port **✅ COMPLETE**. Phase 0 ✅ (hard gate cleared).
+- **Slice:** skills/prompts/agent-context copied + `persona.ts` + frontmatter
+  audit ✅ (final Phase-1 slice). → **NEXT: Phase 2 — Server + preserved API
+  surface** (Hono + `flue()` + crons + `/api` + `/admin/api` + CLI). Read
+  `design/phase-2-server-api.md` next iteration.
 
 ### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
 Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/config.ts`
@@ -38,7 +38,7 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
       `config/default.yaml` `sandbox.backend: gondolin`→`none` (firewall backends
       unported, egress deferred); ported only `normalizeAllowlistHost` into
       `src/engine/egress-allowlist.ts` (rest of egress module deferred to the
-      egress-hardening phase). Added `yaml` dep. Tests: config.test.ts (35) +
+      egress-hardening phase). Used `yaml` dep. Tests: config.test.ts (35) +
       config-overlay.test.ts (9) + config-resolve.test.ts (6) = 50 green.
 - [x] `src/engine/git-auth.ts`    ← `src/engine/git-auth.ts` (227L, +test) ✅. Node
       builtins only (crypto JWT RS256 → installation token, downscope). Verbatim
@@ -95,8 +95,34 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
       ("mint a read-scoped token → read a real issue") is gated on `GITHUB_LIVE_TEST=1`
       + App creds (like spike-1 on `FLUE_SERVER_URL`); default `pnpm test` stays
       offline/green. Run deliberately before relying on the live path.
-- [ ] copy `skills/` (12 SKILL.md dirs) `prompts/` (13 .md) `agent-context/` (3 .md:
-      soul/rules/security) → `src/agents/persona.ts` concat + frontmatter-audit test.
+- [x] copy `skills/` (12 SKILL.md dirs, incl. `references/` subdirs) `prompts/`
+      (13 .md) `agent-context/` (3 .md: soul/rules/security) → `src/agents/persona.ts`
+      concat + frontmatter-audit test ✅. **Placement:** all three copied under
+      `src/` (`src/skills/`, `src/prompts/`, `src/agent-context/`), NOT repo root.
+      **DEVIATION from design layout (intentional, follows the installed truth):**
+      design/phase-1-shared-core.md §layout puts `skills/`/`prompts/`/`agent-context/`
+      at repo ROOT, but `node_modules/@flue/runtime/docs/guide/skills.md` requires
+      skills live UNDER the source dir (it uses `src/skills/`) for the
+      `import x from '../skills/<name>/SKILL.md' with { type: 'skill' }` attribute
+      to resolve from `src/agents/` — so skills MUST be `src/skills/`. Kept
+      prompts + agent-context under `src/` too for ONE consistent location.
+      `persona.ts` reads `../agent-context/*.md` and the audit test reads
+      `src/skills/*/SKILL.md` accordingly. `cp -R`; counts verified (12/13/3).
+      Secret scan of copied content: clean (one match was a doc *example*
+      placeholder `sk_live_abc123...` in `security-review/references/issue-format.md`,
+      not a real key); no `.env`/`.pem`/symlinks in `src/skills/`.
+      `src/agents/persona.ts:loadPersona(opts?)` — reads the 3 `.md` via `fs`
+      (path from `import.meta.url`), concatenates in **alphabetical filename
+      order (rules→security→soul) joined by `\n\n---\n\n`** to MATCH the reference
+      `loadAgentContext()` (`~/work/lastlight/src/workflows/loader.ts:296`, which
+      `localeCompare`-sorts + same separator); `opts.suffix` appends the chat
+      suffix (empty/whitespace ignored). Offline-testable, no build step.
+      Tests: `src/agents/persona.test.ts` (7 — non-empty, distinctive content
+      from each of soul/rules/security, separator count, suffix append/ignore) +
+      `src/skills/skills-frontmatter.test.ts` (14 — parses every SKILL.md
+      frontmatter via `yaml`, asserts non-empty `name`+`description` [the only
+      two fields present in ALL 12; `chat` lacks version/tags], name==dirname per
+      Flue, exactly 12 skills) = 21 green.
 - **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
   `package.json` (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot +
   hono ^4.12.26 + Vitest); `tsconfig.json`; secrets wired; `pnpm install` ✅;
@@ -135,9 +161,12 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   profiles (`engine/git-auth.ts` +test, `engine/profiles.ts`), then the GitHub
   `defineTool` factories (`tools/github.ts` + `tools/github-read.ts` +
   `engine/github-app-client.ts` + `tools/github.test.ts` + gated
-  `test/github-tools-live.test.ts`). Full suite **138 passed / 3 skipped**
-  (+11 github tools; github-tools-live gated).
-- **Last commit:** GitHub `defineTool` factories + app-client ported (see git log).
+  `test/github-tools-live.test.ts`), and finally **copied skills/prompts/
+  agent-context under `src/` + `agents/persona.ts` + frontmatter audit** (this
+  slice). Full suite **159 passed / 3 skipped** (+7 persona, +14 skills audit;
+  github-tools-live + spike-1 + spike-3-cross-process gated). **Phase 1 COMPLETE.**
+- **Last commit:** `439d140` — Phase 1 (final slice): copy skills/prompts/
+  agent-context under src/ + persona.ts + frontmatter audit.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
@@ -180,8 +209,8 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
-- [ ] 1 — Shared core port (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval)
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI)
+- [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
+- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **NEXT (read design/phase-2-server-api.md)**
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
