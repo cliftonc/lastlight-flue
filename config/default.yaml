@@ -1,0 +1,76 @@
+# Repositories Last Light manages. Empty by default — set the real list in your
+# private overlay ($LASTLIGHT_OVERLAY_DIR/config.yaml), which replaces this list
+# wholesale. Webhooks for repos not listed here are filtered at the connector level.
+managedRepos: []
+
+models:
+  default: openai/gpt-5.1
+
+variants: {}
+
+otel:
+  enabled: false
+  serviceName: lastlight
+  includeContent: false
+  forwardToSandbox: true
+  strict: false
+  collectorHosts: []
+
+sandbox:
+  # Flue port: the gondolin/docker firewall backends are not yet ported (egress
+  # hardening is a later phase). 'none' until the Docker SandboxFactory is wired
+  # into config; backend selection currently lives in src/sandboxes/docker.ts.
+  backend: none
+  maxTurns: 200
+
+approval: {}
+
+bootstrap:
+  label: "lastlight:bootstrap"
+
+explore:
+  defaultRepo: null
+
+review:
+  postsCheck: false
+
+disabled:
+  workflows: []
+  crons: []
+  prompts: []
+  skills: []
+  agentContext: []
+
+routes:
+  github:
+    issue_opened: issue-triage
+    issue_answer: answer
+    issue_reopened: issue-triage
+    pr_opened: pr-review
+    pr_synchronize: pr-review
+    pr_reopened: pr-review
+    approval_response: approval-response
+    security_review: security-review
+    pr_fix: pr-fix
+    pr_comment: pr-comment
+    issue_build: github-orchestrator
+    issue_explore: explore
+    issue_comment: issue-comment
+    security_feedback: security-feedback
+    explore_reply: explore-reply
+  slack:
+    reset: chat-reset
+    status: status-report
+    approve: approval-response
+    reject: approval-response
+    build: github-orchestrator
+    triage: issue-triage
+    review: pr-review
+    security: security-review
+    explore: explore
+    answer: answer
+    chat: chat
+    explore_reply: explore-reply
+
+cron:
+  webhooksEnabledCondition: true

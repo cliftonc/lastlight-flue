@@ -15,11 +15,11 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
-- **Slice:** survey done + first port landed (templates/verdict/loop-eval) →
-  NEXT: **config module** (`src/config.ts`: typed loader + `resolveModel(task)` /
-  `resolveThinking(task)` variant→thinkingLevel, `LASTLIGHT_*` env aliases,
-  fail-open JSON parse) — small, unblocks tools/agents. THEN git-auth + profiles
-  (verbatim), THEN GitHub `defineTool` factories, THEN copy skills/prompts/
+- **Slice:** config module ported (`src/config.ts` + `src/config-resolve.ts`) ✅ →
+  NEXT: **git-auth + profiles** (`src/engine/git-auth.ts` ← reference 227L +test;
+  `src/engine/profiles.ts` ← 266L). Verbatim port; Node builtins only (crypto JWT
+  RS256 → installation token, downscope). Re-point `loadAgentContext` → persona.ts
+  (Q1.4 blast radius). THEN GitHub `defineTool` factories, THEN copy skills/prompts/
   agent-context + persona.ts + a SKILL.md frontmatter-audit test.
 
 ### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
@@ -28,10 +28,20 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
 - [x] `src/engine/templates.ts`  ← `src/workflows/templates.ts` (175L, verbatim) ✅
 - [x] `src/engine/verdict.ts`     ← `src/workflows/verdict.ts` (38L) ✅
 - [x] `src/engine/loop-eval.ts`   ← `src/workflows/loop-eval.ts` (89L) ✅
-- [ ] `src/config.ts`             ← `src/config.ts` (624L) + `src/config-resolve.ts`
-      (68L). Key: `resolveModel(models,task)`, `resolveVariant/resolveThinking`,
-      `LastLightConfig` shape, 3-layer merge (env>overlay>default), tests:
-      config.test.ts / config-resolve.test.ts / config-overlay.test.ts.
+- [x] `src/config.ts` (+ `src/config-resolve.ts`) ← reference `src/config.ts`
+      (624L) + `src/config-resolve.ts` (68L), near-verbatim ✅. `resolveModel`,
+      `resolveVariant`, **`resolveThinking`** (typed `ThinkingLevel`
+      'off'|'minimal'|'low'|'medium'|'high'|'xhigh', fails open to 'medium'),
+      `LastLightConfig` shape, 3-layer merge (env>overlay>default), `LASTLIGHT_*`
+      + legacy `OPENCODE_*` aliases, fail-open JSON parse. Added single-arg
+      `resolveModel(task)`/`resolveThinking(task)` forms reading the runtime
+      config (per design signature). Deviations: model default
+      `anthropic/claude-sonnet-4-6`→`openai/gpt-5.1` (no Anthropic key);
+      `config/default.yaml` `sandbox.backend: gondolin`→`none` (firewall backends
+      unported, egress deferred); ported only `normalizeAllowlistHost` into
+      `src/engine/egress-allowlist.ts` (rest of egress module deferred to the
+      egress-hardening phase). Added `yaml` dep. Tests: config.test.ts (35) +
+      config-overlay.test.ts (9) + config-resolve.test.ts (6) = 50 green.
 - [ ] `src/engine/git-auth.ts`    ← `src/engine/git-auth.ts` (227L, +test). Node
       builtins only (crypto JWT RS256 → installation token, downscope). Verbatim.
       Exports: `configureGitAuth`/`refreshGitAuth`, `GitHubTokenPermissions`.
@@ -78,9 +88,10 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   load-bearing (run record carries cross-invoke state). `test/spike-3-gated.test.ts`
   (in-process default + `RUN_FLUE_CLI=1` cross-process). `MIGRATION.md` written.
 - **Phase 1 so far:** ported the 3 pure utilities (templates/verdict/loop-eval) →
-  `src/engine/` with co-located tests (56 ported tests green; fidelity to
-  reference confirmed). Full suite 68 passed / 2 skipped.
-- **Last commit:** `e7752f5` — Phase 1 pure utilities ported.
+  `src/engine/`, then the config module (`config.ts` + `config-resolve.ts` +
+  `engine/egress-allowlist.ts` partial + `config/default.yaml`) with co-located
+  tests. Full suite **118 passed / 2 skipped** (50 config tests).
+- **Last commit:** _(set below after commit)_ — config module ported.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;

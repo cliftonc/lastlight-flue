@@ -20,6 +20,9 @@ importers:
       valibot:
         specifier: ^1.0.0
         version: 1.4.1(typescript@5.9.3)
+      yaml:
+        specifier: ^2.9.0
+        version: 2.9.0
     devDependencies:
       '@types/node':
         specifier: ^22.10.0
