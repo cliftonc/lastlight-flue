@@ -5,11 +5,19 @@
 > of every slice, right after the commit.
 
 ## Current position
-- **Phase:** 0 — Spike & de-risk (BOOTSTRAP ✅ · Spike 1 ✅)
-- **Slice:** Spike 1 done → NEXT: **Spike 2 — custom Docker `SandboxFactory`**
-  (`src/sandboxes/docker.ts`): container per run, workspace mounted, `exec`/file
-  ops via `docker`; prove `git clone` + build in an isolated container + teardown.
-  Egress DEFERRED. Then Spike 3 (durable HITL).
+- **Phase:** 0 — Spike & de-risk (BOOTSTRAP ✅ · Spike 1 ✅ · Spike 2 ✅)
+- **Slice:** Spike 2 done → NEXT: **Spike 3 — durable HITL** (the resume proof).
+  App-owned gate (no Flue suspend primitive): a 2-step workflow that does step1 →
+  writes `pending` to an app run record → returns (ends); an external signal
+  re-runs the workflow with `resumed:true` → step2 runs exactly once (idempotent
+  via the run record). **Must survive a process kill+restart.** Needs: `src/db.ts`
+  exporting `sqlite()` (durable agent sessions) + a raw-sqlite `run-store.ts`
+  (id, step1_done, step2_done, pending_gate, restart_count, status). **Re-prove
+  the re-invoke mechanism against the REAL primitives** — there is NO top-level
+  `invoke(wf,{input})`; workflows run via `flue run`/HTTP `POST /workflows/:name`/
+  `invokeWorkflowAttached`. Answer the two unknowns: (a) does re-invoking a
+  workflow re-run `run()`? (b) does `harness.session(name)` reattach across runs?
+  Write answers into MIGRATION.md.
 - **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
   `package.json` (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot +
   hono ^4.12.26 + Vitest); `tsconfig.json`; secrets wired; `pnpm install` ✅;
@@ -22,7 +30,18 @@
   `result.model = { provider:"openai", id:"gpt-5.1" }`, ~$0.0012/turn.
   Acceptance: `test/spike-1-hello.test.ts` (gated on `FLUE_SERVER_URL`; default
   `pnpm test` = 4 passed / 1 skipped). Response contract recorded below.
-- **Last commit:** `e45393e` — Phase 0 Spike 1 (hello-world agent, PASS).
+- **Spike 2 (done ✅):** `src/sandboxes/docker.ts` — Flue `SandboxFactory` over the
+  host `docker` CLI. `DockerContainer.create()/.remove()` is **caller-owned**
+  lifetime (the adapter must NOT manage it); `DockerSandboxApi` drives exec + all
+  file ops via `docker exec`; `docker(container)` → `createSessionEnv()` via
+  `createSandboxSessionEnv(api,'/workspace')`. Image `node:22-bookworm` (slim
+  lacks git). **Proven** by `test/spike-2-docker.test.ts` (auto-skips w/o docker;
+  free): isolated empty workspace + baked env; **git clone + npm build artifact**
+  read back through the API; full FS contract incl. binary roundtrip; factory→
+  SessionEnv; **teardown verified** (container gone after `remove()`). 5/5 green,
+  no leaked containers. EGRESS still DEFERRED.
+  Also: tsconfig `allowImportingTsExtensions` (Flue imports use `.ts` specifiers).
+- **Last commit:** `91d7e7b` — Phase 0 Spike 2 (Docker SandboxFactory, PASS).
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
@@ -32,6 +51,13 @@
 - `openai` provider auto-authenticates from `OPENAI_API_KEY` — no `registerProvider`.
 - `flue dev --env secrets/.env --port 3583` serves discovered `src/` agents;
   `/health` (app-owned) confirms readiness in ~1s.
+- **Sandbox adapter contract** (docs/api/sandbox-api.md, verified): adapter is a
+  PURE mapper — must not create/delete/kill the provider sandbox (lifetime is the
+  caller's). `createSandboxSessionEnv(api, cwd)` is **synchronous** → `SessionEnv`.
+  `createSessionEnv({ id })` called once per `init()`; `id` = ctx id (agent
+  instance id, or workflow runId inside a workflow). `exec` honors
+  `{cwd, env, timeoutMs, signal}`; round `timeoutMs` UP; exit 124 on timeout.
+  Shell-native adapters (docker) may implement FS ops via the shell.
 
 ## ⚠ BETA DRIFT FOUND & RECORDED (installed 1.0.0-beta.2 vs design docs)
 The design docs / `flue-reference §2–§3` were researched against
