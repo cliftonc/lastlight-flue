@@ -14,15 +14,20 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
-  Phase 0 ✅ (hard gate cleared).
-- **Slice (this iteration — slice 5, DASHBOARD SPA ✅):** served the prebuilt
-  admin dashboard SPA under `/admin` (`src/admin/dashboard.ts` + `dashboard/dist/`
-  committed). → **NEXT: likely move to Phase 3 (pr-review vertical slice).** The
-  only Phase-2-pure work genuinely left is crons (Phase 5 territory) + the
-  finalize-the-SIGTERM-shutdown decision — both better done with real workflows
-  in hand. Trigger routes `/api/*` BLOCKED on Phase 3. See completeness
-  assessment under "Phase status".
+- **Phase:** 3 — Vertical slice `pr-review` **🔶 STARTING**. Phase 2 ✅ (essentially
+  complete: /health green, dashboard loads, CLI, admin reads, operator auth), Phase
+  1 ✅, Phase 0 ✅. Phase-2 leftovers are later-phase-coupled (trigger routes→P3,
+  crons+shutdown→P5, stats/sessions→P7).
+
+### ⚠ Phase 3 live-acceptance directive (external side effect — read before any live run)
+- **Authorized live-test PR:** `cliftonc/drizzle-cube#941` (user's repo; user
+  authorized 2026-06-21 — see memory `pr-review-live-target`).
+- **Subagents BUILD + test with ALL GitHub WRITES MOCKED — NO live posting.** The
+  live run (which posts a real review/comment) is executed by the MAIN LOOP, not a
+  subagent, and the user reviews what will be posted before it's triggered.
+- Before the live run: verify the `secrets/.env` GitHub App (id/installation in env)
+  is installed on `cliftonc/drizzle-cube` (≠ reference repo `cliftonc/lastlight`).
+  If it lacks access, token minting fails → STOP + ask.
 
 ### Phase 2 · slice 5 — admin dashboard SPA served ✅
 - **Assets:** `dashboard/dist/` (4 files, 1.6M: index.html + assets/*.js,*.css +
