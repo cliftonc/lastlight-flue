@@ -24,3 +24,6 @@ logs/
 # --- Editor ---
 .idea/
 .vscode/
+
+# --- Claude Code harness (local) ---
+.claude/

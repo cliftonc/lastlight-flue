@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.18.0",
-  "engines": { "node": ">=22.19" },
+  "engines": {
+    "node": ">=22.19"
+  },
   "scripts": {
     "build": "flue build",
     "dev": "flue dev --env secrets/.env",
@@ -12,8 +14,9 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@flue/runtime": "1.0.0-beta.2",
     "@flue/cli": "1.0.0-beta.1",
+    "@flue/runtime": "1.0.0-beta.2",
+    "hono": "^4.12.26",
     "valibot": "^1.0.0"
   },
   "devDependencies": {
