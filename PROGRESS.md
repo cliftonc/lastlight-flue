@@ -91,7 +91,7 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   `src/engine/`, then the config module (`config.ts` + `config-resolve.ts` +
   `engine/egress-allowlist.ts` partial + `config/default.yaml`) with co-located
   tests. Full suite **118 passed / 2 skipped** (50 config tests).
-- **Last commit:** _(set below after commit)_ — config module ported.
+- **Last commit:** `e9ba46d` — config module ported (resolveModel/resolveThinking).
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
