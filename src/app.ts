@@ -8,6 +8,12 @@ import {
   toRunSummary,
   type RunsReader,
 } from './admin/runs-reader.ts';
+import {
+  loginHandler,
+  operatorAuthConfigFromEnv,
+  requireOperator,
+  type OperatorAuthConfig,
+} from './admin/auth.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -67,12 +73,18 @@ export function healthBody(now: number = Date.now()): HealthBody {
 }
 
 /** `/admin/api/auth-required` body — the CLI `status` command and the dashboard
- *  login flow probe this to discover available auth methods. Real values come
- *  from config in the auth slice; for now report the unconfigured baseline. */
-export function authRequiredBody() {
-  // TODO(phase-2/admin-auth-slice): source `required` from
-  // config.adminPassword and slackOAuth/githubOAuth from configured providers.
-  return { required: false, slackOAuth: false, githubOAuth: false } as const;
+ *  login flow probe this to discover available auth methods. `required` is true
+ *  when an operator password is configured (auth is enforced); `slackOAuth` /
+ *  `githubOAuth` reflect configured OAuth providers. OAuth is not ported until
+ *  Phase 6, so they are `false` (TODO below), never fabricated. */
+export function authRequiredBody(auth: OperatorAuthConfig) {
+  return {
+    required: Boolean(auth.password),
+    // TODO(phase-6/admin-oauth): source from configured Slack/GitHub OAuth
+    // providers once OAuth login is ported. Config does not model these yet.
+    slackOAuth: false,
+    githubOAuth: false,
+  };
 }
 
 /** Optional dependencies injected into the app-owned surface. */
@@ -86,6 +98,14 @@ export interface CreateAppOptions {
    * always mounted, reader or not.
    */
   runsReader?: RunsReader;
+  /**
+   * Operator-auth config gating `/admin/api/*` (password + token-signing
+   * secret). Defaults to `operatorAuthConfigFromEnv()` (reads `ADMIN_PASSWORD` /
+   * `ADMIN_SECRET`). Tests inject an explicit config to exercise enabled vs
+   * disabled auth without touching env. When `password` is empty, auth is
+   * DISABLED (dev/fresh install) — the reference behaviour.
+   */
+  authConfig?: OperatorAuthConfig;
 }
 
 /**
@@ -97,6 +117,7 @@ export interface CreateAppOptions {
  */
 export function createApp(opts: CreateAppOptions = {}): Hono {
   const app = new Hono();
+  const authConfig = opts.authConfig ?? operatorAuthConfigFromEnv();
 
   // ── /health — app-owned, UNAUTHENTICATED (CLI `status` + dashboard poll) ──
   app.get('/health', (c) => c.json(healthBody()));
@@ -130,16 +151,24 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
   //    slice; the FULL re-back (app run-store join: phasesDone/pendingGate/
   //    stats/thread-grouping + EventStreamStore transcripts) is Phase 7. ──────
   //
-  // SEAM (auth slice): operator auth middleware mounts here —
-  //   TODO(phase-2/operator-auth): app.use('/admin/api/*', requireOperator);
-  // These routes are operator-only by contract; this slice does NOT build the
-  // middleware, only leaves the single attach point. `auth-required` MUST stay
-  // unauthenticated (it's read to learn HOW to authenticate) — keep it ABOVE
-  // any `requireOperator` mount, or exempt it explicitly.
+  // OPERATOR AUTH (this slice): the ported HMAC-bearer middleware gates the
+  // whole prefix. It is mounted ONCE here, BEFORE any /admin/api route, so it
+  // runs for every admin request. The middleware itself EXEMPTS the public-by-
+  // contract paths (`auth-required`, `login`) — see `requireOperator` /
+  // `isPublicAuthPath` in src/admin/auth.ts — so those stay reachable without a
+  // token (the CLI/dashboard read auth-required to learn HOW to authenticate,
+  // and POST login to obtain a token). When no password is configured, auth is
+  // disabled and everything passes through (reference behaviour).
+  app.use('/admin/api/*', requireOperator(authConfig));
 
-  // `auth-required` is unauthenticated by contract (the CLI/dashboard read it
-  // to learn HOW to authenticate) — implement now so `lastlight status` works.
-  app.get('/admin/api/auth-required', (c) => c.json(authRequiredBody()));
+  // `auth-required` is unauthenticated by contract — reports REAL config now
+  // (required = password set; OAuth flags false until Phase 6). Exempted by the
+  // middleware above.
+  app.get('/admin/api/auth-required', (c) => c.json(authRequiredBody(authConfig)));
+
+  // `login` (password → signed token). Also exempted by the middleware so the
+  // dashboard/CLI can obtain a token. Part of the same coherent auth unit.
+  app.post('/admin/api/login', loginHandler(authConfig));
 
   // ── Admin DATA reads — backed by the injected RunsReader seam ─────────────
   // Only mounted when a reader is provided (default export wires the real Flue

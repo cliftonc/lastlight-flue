@@ -6,6 +6,7 @@ import type {
 } from '@flue/runtime';
 import { createApp, healthBody, authRequiredBody } from '../src/app.ts';
 import type { RunsReader } from '../src/admin/runs-reader.ts';
+import { createToken } from '../src/admin/auth.ts';
 
 // Phase 2 · slice 1 — contract tests for the APPLICATION-OWNED server surface.
 //
@@ -16,7 +17,9 @@ import type { RunsReader } from '../src/admin/runs-reader.ts';
 // /admin/api/auth-required) plus the 501 seams for not-yet-ported routes.
 
 describe('app-owned surface (createApp, in-process)', () => {
-  const app = createApp();
+  // Explicit disabled-auth config so these assertions never depend on whether
+  // the developer happens to have ADMIN_PASSWORD exported in their shell.
+  const app = createApp({ authConfig: { password: '', secret: 'x' } });
 
   it('GET /health → 200 with preserved Last Light shape', async () => {
     const res = await app.request('/health');
@@ -130,7 +133,10 @@ describe('admin reads with injected RunsReader (offline)', () => {
       listAgents: async () => sampleAgents,
       ...overrides,
     };
-    return { app: createApp({ runsReader: reader }), reader };
+    return {
+      app: createApp({ runsReader: reader, authConfig: { password: '', secret: 'x' } }),
+      reader,
+    };
   }
 
   it('GET /admin/api/workflow-runs → 200 mapped { workflowRuns, total, nextCursor }', async () => {
@@ -221,10 +227,120 @@ describe('shape builders (pure, unit)', () => {
     expect(Number.isInteger(b.uptime)).toBe(true);
   });
 
-  it('authRequiredBody reports the unconfigured baseline', () => {
-    const b = authRequiredBody();
+  it('authRequiredBody reflects config: no password → not required', () => {
+    const b = authRequiredBody({ password: '', secret: 's' });
     expect(b.required).toBe(false);
     expect(b.slackOAuth).toBe(false);
     expect(b.githubOAuth).toBe(false);
+  });
+
+  it('authRequiredBody reflects config: password set → required', () => {
+    const b = authRequiredBody({ password: 'hunter2', secret: 's' });
+    expect(b.required).toBe(true);
+  });
+});
+
+// ── Operator auth on /admin/api/* (ported HMAC-bearer middleware) ─────────────
+// Mounted on the whole prefix; exempts auth-required + login. When a password is
+// configured, protected data routes need a valid bearer token; otherwise 401.
+// All offline: an injected fake RunsReader backs the protected route, and the
+// auth config is injected so no env/secrets are touched.
+describe('operator auth on /admin/api/*', () => {
+  const SECRET = 'test-admin-secret';
+  const fakeReader: RunsReader = {
+    listRuns: async () => ({ runs: [] }),
+    getRun: async () => null,
+    listAgents: async () => [],
+  };
+
+  function authedApp() {
+    return createApp({
+      runsReader: fakeReader,
+      authConfig: { password: 'hunter2', secret: SECRET },
+    });
+  }
+
+  it('protected /admin/api/runs → 401 without credentials', async () => {
+    const app = authedApp();
+    const res = await app.request('/admin/api/runs');
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('unauthorized');
+  });
+
+  it('protected /admin/api/runs → 200 with a valid bearer token', async () => {
+    const app = authedApp();
+    const token = createToken(SECRET, 'password');
+    const res = await app.request('/admin/api/runs', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('accepts a valid token via ?token= query param (EventSource path)', async () => {
+    const app = authedApp();
+    const token = createToken(SECRET, 'password');
+    const res = await app.request(`/admin/api/runs?token=${token}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects a token signed with the wrong secret → 401', async () => {
+    const app = authedApp();
+    const bad = createToken('some-other-secret', 'password');
+    const res = await app.request('/admin/api/runs', {
+      headers: { Authorization: `Bearer ${bad}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('auth-required is reachable WITHOUT auth (and reports required:true)', async () => {
+    const app = authedApp();
+    const res = await app.request('/admin/api/auth-required');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.required).toBe(true);
+  });
+
+  it('login with the correct password → 200 { token } that authenticates', async () => {
+    const app = authedApp();
+    const res = await app.request('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'hunter2' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { token: string };
+    expect(typeof body.token).toBe('string');
+    // The issued token must actually authenticate a protected route.
+    const ok = await app.request('/admin/api/runs', {
+      headers: { Authorization: `Bearer ${body.token}` },
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it('login with the wrong password → 401', async () => {
+    const app = authedApp();
+    const res = await app.request('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'wrong' }),
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('invalid password');
+  });
+
+  it('auth DISABLED (no password) → protected routes pass through unauthenticated', async () => {
+    const app = createApp({
+      runsReader: fakeReader,
+      authConfig: { password: '', secret: SECRET },
+    });
+    const res = await app.request('/admin/api/runs');
+    expect(res.status).toBe(200);
+    // login with no password issues a token + authDisabled flag
+    const login = await app.request('/admin/api/login', { method: 'POST' });
+    const body = (await login.json()) as Record<string, unknown>;
+    expect(body.authDisabled).toBe(true);
+    expect(typeof body.token).toBe('string');
   });
 });

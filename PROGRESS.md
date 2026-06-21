@@ -16,16 +16,68 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
   Phase 0 ✅ (hard gate cleared).
-- **Slice (this iteration — slice 2, THIN ADMIN READ PASS-THROUGH ✅):**
-  implemented the thin `/admin/api/*` READ routes over Flue's
-  `listRuns`/`getRun`/`listAgents` behind an injectable `RunsReader` seam
-  (`src/admin/runs-reader.ts`) + pure shape adapters, replacing the runs/
-  workflow-runs/agents 501 stubs. → **NEXT: Phase 2 slice 3 — operator-auth
-  middleware** (`requireOperator` on the `/admin/api/*` seam already left in
-  `app.ts`; ports the reference HMAC token scheme from `~/work/lastlight/src/
-  admin/auth.ts`, keeping `auth-required` unauthenticated), then the CLI port
-  (`src/cli.ts`), then the custom Node entry (`src/server.ts`, see slice-1
-  shutdown finding) + crons + trigger routes (BLOCKED on Phase 3 — see below).
+- **Slice (this iteration — slice 3, OPERATOR-AUTH MIDDLEWARE ✅):** ported the
+  reference HMAC-bearer operator auth to `src/admin/auth.ts`, mounted
+  `requireOperator` on `/admin/api/*`, made `auth-required` report REAL config.
+  → **NEXT: Phase 2 slice 4 — CLI port** (`src/cli.ts`, a thin HTTP client
+  against `/health` + `/api/*` + `/admin/api/*` — now that status + auth +
+  admin-reads exist), then the custom-entry-vs-additive-SIGTERM shutdown +
+  crons; trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
+
+### Phase 2 · slice 3 — operator-auth middleware ✅
+- **Ported:** `src/admin/auth.ts` from `~/work/lastlight/src/admin/auth.ts`,
+  VERBATIM token semantics. **Scheme:** stateless HMAC-signed bearer token —
+  `createToken(secret, method?)` → `base64url({exp,method?}).base64url(HMAC-
+  SHA256(payload, secret))`, 7-day TTL; `verifyToken` recomputes the HMAC and
+  compares with **`crypto.timingSafeEqual`** (constant-time) then checks `exp`.
+  Adapted the reference's `authMiddleware` into a Hono `requireOperator(config)`
+  **`MiddlewareHandler` factory** + a `loginHandler(config)` (password → token,
+  **constant-time** password compare over equal-length buffers) + an
+  `operatorAuthConfigFromEnv()` resolver.
+- **SESSION-STORE MECHANISM + CAVEAT:** there is **NO server-side session store**
+  — the token is self-describing/self-verifying, so it **SURVIVES PROCESS
+  RESTART** as long as `ADMIN_SECRET` is stable (it is: a fixed env secret; the
+  reference defaults it to `"lastlight-dev-secret"` when unset). No in-memory
+  store, no db, no Phase-7 dependency. **Caveat:** rotating `ADMIN_SECRET`
+  invalidates every outstanding token (intended). Single-process and multi-
+  process both fine (stateless).
+- **How applied (protected vs public):** `createApp()` mounts
+  `app.use('/admin/api/*', requireOperator(authConfig))` ONCE, before any
+  `/admin/api` route. The middleware **exempts public-by-contract paths**
+  (`/admin/api/auth-required`, `/admin/api/login`) via `isPublicAuthPath` (path
+  `.endsWith` check, mirroring the reference) so the CLI/dashboard can read
+  auth-required to learn HOW to auth and POST login to obtain a token. **When no
+  `ADMIN_PASSWORD` is configured, auth is DISABLED → everything passes through**
+  (reference behaviour; dev/fresh install). Token accepted via `Authorization:
+  Bearer <t>` **or** `?token=` query (EventSource path). Invalid/absent → **`401
+  { error: "unauthorized" }`** (exact reference shape).
+- **`auth-required` now reports REAL config:** `authRequiredBody(auth)` →
+  `required = Boolean(auth.password)`; `slackOAuth`/`githubOAuth` = **`false`
+  with `// TODO(phase-6/admin-oauth)`** — config does NOT model OAuth providers
+  yet (OAuth login is Phase 6), so NOT fabricated.
+- **Config keys:** `src/config.ts` does NOT model admin auth (neither did the
+  reference's config module — `adminPassword`/`adminSecret` were read straight
+  from env at the server-wiring layer in `~/work/lastlight/src/index.ts`). So
+  `operatorAuthConfigFromEnv()` sources **`ADMIN_PASSWORD`** (default `""`) +
+  **`ADMIN_SECRET`** (default `"lastlight-dev-secret"`), matching the reference
+  defaults, and is injected at `createApp({ authConfig })`. `secrets/.env` has
+  `ADMIN_PASSWORD` commented out (→ auth disabled in dev) + `ADMIN_SECRET` set.
+- **SECURITY:** constant-time for BOTH the HMAC verify and the password compare
+  (preserved from the reference); secrets read from env, never hardcoded, never
+  logged. OAuth authorize/callback exemptions from the reference are NOT ported
+  (Phase 6) — noted in `isPublicAuthPath` to re-add then.
+- **Offline:** pure app-owned Hono middleware, no Flue runtime. Tests inject an
+  explicit `authConfig` (no env/secret touch) + a fake `RunsReader`.
+- **Tests:** `src/admin/auth.test.ts` (+10: ported token suite verbatim +
+  expired-token + `operatorAuthConfigFromEnv`); `test/app.test.ts` operator-auth
+  block (+8: protected `/admin/api/runs` 401 w/o creds / 200 w/ valid bearer /
+  200 via `?token=` / 401 wrong-secret; `auth-required` reachable unauth &
+  `required:true`; login correct→token-that-authenticates / wrong→401; auth-
+  disabled passthrough + `authDisabled` login). Existing `createApp()` tests
+  pinned to explicit disabled-auth so they don't flake on a shell `ADMIN_PASSWORD`.
+  Full suite **203 passed / 3 skipped** (was 184/3). `pnpm typecheck` clean.
+- **Last commit:** `60b1b7a` — Phase 2 slice 3: operator-auth middleware on
+  `/admin/api/*`.
 
 ### Phase 2 · slice 2 — thin `/admin/api/*` read pass-through ✅
 - **Built:** `src/admin/runs-reader.ts` — the Flue-data **`RunsReader` seam**
@@ -343,7 +395,7 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through over listRuns/getRun/listAgents via injectable RunsReader). NEXT slice: operator-auth middleware (`requireOperator` on the `/admin/api/*` seam), then CLI port, then custom-entry-vs-additive-SIGTERM shutdown + crons. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
+- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through); slice 3 ✅ (operator-auth middleware — `requireOperator` on `/admin/api/*`, stateless HMAC bearer, `auth-required`/`login` public, `auth-required` reports real config). NEXT slice: CLI port (`src/cli.ts`), then custom-entry-vs-additive-SIGTERM shutdown + crons. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
