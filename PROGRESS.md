@@ -5,19 +5,18 @@
 > of every slice, right after the commit.
 
 ## Current position
-- **Phase:** 0 — Spike & de-risk (BOOTSTRAP ✅ · Spike 1 ✅ · Spike 2 ✅)
-- **Slice:** Spike 2 done → NEXT: **Spike 3 — durable HITL** (the resume proof).
-  App-owned gate (no Flue suspend primitive): a 2-step workflow that does step1 →
-  writes `pending` to an app run record → returns (ends); an external signal
-  re-runs the workflow with `resumed:true` → step2 runs exactly once (idempotent
-  via the run record). **Must survive a process kill+restart.** Needs: `src/db.ts`
-  exporting `sqlite()` (durable agent sessions) + a raw-sqlite `run-store.ts`
-  (id, step1_done, step2_done, pending_gate, restart_count, status). **Re-prove
-  the re-invoke mechanism against the REAL primitives** — there is NO top-level
-  `invoke(wf,{input})`; workflows run via `flue run`/HTTP `POST /workflows/:name`/
-  `invokeWorkflowAttached`. Answer the two unknowns: (a) does re-invoking a
-  workflow re-run `run()`? (b) does `harness.session(name)` reattach across runs?
-  Write answers into MIGRATION.md.
+- **Phase:** 0 — Spike & de-risk ✅ **COMPLETE (HARD GATE CLEARED)**. Next phase: 1.
+- **Slice:** Phase 0 done (all 3 spikes + MIGRATION.md committed) → NEXT: **Phase 1
+  — Shared core port.** Bring across runtime-independent pieces from
+  `~/work/lastlight`: `git-auth.ts` + `profiles.ts` (token downscoping);
+  GitHub tools as bound `defineTool` factories (retire `mcp-github-app`); copy
+  `skills/`, `prompts/`, `agent-context/`; port template engine + `verdict.ts` +
+  `loop-eval.ts`; typed config module + `resolveModel`/`resolveThinking`
+  (variant→`thinkingLevel`). Verify: auth/profile unit tests; a tool mints a
+  scoped token + reads a real issue; every `SKILL.md` frontmatter parses.
+  **Suggested first Phase-1 slice:** survey `~/work/lastlight/src` to map exactly
+  what ports (git-auth/profiles + config/resolveModel first — they unblock tools),
+  then port `git-auth.ts` + `profiles.ts` with unit tests.
 - **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
   `package.json` (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot +
   hono ^4.12.26 + Vitest); `tsconfig.json`; secrets wired; `pnpm install` ✅;
@@ -41,7 +40,17 @@
   SessionEnv; **teardown verified** (container gone after `remove()`). 5/5 green,
   no leaked containers. EGRESS still DEFERRED.
   Also: tsconfig `allowImportingTsExtensions` (Flue imports use `.ts` specifiers).
-- **Last commit:** `91d7e7b` — Phase 0 Spike 2 (Docker SandboxFactory, PASS).
+- **Spike 3 (done ✅):** durable HITL gate — `src/db.ts` (`sqlite()` durable
+  sessions) + `src/run-store.ts` (raw `node:sqlite` app run record) +
+  `src/workflows/gated.ts` (pure-TS 2-step gate: step1 → write `pending` → return;
+  re-invoke `resumed:true` → step2 once). **Proven across 3 separate `flue run`
+  processes** (pause → restart → resume-again): step1×1 + step2×1 exactly-once,
+  final status=done, restart_count=2; **app runId ≠ Flue runId**. Answers: (a)
+  re-invoke RE-RUNS `run()` = YES; (b) session reattach is conditional & not
+  load-bearing (run record carries cross-invoke state). `test/spike-3-gated.test.ts`
+  (in-process default + `RUN_FLUE_CLI=1` cross-process). `MIGRATION.md` written.
+- **Last commit:** `d5df164` — Phase 0 Spike 3 (durable HITL, PASS) + MIGRATION.md.
+  **Phase 0 HARD GATE is now CLEARED** — Phase 1+ unblocked.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
@@ -83,7 +92,7 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 - **Default model = `openai/*`** (only `OPENAI_API_KEY` is present; no Anthropic).
 
 ## Phase status
-- [ ] **0 — Spike & de-risk** (HARD GATE) — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns
+- [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [ ] 1 — Shared core port (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval)
 - [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI)
 - [ ] 3 — Vertical slice: pr-review
