@@ -16,13 +16,67 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase:** 2 — Server + preserved API surface **🔶 IN PROGRESS**. Phase 1 ✅,
   Phase 0 ✅ (hard gate cleared).
-- **Slice (this iteration — slice 3, OPERATOR-AUTH MIDDLEWARE ✅):** ported the
-  reference HMAC-bearer operator auth to `src/admin/auth.ts`, mounted
-  `requireOperator` on `/admin/api/*`, made `auth-required` report REAL config.
-  → **NEXT: Phase 2 slice 4 — CLI port** (`src/cli.ts`, a thin HTTP client
-  against `/health` + `/api/*` + `/admin/api/*` — now that status + auth +
-  admin-reads exist), then the custom-entry-vs-additive-SIGTERM shutdown +
-  crons; trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
+- **Slice (this iteration — slice 4, CLI PORT ✅):** ported the reference
+  `lastlight` CLI (a framework-independent fetch+chalk HTTP client) near-verbatim
+  into `src/cli.ts` + `src/cli-format.ts` + `src/cli-config.ts` +
+  `src/cli-timeline.ts`. Added `chalk`/`@clack/prompts`/`cli-table3` deps, a
+  `bin.lastlight` launcher + `pnpm cli` script. `--help`/`status` run offline.
+  → **NEXT: Phase 2 slice 5 — crons + the custom-entry-vs-additive-SIGTERM
+  shutdown decision** (finalize the leaning recorded in slice 2). Trigger routes
+  `/api/*` still BLOCKED on Phase 3 (need real workflows).
+
+### Phase 2 · slice 4 — CLI port ✅
+- **Ported (near-verbatim from `~/work/lastlight/src/`):**
+  - `src/cli-config.ts` ← `cli-config.ts` (no relative-import rewrites needed;
+    `resolveTarget` precedence `--url/--token` → `LASTLIGHT_URL/LASTLIGHT_TOKEN`
+    → `~/.lastlight/config.json` → `DEFAULT_URL=http://localhost:8644` PRESERVED).
+  - `src/cli-format.ts` ← `cli-format.ts` (table/age/colorStatus/checkmark +
+    dependency-free `followSSE`). Adaptation: `widths[i]!` for
+    `noUncheckedIndexedAccess`.
+  - `src/cli-timeline.ts` ← `cli-timeline.ts` (timeline render, tool-family
+    classify, result summarize). Adaptation: `FAMILY_BY_NAME[l]!`,
+    `FAMILY_STYLE[<ToolFamily>]!`.
+  - `src/cli.ts` ← `cli.ts` (842L). Adaptations: `.js`→`.ts` import specifiers;
+    `argv[i]!`/regex-group `!` guards; **`setup` wizard NOT ported** — `lastlight
+    setup` exits with a graceful "not available yet, use login" message
+    (`// TODO(phase-2/cli-setup)`; the 844L interactive docker/secrets wizard is
+    out of scope for the thin client port — NOT deleted from help, NOT faked).
+- **Deps added (matching the reference's installed versions):** `chalk@5.6.2`,
+  `@clack/prompts@1.6.0` (ref `^1.2.0`), `cli-table3@0.6.5`. All runtime deps
+  (CLI ships as part of the app).
+- **How to RUN the CLI (offline, no build):** `pnpm cli <args>` (= `tsx
+  src/cli.ts`), or `pnpm exec tsx src/cli.ts <args>`, or the `bin` launcher
+  `node bin/lastlight.mjs <args>` (`package.json#bin.lastlight` → a `.mjs`
+  wrapper that re-execs `src/cli.ts` through the local `tsx`, since the CLI uses
+  `.ts` import specifiers). E.g. `pnpm cli --help`, `pnpm cli status`.
+- **Commands LIVE now (server endpoints already implemented):** `--help`/`help`,
+  `status`/`whoami` (`/health` + `/admin/api/auth-required` + token probe vs
+  `/admin/api/stats`), `login`/`logout` (`/admin/api/login` POST — auth slice),
+  `workflow list` (`/admin/api/workflow-runs`), `workflow log <id>` partial
+  (`/workflow-runs/:id` works; its `/executions` companion is 501 → command
+  surfaces the error). Pure local: `logout`.
+- **Commands that HIT 501 (endpoint not implemented yet — surface the server's
+  error gracefully, NOT faked, NOT removed):** `stats` (`/admin/api/stats*`),
+  `session list|log` (`/admin/api/sessions*`), `logs search`
+  (`/admin/api/log-search`), `approvals list|approve|reject`
+  (`/admin/api/approvals*`), `server list|logs` (`/admin/api/server/*` — never
+  existed), `workflow log`'s `/executions` leg. **BLOCKED on Phase 3** (need real
+  workflows): `build` (`/api/build`), `triage/review/health/security` + the
+  default github-ref dispatch (`/api/run`), `chat` (`/api/chat`) — all currently
+  501 trigger-route stubs.
+- **Offline + app-independent:** the CLI is a pure HTTP client (global `fetch` +
+  chalk). No Flue runtime, no build, no server needed for `--help`/`status`.
+  Verified: `pnpm exec tsx src/cli.ts --help` prints + exits 0; `node
+  bin/lastlight.mjs status --url http://localhost:9` degrades to "Server
+  unreachable" cleanly.
+- **Tests:** ported `cli-config.test.ts` (+6) + `cli-timeline.test.ts` (+11)
+  (`.js`→`.ts` imports), added `cli-format.test.ts` (+9: table alignment/ANSI-
+  width/empty, relative age units, colorStatus passthrough, checkmark glyphs).
+  Target/URL+token precedence covered by cli-config. NO live smoke added this
+  slice (default `pnpm test` stays offline). Full suite **229 passed / 3 skipped**
+  (was 203/3; +26). `pnpm typecheck` clean.
+- **Last commit:** see `git log` (Phase 2 slice 4: CLI port). Hash NOT embedded
+  here (avoids the self-referential amend churn the prior slices hit).
 
 ### Phase 2 · slice 3 — operator-auth middleware ✅
 - **Ported:** `src/admin/auth.ts` from `~/work/lastlight/src/admin/auth.ts`,
@@ -395,7 +449,7 @@ reality (now in `flue-reference §0`, which overrides the older narrative):**
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker SandboxFactory (clone+build, egress deferred); durable HITL + invoke/session unknowns answered (MIGRATION.md)
 - [x] **1 — Shared core port** ✅ (config, git-auth/profiles, tools, skills, persona, template/verdict/loop-eval) — all port-map items done; full suite 159 passed / 3 skipped
-- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through); slice 3 ✅ (operator-auth middleware — `requireOperator` on `/admin/api/*`, stateless HMAC bearer, `auth-required`/`login` public, `auth-required` reports real config). NEXT slice: CLI port (`src/cli.ts`), then custom-entry-vs-additive-SIGTERM shutdown + crons. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
+- [ ] 2 — Server + preserved API surface (Hono + flue() + crons + /api + /admin/api + CLI) ← **IN PROGRESS.** slice 1 ✅ (app.ts composition + shutdown finding); slice 2 ✅ (thin `/admin/api/*` read pass-through); slice 3 ✅ (operator-auth middleware — `requireOperator` on `/admin/api/*`, stateless HMAC bearer, `auth-required`/`login` public, `auth-required` reports real config); slice 4 ✅ (CLI port — `src/cli.ts` + cli-format/cli-config/cli-timeline, `bin.lastlight` + `pnpm cli`, chalk/@clack/prompts/cli-table3 deps; runs offline). NEXT slice: crons + custom-entry-vs-additive-SIGTERM shutdown decision. Trigger routes `/api/*` BLOCKED on Phase 3 (need real workflows).
 - [ ] 3 — Vertical slice: pr-review
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
