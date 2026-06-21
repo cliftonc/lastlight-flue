@@ -227,9 +227,9 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   agent-context under `src/` + `agents/persona.ts` + frontmatter audit** (this
   slice). Full suite **159 passed / 3 skipped** (+7 persona, +14 skills audit;
   github-tools-live + spike-1 + spike-3-cross-process gated). **Phase 1 COMPLETE.**
-- **Last commit:** _(set below after the Phase-2 slice-1 commit)_ — Phase 2 slice 1:
-  app.ts composition (createApp + /health + /api/status + /admin/api/auth-required
-  + 501 seams) + shutdown/signal finding.
+- **Last commit:** `eee7933` — Phase 2 slice 1: app.ts composition (createApp +
+  /health + /api/status + /admin/api/auth-required + 501 seams) + shutdown/signal
+  finding.
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
