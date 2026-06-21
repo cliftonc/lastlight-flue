@@ -76,7 +76,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   disabled passthrough + `authDisabled` login). Existing `createApp()` tests
   pinned to explicit disabled-auth so they don't flake on a shell `ADMIN_PASSWORD`.
   Full suite **203 passed / 3 skipped** (was 184/3). `pnpm typecheck` clean.
-- **Last commit:** `60b1b7a` — Phase 2 slice 3: operator-auth middleware on
+- **Last commit:** `8c97570` — Phase 2 slice 3: operator-auth middleware on
   `/admin/api/*`.
 
 ### Phase 2 · slice 2 — thin `/admin/api/*` read pass-through ✅
