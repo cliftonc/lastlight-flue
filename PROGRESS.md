@@ -5,17 +5,33 @@
 > of every slice, right after the commit.
 
 ## Current position
-- **Phase:** 0 — Spike & de-risk (BOOTSTRAP done ✅)
-- **Slice:** bootstrap complete → NEXT: Spike 1 (hello-world `createAgent` on
-  `openai/*`), then Spike 2 (Docker `SandboxFactory`), Spike 3 (durable HITL).
-- **Done so far:** git init; `.gitignore` (secrets/ ignored); `package.json`
-  (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot + Vitest);
-  `tsconfig.json` (NodeNext ESM); secrets wired; **`pnpm install` ✅** (beta pkgs
-  resolved); **`flue.config.ts`** (`defineConfig` from `@flue/cli/config`,
-  target:'node'); **`vitest.config.ts`**; **`test/bootstrap.test.ts`** (4 green —
-  pins the installed API surface); `pnpm typecheck` + `pnpm test` green;
-  `flue --help` confirms CLI wired.
-- **Last commit:** `86e4efc` — Phase 0 bootstrap (install, config, API pins).
+- **Phase:** 0 — Spike & de-risk (BOOTSTRAP ✅ · Spike 1 ✅)
+- **Slice:** Spike 1 done → NEXT: **Spike 2 — custom Docker `SandboxFactory`**
+  (`src/sandboxes/docker.ts`): container per run, workspace mounted, `exec`/file
+  ops via `docker`; prove `git clone` + build in an isolated container + teardown.
+  Egress DEFERRED. Then Spike 3 (durable HITL).
+- **Bootstrap (done):** git init; `.gitignore` (secrets/, `.claude/` ignored);
+  `package.json` (pnpm, ESM, @flue/runtime 1.0.0-beta.2 + @flue/cli + valibot +
+  hono ^4.12.26 + Vitest); `tsconfig.json`; secrets wired; `pnpm install` ✅;
+  `flue.config.ts` (`defineConfig` from `@flue/cli/config`, target:'node');
+  `vitest.config.ts`; `test/bootstrap.test.ts` (pins installed API surface).
+- **Spike 1 (done ✅):** `src/agents/hello.ts` (`createAgent`, model
+  `openai/gpt-5.1` via `LASTLIGHT_MODEL`) + `src/app.ts` (Hono + `flue()` +
+  `/health`). **Proven live** on our `OPENAI_API_KEY` via `flue dev`:
+  `POST /agents/hello/spike-1?wait=result` → `result.text` non-empty,
+  `result.model = { provider:"openai", id:"gpt-5.1" }`, ~$0.0012/turn.
+  Acceptance: `test/spike-1-hello.test.ts` (gated on `FLUE_SERVER_URL`; default
+  `pnpm test` = 4 passed / 1 skipped). Response contract recorded below.
+- **Last commit:** `e45393e` — Phase 0 Spike 1 (hello-world agent, PASS).
+
+### Verified runtime facts (add to as spikes land)
+- Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
+  `?wait=result` → `200 { result:{ text, usage:{input,output,totalTokens,cost},
+  model:{provider,id} }, streamUrl, offset, submissionId }`; bare POST → `202
+  { streamUrl, offset }`. HTTP exposure REQUIRES a `route` export on the agent.
+- `openai` provider auto-authenticates from `OPENAI_API_KEY` — no `registerProvider`.
+- `flue dev --env secrets/.env --port 3583` serves discovered `src/` agents;
+  `/health` (app-owned) confirms readiness in ~1s.
 
 ## ⚠ BETA DRIFT FOUND & RECORDED (installed 1.0.0-beta.2 vs design docs)
 The design docs / `flue-reference §2–§3` were researched against
