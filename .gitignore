@@ -9,7 +9,9 @@ secrets/
 
 # --- Node / build ---
 node_modules/
-dist/
+# Build output (`flue build` → ./dist/server.mjs). Root-scoped so it does NOT
+# ignore the committed prebuilt dashboard assets at `dashboard/dist/`.
+/dist/
 *.tsbuildinfo
 .flue/
 coverage/

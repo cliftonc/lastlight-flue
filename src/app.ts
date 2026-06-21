@@ -14,6 +14,7 @@ import {
   requireOperator,
   type OperatorAuthConfig,
 } from './admin/auth.ts';
+import { mountDashboard } from './admin/dashboard.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -106,6 +107,17 @@ export interface CreateAppOptions {
    * DISABLED (dev/fresh install) — the reference behaviour.
    */
   authConfig?: OperatorAuthConfig;
+  /**
+   * Serve the prebuilt admin dashboard SPA under `/admin` (static assets +
+   * SPA fallback to index.html). Defaults to `true` for the live wiring. Tests
+   * that only exercise the JSON surface pass `false` (or an explicit
+   * `dashboardRoot`) so they don't depend on the committed `dashboard/dist`.
+   * The shell/assets are PUBLIC — mounted AFTER `/admin/api/*` so the API and
+   * its operator-auth middleware are never shadowed by the static serving.
+   */
+  serveDashboard?: boolean;
+  /** Override the dashboard assets root (absolute path). Tests inject a fixture. */
+  dashboardRoot?: string;
 }
 
 /**
@@ -258,6 +270,17 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
         ),
       );
     }
+  }
+
+  // ── Admin dashboard SPA (Phase 2 · slice 5) ──────────────────────────────
+  // Serve the prebuilt Vite SPA under `/admin` (static assets + SPA fallback).
+  // Mounted LAST — after every `/admin/api/*` route + the operator-auth
+  // middleware — so the static/fallback serving cannot shadow the JSON API,
+  // /health, /api/*, or Flue's routes. Public by design (the SPA logs in via
+  // /admin/api/login itself). Off by default ONLY in opts where a test asks; the
+  // live default export turns it on.
+  if (opts.serveDashboard ?? true) {
+    mountDashboard(app, opts.dashboardRoot);
   }
 
   return app;

@@ -101,6 +101,19 @@ names):**
     built server.
 - **Tool:** `@flue/runtime/tool` exports exactly `defineTool` (also re-exported
   from `.`).
+- **Static file serving (`@hono/node-server/serve-static`, verified 2026-06-21,
+  v2.0.5):** `serveStatic(opts?) => MiddlewareHandler`; `opts = { root?, path?,
+  index?, precompressed?, rewriteRequestPath?, onFound?, onNotFound? }`. Resolves
+  via `path = join(root, rewriteRequestPath?(reqPath) ?? reqPath)` then
+  `statSync` — so **`root` may be ABSOLUTE** (`join` keeps it). On a miss it
+  calls `next()` (enables a SPA `index.html` fallback registered after it); on a
+  directory it serves `index` (default `index.html`). `{ path: '<file>' }` serves
+  that one file (ignores the request path) — the SPA-fallback primitive. It only
+  `console.error`s (does not throw) if `root` is missing at construction.
+  `@hono/node-server` is a transitive dep of `@flue/runtime` (`^2.0.3`); we added
+  it as a **direct dep** so `@hono/node-server/serve-static` resolves from the
+  project root (pnpm did not hoist it). Used to serve the prebuilt admin
+  dashboard under `/admin` (`src/admin/dashboard.ts`).
 - **CLI (`flue`, verified `--help`):** `dev | run | connect | build | init | add |
   update | docs | logs`. **`flue logs <workflowRunId>` DOES exist** (overrides §9's
   "no `flue logs`"). `flue connect <agent> <instance-id>` **requires** an
