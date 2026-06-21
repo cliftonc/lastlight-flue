@@ -15,11 +15,10 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase:** 1 — Shared core port (IN PROGRESS). Phase 0 ✅ (hard gate cleared).
-- **Slice:** config module ported (`src/config.ts` + `src/config-resolve.ts`) ✅ →
-  NEXT: **git-auth + profiles** (`src/engine/git-auth.ts` ← reference 227L +test;
-  `src/engine/profiles.ts` ← 266L). Verbatim port; Node builtins only (crypto JWT
-  RS256 → installation token, downscope). Re-point `loadAgentContext` → persona.ts
-  (Q1.4 blast radius). THEN GitHub `defineTool` factories, THEN copy skills/prompts/
+- **Slice:** git-auth + profiles ported ✅ → NEXT: **GitHub `defineTool` factories**
+  (`src/tools/github.ts` + `github-read.ts`) reimplementing `src/engine/github-tools.ts`
+  (354L) as Flue `defineTool` factories bound to (ref, token, profile);
+  `src/engine/github-app-client.ts` (Octokit) ports ~as-is. THEN copy skills/prompts/
   agent-context + persona.ts + a SKILL.md frontmatter-audit test.
 
 ### Phase 1 port map (from reference survey of ~/work/lastlight) — target → source
@@ -42,13 +41,23 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
       `src/engine/egress-allowlist.ts` (rest of egress module deferred to the
       egress-hardening phase). Added `yaml` dep. Tests: config.test.ts (35) +
       config-overlay.test.ts (9) + config-resolve.test.ts (6) = 50 green.
-- [ ] `src/engine/git-auth.ts`    ← `src/engine/git-auth.ts` (227L, +test). Node
-      builtins only (crypto JWT RS256 → installation token, downscope). Verbatim.
-      Exports: `configureGitAuth`/`refreshGitAuth`, `GitHubTokenPermissions`.
-- [ ] `src/engine/profiles.ts`    ← `src/engine/profiles.ts` (266L). `GitAccessProfile`
+- [x] `src/engine/git-auth.ts`    ← `src/engine/git-auth.ts` (227L, +test) ✅. Node
+      builtins only (crypto JWT RS256 → installation token, downscope). Verbatim
+      (adapted: `data` typed instead of `any` for `noUncheckedIndexedAccess`; no
+      behavior change). Exports: `configureGitAuth`/`refreshGitAuth`,
+      `GitHubTokenPermissions`, `GitHubPermissionLevel`. Co-located `git-auth.test.ts`
+      ported (`.js`→`.ts` specifier); mocks `child_process`/`fs`/`crypto` + global
+      `fetch` → **NO live GitHub creds/network needed**. 9 tests green.
+- [x] `src/engine/profiles.ts`    ← `src/engine/profiles.ts` (266L) ✅. `GitAccessProfile`
       (read|issues-write|review-write|repo-write), `GITHUB_PERMISSION_PROFILES`,
-      `GitSandboxAccess`. Re-point `loadAgentContext` → persona.ts. ⚠ keep
-      `GitAccessProfile` distinct from Flue's agent `profile` option.
+      `AGENTIC_PROFILE_FOR`, `GitSandboxAccess`, `ExecutorConfig`/`ExecutionResult`/
+      `Extension*`/`Skills*` interfaces — all ported. Imports `GitHubTokenPermissions`
+      from `./git-auth.ts` and `OtelConfig`/`SandboxBackend` from `../config.ts`
+      (verified exports). ⚠ `GitAccessProfile` kept distinct from Flue's agent
+      `profile`. **Deviation:** `loadAgentContext()` (delegated to unported
+      `workflows/loader.ts`) NOT ported — replaced with a `// TODO(persona)` note;
+      superseded by `src/agents/persona.ts:loadPersona()` (later slice, design Q1.4).
+      Reference has no profiles test; nothing added (pure types/const maps).
 - [ ] `src/tools/github.ts` (+`github-read.ts`) ← reimplement `src/engine/github-tools.ts`
       (354L, pi-ai schema) as Flue `defineTool` factories bound to (ref, token,
       profile). `src/engine/github-app-client.ts` (Octokit factory) ports ~as-is.
@@ -89,9 +98,10 @@ Pure/portable (zero framework coupling). Target layout: `src/engine/` + `src/con
   (in-process default + `RUN_FLUE_CLI=1` cross-process). `MIGRATION.md` written.
 - **Phase 1 so far:** ported the 3 pure utilities (templates/verdict/loop-eval) →
   `src/engine/`, then the config module (`config.ts` + `config-resolve.ts` +
-  `engine/egress-allowlist.ts` partial + `config/default.yaml`) with co-located
-  tests. Full suite **118 passed / 2 skipped** (50 config tests).
-- **Last commit:** `e9ba46d` — config module ported (resolveModel/resolveThinking).
+  `engine/egress-allowlist.ts` partial + `config/default.yaml`), then git-auth +
+  profiles (`engine/git-auth.ts` +test, `engine/profiles.ts`) with co-located
+  tests. Full suite **127 passed / 2 skipped** (+9 git-auth).
+- **Last commit:** git-auth + profiles ported (see git log).
 
 ### Verified runtime facts (add to as spikes land)
 - Agent HTTP contract: `POST /agents/<name>/<id>` body `{ message, images? }`;
