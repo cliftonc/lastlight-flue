@@ -91,7 +91,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - **Tests:** full suite **184 passed / 3 skipped** (+9 `src/admin/runs-reader.test.ts`
   adapter, +8 `test/app.test.ts` injected-reader route tests; was 167/3).
   `pnpm typecheck` clean.
-- **Last commit:** `b8218eb` — Phase 2 slice 2: thin `/admin/api/*` read
+- **Last commit:** `edea5cd` — Phase 2 slice 2: thin `/admin/api/*` read
   pass-through over Flue inspection primitives (RunsReader seam + adapters).
 
 ### Phase 2 · slice 1 — app composition + shutdown finding ✅
