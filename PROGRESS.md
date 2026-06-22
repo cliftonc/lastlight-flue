@@ -20,7 +20,29 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **427/5 skipped**.
+  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **444/5 skipped**.
+- **Phase 5 slice 3 DONE ✅ — `pr-fix` workflow ported** (`src/workflows/pr-fix.ts`,
+  `run` → `runPrFix(ctx, deps)` DI seam). Standalone EXECUTOR-ON-A-PR (no architect/review):
+  mints a **`repo-write`** scoped token (PEM wall, downscoped to repo); resolves the PR
+  HEAD ref deterministically (`pulls.get().head.ref` — workflow code, not a model tool);
+  `withPrFixSandbox` (new in build-sandbox.ts) pre-clones + checks out the EXISTING PR
+  head BRANCH (`git clone --branch <headRef>`, NOT `checkout -B` → fix lands on the PR's
+  branch); REUSES `createFixAgent` (fix task key, persona, `building` skill, read tools,
+  sandbox, cwd /workspace); renders `pr-fix.md` via `renderPrFixPrompt` (fix request + CI
+  text + PR title all UNTRUSTED-wrapped). Agent fixes + COMMITS in-sandbox; workflow reads
+  HEAD sha + PUSHES the BOUND head branch via the same **mocked `pushBranch` seam**; then
+  posts a deterministic **ack comment** (`src/pr-fix-post.ts`, bound ref → `issues.createComment`).
+  Container ALWAYS torn down in `finally` (incl. on throw/clone-fail); token never logged.
+  - **Tests (+17):** prompt golden (untrusted-wrap incl. hostile-escape, CI section) +
+    sandbox variant (clones existing branch not -B, teardown-on-throw, token-redacted) +
+    run-level over fakes (token mint, bound head-ref resolve, push targets bound ref not
+    model text, teardown-on-fix-throw + clone-fail, token-not-logged) + ack-poster security.
+  - **flue build green; discovery = agents{hello} + workflows{build,gated,issue-comment,
+    issue-triage,pr-fix,pr-review}**; no vitest import in dist; helpers in agent-lib/
+    (+ pr-fix-post.ts at src/ top-level), tests in nested __tests__/.
+  - **NO LIVE SIDE EFFECT** — all GitHub/git/model/sandbox MOCKED; no real commits/pushes/
+    PRs/comments, no live `flue run`. Last commit: Phase 5 slice 3 (pr-fix). Next slice =
+    `answer` or `repo-health`.
 - **Phase 5 slice 2 DONE ✅ — `issue-comment` workflow ported** (`src/workflows/issue-comment.ts`,
   `run` → `runIssueComment(ctx, deps)` DI seam). Single-phase, TOOL-ONLY agent (NO sandbox —
   reads issue/PR thread via bound read tools; skill caps at ≤2 reads, no checkout). Mints an
@@ -242,7 +264,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
 - [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
-  slice 2: issue-comment ✅)
+  slice 2: issue-comment ✅; slice 3: pr-fix ✅)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover

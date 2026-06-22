@@ -122,6 +122,68 @@ export async function withBuildSandbox<T>(
   }
 }
 
+/**
+ * The pr-fix variant of `withBuildSandbox`: pre-clone the repo and check out an
+ * EXISTING PR head branch (NOT `checkout -B`, which would create a new branch).
+ * The fix must land on — and push back to — the PR's own head branch, so we clone
+ * that branch directly (`git clone --branch <headRef>`). Caller-owns-lifetime
+ * (container created here, ALWAYS `remove()`d in a `finally`), the container is
+ * handed to the body so the workflow can run the deterministic in-sandbox push over
+ * the same checkout. Like `withBuildSandbox`, there is NO tool-only fallback — the
+ * fix genuinely needs the workspace, so a provisioning/clone failure THROWS
+ * (token-redacted). The `headRef` is workflow-resolved (`pulls.get().head.ref`),
+ * never model-chosen.
+ *
+ * ⚠ EGRESS DEFERRED: the container has full network + no SSRF floor — do not run
+ * untrusted input through it.
+ */
+export async function withPrFixSandbox<T>(
+  spec: { owner: string; repo: string; headRef: string },
+  token: string,
+  body: (sandbox: SandboxFactory, container: BuildContainer) => Promise<T>,
+  deps: {
+    ops?: BuildSandboxOps;
+    log?: { warn(msg: string, meta?: unknown): void };
+  } = {},
+): Promise<T> {
+  const ops = deps.ops ?? defaultBuildSandboxOps();
+  let container: BuildContainer | undefined;
+
+  try {
+    container = await ops.createContainer({
+      image: BUILD_IMAGE,
+      env: { GIT_TOKEN: token },
+    });
+    await preCloneHeadBranch(container, spec, token);
+    const sandbox = container.sandbox();
+    return await body(sandbox, container);
+  } finally {
+    if (container) await safeRemove(container, deps.log);
+  }
+}
+
+/** Clone the repo at the EXISTING PR head branch into `/workspace`. */
+async function preCloneHeadBranch(
+  container: BuildContainer,
+  spec: { owner: string; repo: string; headRef: string },
+  token: string,
+): Promise<void> {
+  // x-access-token:<token>@ authenticates a GitHub App installation token over
+  // HTTPS. `--branch <headRef>` checks out the PR's existing head branch so the fix
+  // commits land on it; a FULL clone (not --depth 1) so `git push origin <branch>`
+  // is fast-forwardable. The tokenized URL is NEVER logged (we don't echo it).
+  const url = `https://x-access-token:${token}@github.com/${spec.owner}/${spec.repo}.git`;
+  const clone = await container.exec(
+    `git clone --branch ${shellArg(spec.headRef)} ${shellArg(url)} ${BUILD_WORKSPACE}`,
+    { timeoutMs: 10 * 60_000 },
+  );
+  if (clone.exitCode !== 0) {
+    throw new Error(
+      `git clone --branch ${spec.headRef} failed (${clone.exitCode}): ${redact(clone.stderr.trim(), token)}`,
+    );
+  }
+}
+
 /** Clone the repo into `/workspace` and checkout -B the working branch. */
 async function preCloneRepo(
   container: BuildContainer,
