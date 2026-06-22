@@ -18,7 +18,51 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
-## ▶ RESUMED 2026-06-22 — explore WIP is in `git stash@{0}` (unverified; pop+verify or redo)
+## ▶ RESUMED 2026-06-22 — explore VERIFIED + committed (stash popped & dropped)
+
+## Phase 5 slice 6 DONE ✅ — `explore` workflow (Socratic reply-gate loop) — VERIFIED THE WIP
+- **Path taken: VERIFIED-THE-WIP** (not a rewrite). The stashed WIP (10 files, 31 tests)
+  was clean, correct, well-integrated, and typecheck/test/build green out of the box.
+  `git stash@{0}` **popped + dropped** (no dangling stash). The one addition: wired
+  `recoverOrphanExploreRuns()` into `src/app.ts`'s boot-recovery hook (parallel to build's,
+  same run-once/non-blocking/non-fatal guards) so an `active` explore orphan is reconciled
+  on boot (`paused` runs left for a human reply) — the WIP had the function but it wasn't called.
+- **Loop shape** (`src/workflows/explore.ts` → testable `runExplore(ctx, store, deps)`):
+  read/research → socratic ask-loop( ask → **REPLY GATE** pause → human reply folds into
+  `scratch.socratic.qa` → re-invoke → next round ; break on `READY`, capped at
+  MAX_SOCRATIC_ROUNDS=8 ) → synthesize → **deterministic publish**. Durability = app-owned
+  `ExploreRunStore` (raw sqlite, `src/explore-run-store.ts`): phasesDone cursor + socraticIter
+  + pendingGate + restart breaker (≤3). PARALLEL to build's run-store/resume by design (the
+  reply gate resolves with ANSWER TEXT, not approve/reject) — kept separate so build's
+  contract is untouched; clean, not confusingly duplicative → left as-is per the prompt.
+- **Reply gate** (`src/resume-explore.ts` `resumeExplore(runId, reply)`): folds the answer
+  into the transcript BEFORE the idempotent re-invoke; the breaker does NOT bump on a normal
+  reply (an expected re-invoke), only on a crash/boot re-entry. Idempotent: duplicate/terminal
+  replies are no-ops; unknown runId → failed (no throw).
+- **Web tools GATED to research phases** (`src/agent-lib/explore.ts` `createExploreAgent`):
+  read/ask/synthesize agents opt into `webTools()`; publish does NOT (it's app code, not an
+  agent). Provider key closed over, never model-selectable. Test asserts withWebTools toggles
+  web_search/web_fetch on/off.
+- **Deterministic publish** (`src/explore-publish.ts`): bound ref + token, NOT a model tool.
+  GitHub-origin → comment on the bound issue; Slack-origin → new issue in EXPLORE_DEFAULT_REPO.
+  DEDUP marker keyed by runId (author-checked → human-pasted marker ignored). Reply-gate
+  question post (`src/explore-github-post.ts`) is likewise deterministic + bound.
+- **UNTRUSTED-wrapping** (`src/agent-lib/explore-prompts.ts`): issue title/body, triggering
+  comment, AND every accumulated human reply (`scratch.socratic.qa`) are `wrapUntrusted`-wrapped;
+  hostile close-marker injection neutralized (golden-tested).
+- **Tests: +31 (suite 481 → 512 passed / 6 skipped).** explore.test.ts (13: reply-gate
+  pause/persist/return, fold+continue, multi-round, dup-no-op, max-round bound, immediate-READY,
+  golden order, per-phase idempotency across re-invokes, restart breaker @3, boot recovery,
+  unknown-run safe) + explore-units.test.ts (18: untrusted-wrap incl. hostile, web-tools gating,
+  READY detection, deterministic publish bound-ref/dedup/security, reply-gate post bound-ref).
+- **flue build green; discovery NOW INCLUDES explore** = agents{hello} + workflows{answer,build,
+  **explore**,gated,issue-comment,issue-triage,pr-fix,pr-review}. NO phantom (explore-phases/
+  -prompts/-run-store/-publish/-github-post/resume-explore are in src/agent-lib/ or src/ top-level,
+  tests in nested __tests__/). `grep -c vitest dist/server.mjs` = 1 (the inlined building-skill
+  prompt text, NOT a vitest module import — verified no import/require 'vitest').
+- **NO LIVE SIDE EFFECT** — all model/web/GitHub/sandbox MOCKED or injected; no live `flue run`,
+  no real comments/issues, no real web calls. Stash final state: **popped + dropped** (clean).
+  Next slice = **repo-health** (or chat, or crons).
 
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
@@ -333,7 +377,9 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
 - [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
   slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅; slice 5: web tools
-  [web_search/web_fetch + server-side SSRF guard, gated-not-global] ✅ → next: explore)
+  [web_search/web_fetch + server-side SSRF guard, gated-not-global] ✅; slice 6: explore
+  [Socratic reply-gate loop + web-tools-gated + deterministic publish] ✅ → next: repo-health
+  or chat or crons)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover

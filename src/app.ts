@@ -20,6 +20,7 @@ import {
   type ApprovalsBackend,
 } from './admin/approvals.ts';
 import { recoverOrphanRuns } from './resume.ts';
+import { recoverOrphanExploreRuns } from './resume-explore.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -384,6 +385,18 @@ function runBootRecovery(): void {
     })
     .catch((err: unknown) => {
       console.error('[boot] orphan recovery failed (non-fatal):', err);
+    });
+  // Same reconciliation for the explore run-store: re-invoke `active` orphans (a
+  // crash mid-research), LEAVE `paused` runs (those await a human reply in the
+  // thread). The explore restart-count breaker caps a wedged run.
+  void recoverOrphanExploreRuns()
+    .then((ids) => {
+      if (ids.length) {
+        console.log(`[boot] recovered ${ids.length} orphaned explore run(s): ${ids.join(', ')}`);
+      }
+    })
+    .catch((err: unknown) => {
+      console.error('[boot] explore orphan recovery failed (non-fatal):', err);
     });
 }
 runBootRecovery();
