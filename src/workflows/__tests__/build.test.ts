@@ -54,14 +54,19 @@ function ctx(input: BuildInput): FlueContext<BuildInput> {
 function recordingDeps(opts: {
   verdicts?: Record<string, string>;
   gates?: { post_architect?: boolean; post_reviewer?: boolean };
+  guardrails?: string;
 } = {}) {
   const phases: string[] = [];
   const gateAsks: string[] = [];
   const prOpens: string[] = [];
   const gates = { post_architect: true, post_reviewer: false, ...opts.gates };
+  let gateCommentId = 9000;
   const deps: BuildDeps = {
     async runPhase(_c, _r, name) {
       phases.push(name);
+      if (name === 'guardrails') {
+        return { text: opts.guardrails ?? 'READY — verified.' };
+      }
       if (name.startsWith('reviewer:')) {
         return { text: opts.verdicts?.[name] ?? 'VERDICT: APPROVED\n\nLGTM.' };
       }
@@ -69,10 +74,11 @@ function recordingDeps(opts: {
     },
     async postGateComment(_c, _r, gate) {
       gateAsks.push(gate);
+      return { commentId: gateCommentId++ };
     },
     async openPullRequest(_c, r) {
       prOpens.push(r.id);
-      return { html_url: `https://gh/pr/${r.issue}` };
+      return { html_url: `https://gh/pr/${r.issue}`, number: 314 };
     },
     gateEnabled: (g) => gates[g],
     parseVerdict: defaultBuildDeps().parseVerdict,
@@ -263,6 +269,56 @@ describe('build — post_reviewer gate (mid-loop pause/resume)', () => {
       'recheck:0',
       'reviewer:1',
     ]);
+  });
+});
+
+describe('build — guardrails PROCEED / BLOCKED + bootstrap bypass', () => {
+  it('a READY guardrails proceeds the full happy path through open-PR', async () => {
+    const t = recordingDeps({ gates: { post_architect: false }, guardrails: 'READY — verified.' });
+    const res = await runBuild(ctx({ ...INPUT }), store, t.deps);
+    expect(res.status).toBe('complete');
+    expect(res.prUrl).toBe('https://gh/pr/42');
+    expect(t.phases).toEqual(['guardrails', 'architect', 'executor', 'reviewer:0']);
+    // The PR number was recorded in the run record.
+    expect(store.get(INPUT.runId)!.scratch.prNumber).toBe('314');
+  });
+
+  it('a BLOCKED guardrails terminalizes the run (failed) and runs nothing after', async () => {
+    const t = recordingDeps({ guardrails: 'BLOCKED — no test framework configured.' });
+    const res = await runBuild(ctx({ ...INPUT }), store, t.deps);
+    expect(res.status).toBe('failed');
+    expect(res.reason).toBe('guardrails-blocked');
+    expect(t.phases).toEqual(['guardrails']); // architect never ran
+    expect(t.prOpens).toEqual([]);
+    expect(store.get(INPUT.runId)!.status).toBe('failed');
+  });
+
+  it('a BLOCKED guardrails is BYPASSED for a bootstrap-labelled issue (executor establishes tooling)', async () => {
+    const t = recordingDeps({
+      gates: { post_architect: false },
+      guardrails: 'BLOCKED — no test framework, but this is a bootstrap task.',
+    });
+    const res = await runBuild(
+      ctx({ ...INPUT, issueContext: { labels: ['lastlight:bootstrap'] } }),
+      store,
+      t.deps,
+    );
+    // The BLOCK is bypassed → the build proceeds all the way to the PR.
+    expect(res.status).toBe('complete');
+    expect(t.phases).toEqual(['guardrails', 'architect', 'executor', 'reviewer:0']);
+  });
+});
+
+describe('build — gate-comment id recorded in the run record', () => {
+  it('records the posted gate-comment id under gateComment:post_architect, idempotently', async () => {
+    const t = recordingDeps({ gates: { post_architect: true } });
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // pause @ post_architect
+    const rec = store.get(INPUT.runId)!;
+    expect(rec.scratch['gateComment:post_architect']).toBe('9000');
+    // A re-pause does NOT re-post (idempotent) → the id stays the same, ask posts once.
+    await runBuild(ctx({ ...INPUT }), store, t.deps);
+    expect(store.get(INPUT.runId)!.scratch['gateComment:post_architect']).toBe('9000');
+    expect(t.gateAsks).toEqual(['post_architect']);
   });
 });
 

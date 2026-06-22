@@ -40,6 +40,8 @@ export interface ArchitectIssueContext {
   comment?: string;
   /** The requester's handle (trigger metadata — established out of band). */
   sender?: string;
+  /** Issue label names (trigger metadata) — used for the guardrails bootstrap bypass. */
+  labels?: string[];
 }
 
 export interface ArchitectPromptContext {

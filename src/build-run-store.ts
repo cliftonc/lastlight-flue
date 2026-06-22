@@ -159,6 +159,18 @@ export class BuildRunStore {
       .run(JSON.stringify(phasesDone), JSON.stringify(merged), id);
   }
 
+  /**
+   * Merge scratch POINTERS into the run record WITHOUT marking a phase done — for
+   * side-effect anchors recorded outside a phase boundary (a posted gate-comment id,
+   * a PR number). Re-reads the current row so concurrent fields aren't clobbered.
+   */
+  recordScratch(id: string, scratch: Record<string, string>): void {
+    const cur = this.get(id);
+    if (!cur) return;
+    const merged = { ...cur.scratch, ...scratch };
+    this.db.prepare('UPDATE build_runs SET scratch = ? WHERE id = ?').run(JSON.stringify(merged), id);
+  }
+
   /** Suspend at a gate: record the pending gate + mark paused. Idempotent. */
   setPending(id: string, gate: GateName): void {
     this.db

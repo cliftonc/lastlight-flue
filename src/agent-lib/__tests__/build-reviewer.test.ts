@@ -368,8 +368,8 @@ describe("defaultBuildDeps.runPhase — per-cycle reviewer-loop routing (over in
     expect(rc.text).toContain("REQUEST_CHANGES");
   });
 
-  it("still throws for an unwired phase (guardrails lands next)", async () => {
+  it("throws on an UNKNOWN phase name (no body routed)", async () => {
     const deps = defaultBuildDeps(noopArch, noopExec, reviewerDeps("VERDICT: APPROVED"), fixDeps().deps);
-    await expect(deps.runPhase(ctx(), RUN, "guardrails")).rejects.toThrow(/not wired yet/);
+    await expect(deps.runPhase(ctx(), RUN, "bogus-phase")).rejects.toThrow(/unknown phase/);
   });
 });

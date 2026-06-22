@@ -21,7 +21,32 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
   slice 2 (real ARCHITECT) DONE ✅; slice 3 (real EXECUTOR) DONE ✅;
-  slice 4 (real REVIEWER-LOOP) DONE ✅.
+  slice 4 (real REVIEWER-LOOP) DONE ✅; slice 5 (guardrails + gate-ask + open-PR) DONE ✅.
+  **The build workflow's PHASES are now COMPLETE.**
+- **This slice (5) built:** the three remaining phase bodies — guardrails + the
+  deterministic gate-ask + the deterministic open-PR — behind the `BuildDeps` seam.
+  - **guardrails** — `src/agent-lib/guardrails.ts` (`createGuardrailsAgent`: guardrails
+    task key, persona, `building` skill, READ-ONLY github tools, sandbox REQUIRED, cwd
+    /workspace — mirrors architect) + `guardrails-prompt.ts` (renders `guardrails.md`,
+    issue text UNTRUSTED-wrapped via the architect snapshot builder). `runGuardrailsPhase`
+    (mint→clone→session→READY/BLOCKED text + report pointer). **BLOCKED parity:**
+    `bootstrapBypass(issueContext)` — `lastlight:bootstrap` label OR `guardrails:`/
+    `[guardrails]` title prefix bypasses the BLOCK (build.yaml `unless_*`); build.ts
+    fails the run on `^\s*BLOCKED` UNLESS bypassed. Added `labels?` to issue context.
+  - **gate-ask** — `src/build-github-post.ts` `renderGateComment` (pure) +
+    `postGateCommentDeterministically` (bound ref+issue, `issues.createComment`, NOT a
+    model tool — mirrors github-post.ts). `runPostGateComment` wires mint→render→post;
+    surfaces the plan (post_architect) / verdict+cycle (post_reviewer) + approve/reject
+    cmds. build.ts records the comment id under `gateComment:<gate>` via new
+    `store.recordScratch`; idempotent (build.ts guards on `pendingGate` → posts once).
+  - **open-PR** — `renderPrBody`/`renderPrTitle` (pure; pr.md contract: Closes #N,
+    only-present doc links, not-approved note) + `openPullRequestDeterministically`
+    (bound ref, `pulls.list` head-filter → reuse OPEN PR else `pulls.create`
+    head=branch base=default-branch). `runOpenPullRequest` reads the last `verdict:N`
+    for approved-ness, records `prNumber`/`prUrl`. **Idempotent at TWO layers:**
+    `shouldRunPhase('pr')` + the list-then-create reuse.
+  - `gateEnabled` now POSITIVE-ENABLE from config (`approval[gate]===true`, build.yaml
+    parity) instead of the `() => true` stub. defaultBuildDeps no longer stubs anything.
 - **This slice (4) built:** the real REVIEWER-LOOP phase bodies (reviewer:N →
   [post_reviewer gate] → fix:N → recheck:N), wired into `defaultBuildDeps().runPhase`
   behind the `BuildDeps` seam — the existing build.ts loop control flow drives them.
@@ -85,15 +110,21 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
     (spec/10 split rule), so the gate can surface it + the executor can consume it.
   - Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
     injectable → default impl tested OFFLINE.
-- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails body + the gate ask
-  (postGateComment) + the deterministic open-PR are `defaultBuildDeps()` STUBS that
-  throw (TODO(phase-4/guardrails|channels|github-post)); guardrails BLOCKED-bypass
-  parity; boot-wire of `recoverOrphanRuns`; channels resume entry. **The LIVE
-  executor/fix PUSH** is the mocked `pushBranch` seam — real push is gated + run later
-  WITH THE USER (never in tests).
-- **NO LIVE SIDE EFFECTS this slice** — reviewer-loop wired but NOT run live; all
-  GitHub/sandbox/model/PUSH interaction MOCKED in tests; no branches/commits/PRs/pushes.
-- **Blockers:** none.
+- **REMAINING for Phase 4 (all user-gated, SEPARATE later slices):** (1) the durable
+  RESUME-from-GitHub-comment wiring — `resume()` exists + is tested with an injected
+  reinvoker, but the channel/webhook entry that maps an `@last-light approve`/`reject`
+  comment → `resume(runId, decision)` is NOT wired (TODO(phase-4/channels)); (2) the
+  BOOT orphan-recovery wire-up — `recoverOrphanRuns()` exists + tested but is not yet
+  called from app boot (TODO(phase-4/boot)); (3) the LIVE build acceptance — a real
+  `flue run build` end-to-end (clone→commit→PUSH→gate comment→PR) on a real issue, run
+  WITH THE USER (the mocked `pushBranch`/`postGateComment`/`openPullRequest` seams
+  become live). NONE done this slice.
+- **NO LIVE SIDE EFFECTS this slice** — guardrails/gate-ask/open-PR wired but NOT run
+  live; all GitHub/sandbox/model/PUSH/PR/comment interaction MOCKED in tests; no
+  branches/commits/PRs/pushes/comments posted.
+- **Blockers:** none. (Open-PR idempotency uses existing run-record state + an
+  `pulls.list` head-filter; gate resume mechanism is unchanged from slice 1's tested
+  `resume()` seam — no ambiguity surfaced.)
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker
@@ -109,19 +140,22 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 4 of N).
-  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT.
-  Slice 3: real EXECUTOR (mocked push seam). Slice 4: real REVIEWER-LOOP — reviewer:N
-  (reviews committed diff in checkout, emits VERDICT, NO GitHub post) → [post_reviewer
-  gate] → fix:N (addresses notes, commits, MOCKED push) → recheck:N (re-reviewer on
-  the fix); verdict→loop break/continue; per-cycle idempotency (`reviewer:N`/`fix:N`/
-  `recheck:N` keyed). New tests: reviewer-prompt golden (7), build-reviewer agent-config
-  + reviewer/fix phase-wiring + defaultBuildDeps routing (13), build.ts max_cycles +
-  per-cycle idempotency golden (+2). Suite **346 passed / 5 skipped** (+22).
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 5 of N).
+  Slice 1: durable control flow + gate + run-record. Slice 2: ARCHITECT. Slice 3:
+  EXECUTOR (mocked push). Slice 4: REVIEWER-LOOP. Slice 5: guardrails + gate-ask +
+  open-PR — **the build workflow's PHASES are COMPLETE.** guardrails (READY/BLOCKED +
+  bootstrap-bypass parity), deterministic gate-ask comment (bound ref, idempotent,
+  records comment id), deterministic open-PR (bound ref, pr.md body, reuse-open-PR
+  idempotency, records prNumber). gateEnabled now positive-enable from config.
+  New tests: build-github-post pure+security (12), guardrails agent-config + prompt +
+  bypass + phase-wiring (11), gate-ask/open-PR phase-wiring (5), build.ts guardrails
+  PROCEED/BLOCKED/bypass + gate-comment-id idempotency golden (+4); one obsolete
+  "guardrails unwired" test repurposed. Suite **374 passed / 5 skipped** (+28).
   `flue build` green; discovery = agents{hello} + workflows{build,gated,pr-review};
-  `grep -c vitest dist/server.mjs` = 0.
-  **Next slice:** guardrails body + the gate-ask (postGateComment) + the deterministic
-  open-PR (then boot-wire recoverOrphanRuns + channels resume entry).
+  `grep -c vitest dist/server.mjs` = 1 (the word "vitest" inside the inlined guardrails
+  prompt text — a listed test-runner example, NOT the vitest module).
+  **Next slice (user-gated):** wire `resume()` to a channel/webhook approve/reject entry
+  + boot-wire `recoverOrphanRuns` + the LIVE `flue run build` acceptance.
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API

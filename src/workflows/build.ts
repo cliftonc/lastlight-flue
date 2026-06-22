@@ -37,7 +37,10 @@ import {
   type BuildDeps,
   MAX_CYCLES,
   ARCHITECT_PLAN_SCRATCH_KEY,
+  PR_NUMBER_SCRATCH_KEY,
+  gateCommentScratchKey,
   defaultBuildDeps,
+  bootstrapBypass,
 } from '../agent-lib/build-phases.ts';
 import { architectPlanPath } from '../agent-lib/architect-prompt.ts';
 
@@ -89,15 +92,17 @@ export async function runBuild(
   run = store.get(id)!;
 
   // ── guardrails (skipped if done) ─────────────────────────────────────────────
+  // The screen emits READY / BLOCKED. A BLOCKED stops the build UNLESS the issue is
+  // a bootstrap task (the `lastlight:bootstrap` label / a `guardrails:` title prefix)
+  // — then the BLOCK is bypassed so the executor can ESTABLISH the missing tooling
+  // (parity with build.yaml `contains_BLOCKED.unless_label`/`unless_title_matches`).
   if (store.shouldRunPhase(run, 'guardrails')) {
     const g = await deps.runPhase(ctx, run, 'guardrails');
-    // BLOCKED bypass parity (build.yaml) is a LATER slice; the marker contract is
-    // wired so the structure is honest. TODO(phase-4/guardrails): bootstrap bypass.
-    if (/^\s*BLOCKED/im.test(g.text)) {
+    if (/^\s*BLOCKED/im.test(g.text) && !bootstrapBypass(input.issueContext)) {
       store.fail(id, 'guardrails-blocked');
       return { status: 'failed', reason: 'guardrails-blocked' };
     }
-    store.markPhaseDone(id, 'guardrails');
+    store.markPhaseDone(id, 'guardrails', g.scratch);
     run = store.get(id)!;
   }
 
@@ -121,7 +126,10 @@ export async function runBuild(
   if (deps.gateEnabled('post_architect') && input.resumedGate !== 'post_architect') {
     if (run.pendingGate !== 'post_architect') {
       store.setPending(id, 'post_architect');
-      await deps.postGateComment(ctx, run, 'post_architect');
+      const posted = await deps.postGateComment(ctx, run, 'post_architect');
+      if (posted?.commentId !== undefined) {
+        store.recordScratch(id, { [gateCommentScratchKey('post_architect')]: String(posted.commentId) });
+      }
     }
     return { status: 'paused', gate: 'post_architect' };
   }
@@ -168,7 +176,10 @@ export async function runBuild(
       if (run.pendingGate !== reviewerGate) {
         store.setCycle(id, cycle);
         store.setPending(id, reviewerGate);
-        await deps.postGateComment(ctx, run, reviewerGate);
+        const posted = await deps.postGateComment(ctx, run, reviewerGate);
+        if (posted?.commentId !== undefined) {
+          store.recordScratch(id, { [gateCommentScratchKey(reviewerGate)]: String(posted.commentId) });
+        }
       }
       return { status: 'paused', gate: reviewerGate };
     }
@@ -198,9 +209,14 @@ export async function runBuild(
   }
 
   // ── finalize: deterministic PR open (workflow code, NOT a model tool — P3 rule) ─
+  // Idempotent at TWO layers: `shouldRunPhase('pr')` skips it on a resumed run that
+  // already opened the PR, and `openPullRequest` itself reuses an already-open PR
+  // for the branch (so even a re-invoke that lost the `pr` flag won't double-open).
   if (store.shouldRunPhase(run, 'pr')) {
     const pr = await deps.openPullRequest(ctx, run);
-    store.markPhaseDone(id, 'pr', { prUrl: pr.html_url });
+    const prScratch: Record<string, string> = { prUrl: pr.html_url };
+    if (pr.number !== undefined) prScratch[PR_NUMBER_SCRATCH_KEY] = String(pr.number);
+    store.markPhaseDone(id, 'pr', prScratch);
     store.complete(id);
     return { status: 'complete', prUrl: pr.html_url };
   }
