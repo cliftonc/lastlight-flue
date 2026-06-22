@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
-import { runPrReview, type PrReviewDeps, type PrReviewInput } from "./pr-review.ts";
-import type { PostedReview, PrRef } from "../github-post.ts";
+import { runPrReview, type PrReviewDeps, type PrReviewInput } from "../pr-review.ts";
+import type { PostedReview, PrRef } from "../../github-post.ts";
 
 // A minimal FlueContext stand-in: only `payload` + `log` + `init` are touched by
 // runPrReview, and `init` is never called because the reviewer run is injected.

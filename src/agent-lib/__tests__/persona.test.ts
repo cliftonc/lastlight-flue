@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { loadPersona } from './persona.ts';
+import { loadPersona } from '../persona.ts';
 
 describe('loadPersona', () => {
   it('returns a non-empty string', () => {

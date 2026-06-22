@@ -15,7 +15,9 @@ function stubSkillMd(): Plugin {
     name: 'stub-skill-md',
     enforce: 'pre',
     resolveId(source) {
-      if (source.endsWith('/SKILL.md') || source.endsWith('.md')) return STUB_ID;
+      // Only stub `/SKILL.md` (the Flue skill-attribute import). Matching any
+      // `.md` was broader than needed and would mask real markdown-import issues.
+      if (source.endsWith('/SKILL.md')) return STUB_ID;
       return null;
     },
     load(id) {

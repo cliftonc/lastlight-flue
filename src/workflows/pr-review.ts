@@ -14,7 +14,7 @@
  *      fallback (GitHub forbids reviewing your own PR).
  *
  * Slice scope: single phase, no loop, no gate, no run-record/resume (that's Phase 4).
- * SANDBOX DEFERRED — the reviewer is tool-only this slice (see agents/reviewer.ts).
+ * SANDBOX DEFERRED — the reviewer is tool-only this slice (see agent-lib/reviewer.ts).
  *
  * Beta.2 form: `export async function run(ctx)` — there is NO `defineWorkflow` /
  * object form in @flue/runtime 1.0.0-beta.2 (spec/flue-reference.md §0).
@@ -33,8 +33,8 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createReviewerAgent } from "../agents/reviewer.ts";
-import { renderReviewPrompt } from "./pr-review-prompt.ts";
+import { createReviewerAgent } from "../agent-lib/reviewer.ts";
+import { renderReviewPrompt } from "../agent-lib/pr-review-prompt.ts";
 import {
   mapVerdictToEvent,
   extractReviewBody,

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { renderReviewPrompt } from "./pr-review-prompt.ts";
-import { parseReviewerVerdict } from "../engine/verdict.ts";
+import { renderReviewPrompt } from "../pr-review-prompt.ts";
+import { parseReviewerVerdict } from "../../engine/verdict.ts";
 
 describe("renderReviewPrompt — thin review-request assembly", () => {
   it("renders the PR context block from the input", () => {

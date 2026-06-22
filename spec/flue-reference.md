@@ -47,6 +47,29 @@ names):**
   may be sync or async; receives `{ id }`. A file in `src/agents/<name>.ts` whose
   **default export** is `createAgent(...)`; optional `route: AgentRouteHandler`
   export ⇒ `POST /agents/<name>/:id`; optional `description` string export.
+- **Discovery rule (EMPIRICALLY VERIFIED 2026-06-22, beta.2) — IMMEDIATE files only,
+  build SKIPS bad ones (no error):** Flue discovers **every IMMEDIATE file** in
+  `src/agents/`, `src/workflows/`, `src/channels/` as an agent/workflow/channel
+  (filename = name). **Nested files (e.g. `src/agents/__tests__/x.ts`,
+  `src/agent-lib/x.ts`) are NOT discovered.** Crucially: `flue build` does **NOT
+  error** on a mis-placed immediate file — it **silently lists it as a discovered
+  entry and INLINES its top-level module-eval into `dist/server.mjs`** regardless
+  of whether it's a valid agent (default-export `createAgent`) / workflow (`export
+  run`). So a co-located `*.test.ts` (which `import … from 'vitest'` at module load)
+  or a non-default-export helper (a factory / pure fn) placed as an immediate file
+  becomes a **phantom discovered entry**, and the test file's `vitest` import gets
+  inlined → the server entry crashes at load ("Vitest failed to access its internal
+  state") whenever `dist/server.mjs` is imported (i.e. on `flue run` / server boot).
+  The build EMIT itself still succeeds, so this is silent until run-time.
+  **⇒ RULE for this repo:** never put `*.test.ts` or a non-agent/non-workflow helper
+  as an IMMEDIATE file under `agents/`/`workflows/`/`channels/`. Co-located tests go
+  in a nested `__tests__/` subdir; reviewer-stack helpers (factories, prompt
+  assembly, persona loader) live in `src/agent-lib/` and are imported by the real
+  discovered workflow. Confirm clean discovery by reading `flue build`'s
+  `agents`/`workflows` list and `grep '^//#region src/(agents|workflows)/'
+  dist/server.mjs` (only real entrypoints should appear; `grep -c vitest
+  dist/server.mjs` must be 0). (Other co-located `*.test.ts` under `src/engine/`,
+  `src/admin/`, `src/tools/`, `src/` root are FINE — those dirs are not discovered.)
 - **Workflows:** the **file/function form is the ONLY form** — a file in
   `src/workflows/<name>.ts` exporting `export async function run(ctx)`. **There is
   NO `defineWorkflow` and NO object form** in beta.2. Shape:

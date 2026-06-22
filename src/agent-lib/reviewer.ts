@@ -1,6 +1,12 @@
 /**
  * The PR-review reviewer agent.
  *
+ * NOT a discovered agent: this is a `createReviewerAgent(ref, octokit)` FACTORY
+ * (no default export) used by the `pr-review` workflow, so it lives in
+ * `src/agent-lib/` (not `src/agents/`) — Flue discovers every IMMEDIATE file in
+ * `src/agents/` as an addressable agent, so a non-default-export helper there
+ * would be mis-discovered as a phantom agent. See PROGRESS / flue-reference §0.
+ *
  * Phase 3 vertical slice (design/phase-3-pr-review.md). The reviewer:
  *   - has READ-ONLY GitHub tools bound to (ref, token) — closed over, never
  *     model-selected (spec/09 security spine);

@@ -17,6 +17,40 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - **Phase:** 3 — Vertical slice `pr-review` **🔶 IN PROGRESS** (slice 1 done; live
   acceptance pending). Phase 2 ✅, Phase 1 ✅, Phase 0 ✅.
 
+### Phase 3 · slice 1.5 — BUILD-BREAK FIX: clean Flue discovery ✅ (UNBLOCKS the live run)
+- **Bug:** `flue run pr-review` crashed at its build step with "Vitest failed to
+  access its internal state … 'vitest' is imported inside Vite/Vitest config file".
+- **Root cause (now in flue-reference §0, EMPIRICALLY VERIFIED):** Flue discovers
+  EVERY immediate file in `src/agents/`+`src/workflows/`(+`channels/`) as an
+  entry. `flue build` does **NOT error** on a bad immediate file — it **silently
+  lists it + inlines its module-eval into `dist/server.mjs`**. So the co-located
+  `*.test.ts` files (`vitest` import) + non-default-export helpers became phantom
+  entries; the test files' `vitest` import got inlined → server entry crashes at
+  LOAD time (run-time), even though the build EMIT succeeded. Phantom agents seen:
+  `persona`, `reviewer`; phantom workflows: `pr-review-prompt`, + `*.test`.
+- **Fix (moves only, no logic change):**
+  - Helpers → **`src/agent-lib/`** (new, NOT discovered): `agents/persona.ts`,
+    `agents/reviewer.ts` (factory), `workflows/pr-review-prompt.ts`. All were
+    depth-1 under `src/` and stay depth-1, so their `../` imports are unchanged;
+    `reviewer.ts` still imports `./persona.ts` (sibling). `pr-review.ts` updated to
+    import from `../agent-lib/{reviewer,pr-review-prompt}.ts`.
+  - Co-located tests → nested **`__tests__/`** (matches `src/**/*.test.ts`, NOT
+    discovered): `persona.test.ts`+`pr-review-prompt.test.ts` →
+    `src/agent-lib/__tests__/`; `pr-review.test.ts` → `src/workflows/__tests__/`.
+    Relative imports bumped one `../`.
+- **Verified:** `flue build --target node` succeeds; discovery is now exactly
+  **agents = {hello}**, **workflows = {gated, pr-review}** (confirmed via build's
+  own agent/workflow list AND `grep '^//#region src/(agents|workflows)/'
+  dist/server.mjs` → only hello/gated/pr-review). `grep -c vitest dist/server.mjs`
+  = **0** (was non-zero). `pnpm typecheck` clean. `pnpm test` **264 passed / 4
+  skipped** — UNCHANGED (the 3 moved tests still run from `__tests__/`).
+- **Hardening:** tightened `vitest.config.ts` `stubSkillMd.resolveId` from
+  `endsWith('.md')` → `endsWith('/SKILL.md')` (was masking real markdown imports;
+  all skill imports end in `/SKILL.md`, verified). Tests still 264/4.
+- **NO live run / NO GitHub post happened.** This UNBLOCKS the Phase 3 live
+  `flue run pr-review` (done by the main loop, not a subagent).
+- **Last commit:** see `git log` (Phase 3: fix Flue discovery / build break).
+
 ### Phase 3 · slice 1 — pr-review workflow + reviewer agent + deterministic poster ✅
 - **Built:** `src/workflows/pr-review.ts` (`export async function run(ctx)` — the
   only beta.2 form), `src/agents/reviewer.ts` (`createReviewerAgent(ref, octokit)`),
