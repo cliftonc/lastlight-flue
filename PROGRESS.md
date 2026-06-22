@@ -590,6 +590,43 @@ status`/`/health` green, dashboard loads, runs inspectable" — is **MET**
 Phase-2 items are all blocked-on or better-built-with Phase 3/5; the compatibility
 surface (server, auth, CLI, admin reads, dashboard) is in place.
 - [ ] 3 — Vertical slice: pr-review ← **IN PROGRESS.** slice 1 ✅ (workflow + reviewer agent + deterministic poster + COMMENT fallback; sandbox/build-gate deferred; live acceptance PENDING, gated test unrun).
+
+### Phase-3 fix: persona ENOENT under `flue build` (build-time markdown inlining)
+- **Bug (confirmed by a real `flue run`):** workflow built + GitHub token minted,
+  then crashed `ENOENT … open '…/agent-context/rules.md'`. Root cause:
+  `loadPersona()` (`src/agent-lib/persona.ts`) read `agent-context/{rules,security,
+  soul}.md` via `readFileSync` on an `import.meta.url`-derived path AT RUNTIME.
+  Under `flue build` persona.ts is inlined into `dist/server.mjs`, so
+  `import.meta.url` → `dist/`, the path resolved to `<root>/agent-context` (files
+  live at `src/agent-context/`) AND the `.md` files were never shipped to dist.
+  Unit tests passed only because tsx runs from `src/`. Broke EVERY persona-using
+  agent under a real run/deploy → blocked the Phase-3 live milestone.
+- **Fix (Flue-idiomatic, build-time):** persona.ts now imports the three files via
+  `import rules from '../agent-context/rules.md' with { type: 'markdown' }` (+
+  security, soul) — Flue INLINES the contents as strings at build time (same
+  mechanism skills use). No fs/path/import.meta.url at runtime. Public API
+  unchanged: order preserved (rules→security→soul), `\n\n---\n\n` joiner, optional
+  `opts.suffix` — callers/tests untouched.
+- **vitest plugin:** `stub-skill-md` → `stub-markdown` with TWO branches:
+  `*/SKILL.md` → skill stub `{ name, __stub }` (unchanged); any other `*.md` →
+  the REAL file contents inlined as a default string (loaded in the `load` hook),
+  so persona tests still assert real content offline and match the build.
+- **Verified (no live run):** `flue build --target node` ✅; agent-context CONTENT
+  inlined into `dist/server.mjs` — `grep -c "diligent and methodical open-source
+  maintenance bot" dist/server.mjs` = 1 (also GitHub-First Coordination=1,
+  USER_CONTENT_UNTRUSTED=1), present as an escaped JS string literal → build-time
+  inlining proven. `pnpm typecheck` clean; `pnpm test` 264 passed / 4 skipped
+  (persona test count unchanged). Discovery clean (agents={hello},
+  workflows={gated,pr-review}); `grep -c vitest dist/server.mjs` = 0. Verified
+  markdown-import behaviour recorded in flue-reference §0.
+  **⇒ UNBLOCKS the live `flue run pr-review`** (not run here; left to the main loop).
+- **Follow-up (NOT this slice):** `src/config.ts` + `src/admin/dashboard.ts` also
+  use `import.meta.url` + `readFileSync`, but read EXTERNAL runtime files (config
+  YAML resolved from cwd; prebuilt dashboard HTML assets) that legitimately exist
+  on disk at deploy time — NOT authored source needing inlining — so not the same
+  bug. Re-confirm dashboard asset paths resolve from the built entry when dashboard
+  serving is wired live; prompts are already string-rendered, skills already use
+  the `with { type: 'skill' }` build path.
 - [ ] 4 — build + durable approval gate
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)

@@ -105,6 +105,27 @@ names):**
   import, so `vitest.config.ts` adds a `stub-skill-md` plugin mapping `*/SKILL.md`
   to a stub `SkillReference` for offline unit tests (the real skill loading is a
   Flue-build/tsx concern, exercised by `flue run`, not by `pnpm test`).
+- **Markdown instructions/context import (EMPIRICALLY VERIFIED 2026-06-22, beta.2)
+  — how authored agent instructions/context reach the BUILT runtime:** `import x
+  from './file.md' with { type: 'markdown' }` makes Flue **INLINE the file's
+  CONTENTS as a default-exported JS STRING into `dist/server.mjs` at BUILD time**
+  (the same build-time mechanism skills use). Verified: after `flue build
+  --target node`, a distinctive sentence from `src/agent-context/soul.md` appears
+  verbatim (as an escaped JS string literal, e.g. `...a diligent and methodical
+  open-source maintenance bot...`) in `dist/server.mjs`. The attribute is
+  REQUIRED — a bare `.md` import fails the build, and `SKILL.md` must use `type:
+  'skill'` instead (different inlining). This is the Flue-idiomatic replacement
+  for reading authored `.md` from disk at runtime: a `readFileSync` on an
+  `import.meta.url`-derived path is WRONG, because the source module is inlined
+  into `dist/server.mjs` (so `import.meta.url` → `dist/`) and the `.md` files are
+  not copied to the output — they must be inlined via the import attribute or they
+  won't exist at runtime (this was the persona ENOENT crash; see PROGRESS).
+  Typechecks via `@flue/runtime`'s `types/index.d.ts`, which triple-slash-
+  references `types/markdown-md.d.ts` (`declare module '*.md'` → default `string`).
+  Vite/Vitest cannot parse the raw `.md`, so `vitest.config.ts`'s `stub-markdown`
+  plugin has two branches: `*/SKILL.md` → skill stub `{ name, __stub }`; any other
+  `*.md` → the REAL file contents inlined as a default string (so persona tests
+  assert real content offline, matching the build).
 - **Invocation:** **NO top-level `invoke` export.** Workflows run via the `flue
   run <name>` CLI, over HTTP, or programmatically via `invokeWorkflowAttached` /
   `handleWorkflowRequest` (lower-level). `dispatch(agent, { id, input })` is the

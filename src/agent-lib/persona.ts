@@ -1,7 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
 // Shared agent persona — the single `instructions` string handed to EVERY role
 // agent (workflow + chat). It concatenates the canonical `agent-context/*.md`
 // files so there is ONE persona source, no bifurcation between surfaces.
@@ -13,18 +9,26 @@ import { dirname, join } from 'node:path';
 // Behaviour matches the reference `loadAgentContext()`
 // (~/work/lastlight/src/workflows/loader.ts): the `.md` files are concatenated
 // in ALPHABETICAL filename order (rules → security → soul) and joined with a
-// `\n\n---\n\n` separator. Reading from disk via fs (path resolved relative to
-// this module) keeps the loader unit-testable offline with no build step.
+// `\n\n---\n\n` separator.
+//
+// The three files are imported with `with { type: 'markdown' }` so Flue INLINES
+// their contents as strings at BUILD time (see flue-reference §0 + the
+// "Markdown instructions" section of guide/building-agents.md). This is the
+// same build-time mechanism skills use (`with { type: 'skill' }`). It replaces
+// the previous `readFileSync(import.meta.url-derived path)` runtime read, which
+// broke under `flue build`: persona.ts is inlined into `dist/server.mjs`, so
+// `import.meta.url` resolved to `dist/` and the files were neither there nor
+// shipped — every persona-using agent crashed at runtime with ENOENT. No
+// fs/path/import.meta.url reads happen here anymore.
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-// agents/persona.ts → ../agent-context (copied under src/ so it travels with the
-// authored source; see PROGRESS for the deviation from the design's root layout).
-const AGENT_CONTEXT_DIR = join(HERE, '..', 'agent-context');
+import rules from '../agent-context/rules.md' with { type: 'markdown' };
+import security from '../agent-context/security.md' with { type: 'markdown' };
+import soul from '../agent-context/soul.md' with { type: 'markdown' };
 
 // The canonical persona files, in the order the reference loader emits them
-// (alphabetical filename sort). Keep this list explicit so the loader is
-// deterministic and does not depend on directory enumeration order.
-const PERSONA_FILES = ['rules.md', 'security.md', 'soul.md'] as const;
+// (alphabetical filename sort): rules → security → soul. Keep this list explicit
+// so the loader is deterministic.
+const PERSONA_PARTS = [rules, security, soul] as const;
 
 const SEPARATOR = '\n\n---\n\n';
 
@@ -39,16 +43,12 @@ export interface LoadPersonaOptions {
 
 /**
  * Build the shared agent persona / `instructions` string from
- * `agent-context/{rules,security,soul}.md`.
+ * `agent-context/{rules,security,soul}.md` (inlined at build time).
  *
  * @returns the concatenated persona, optionally with `opts.suffix` appended.
  */
 export function loadPersona(opts: LoadPersonaOptions = {}): string {
-  const parts = PERSONA_FILES.map((name) =>
-    readFileSync(join(AGENT_CONTEXT_DIR, name), 'utf-8').trim(),
-  );
-
-  let persona = parts.join(SEPARATOR);
+  let persona = PERSONA_PARTS.map((part) => part.trim()).join(SEPARATOR);
 
   const suffix = opts.suffix?.trim();
   if (suffix) {
