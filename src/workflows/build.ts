@@ -127,9 +127,13 @@ export async function runBuild(
   }
 
   // ── executor (skipped if done) ───────────────────────────────────────────────
+  // The executor reads the architect plan from the checkout, implements + COMMITS
+  // it in-sandbox, and the workflow PUSHES the branch (mocked in tests). Its phase
+  // result carries scratch POINTERS (the executor-summary file path + the commit
+  // sha — never the diff blob; spec/10) that anchor the reviewer/PR phases.
   if (store.shouldRunPhase(run, 'executor')) {
-    await deps.runPhase(ctx, run, 'executor');
-    store.markPhaseDone(id, 'executor', { executorSummary: '.lastlight/executor-summary.md' });
+    const ex = await deps.runPhase(ctx, run, 'executor');
+    store.markPhaseDone(id, 'executor', ex.scratch);
     run = store.get(id)!;
   }
 

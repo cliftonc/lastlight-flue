@@ -37,6 +37,10 @@ AFTER THE GATE PASSES:
 
 Tested: {test command} -> {result}
 Scope-risk: {low|medium|high}"
-4. git push origin HEAD
 
-OUTPUT: List of files changed, test/lint/typecheck results, commit hash.
+Do NOT push — the harness pushes {{branch}} for you AFTER this session ends
+(the push is a controlled, workflow-owned step over the repo-write token). Just
+commit locally on {{branch}}; leave the working tree clean.
+
+OUTPUT: List of files changed, test/lint/typecheck results, the commit hash
+(run `git rev-parse HEAD` and report it).

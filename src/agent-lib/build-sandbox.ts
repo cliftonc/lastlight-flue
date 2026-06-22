@@ -96,7 +96,7 @@ async function execInContainer(
 export async function withBuildSandbox<T>(
   spec: BuildCloneSpec,
   token: string,
-  body: (sandbox: SandboxFactory) => Promise<T>,
+  body: (sandbox: SandboxFactory, container: BuildContainer) => Promise<T>,
   deps: {
     ops?: BuildSandboxOps;
     log?: { warn(msg: string, meta?: unknown): void };
@@ -113,7 +113,10 @@ export async function withBuildSandbox<T>(
     });
     await preCloneRepo(container, spec, token);
     const sandbox = container.sandbox();
-    return await body(sandbox);
+    // The container is handed to the body too (after the agent session) so the
+    // workflow can run deterministic git steps — e.g. the executor's branch PUSH —
+    // over the same checkout via the sandbox git CLI (not a model tool).
+    return await body(sandbox, container);
   } finally {
     if (container) await safeRemove(container, deps.log);
   }

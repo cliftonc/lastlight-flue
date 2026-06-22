@@ -20,7 +20,27 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
-  slice 2 (real ARCHITECT phase body) DONE ✅.
+  slice 2 (real ARCHITECT phase body) DONE ✅; slice 3 (real EXECUTOR phase) DONE ✅.
+- **This slice (3) built:** the real EXECUTOR phase body, wired into
+  `defaultBuildDeps().runPhase('executor')` behind the `BuildDeps` seam (runs AFTER
+  the post_architect gate). Mirrors the architect:
+  - `src/agent-lib/executor.ts` — `createExecutorAgent(ref,octokit,sandbox)`:
+    model=resolveModel('executor') (falls back to default), thinking='executor',
+    persona instructions, READ-ONLY github tools, `building` skill, sandbox+cwd
+    /workspace. Top-level NAMED session `executor` (NOT a subagent).
+  - `src/agent-lib/executor-prompt.ts` — renders `src/prompts/executor.md`; NAMES
+    `.lastlight/issue-<N>/architect-plan.md` (the plan is the handoff — read from
+    the checkout, NOT inlined); optional untrusted-wrapped issue snapshot.
+  - `runExecutorPhase` (build-phases.ts): mint repo-write token → octokit →
+    `withBuildSandbox` (pre-clone+`checkout -B`, plan on branch) → session (agent
+    implements + COMMITS in-sandbox via git CLI, NOT a tool) → `readHeadSha` →
+    **`pushBranch` SEAM** (the controlled repo-write side effect). Scratch records
+    executor-summary POINTER + commit sha (spec/10); `PhaseResult.scratch` carries
+    them up to the workflow's `markPhaseDone`.
+  - **PUSH = mockable seam:** `withBuildSandbox` now also hands the `BuildContainer`
+    to the body so the workflow runs `git push origin <bound-branch>` in-sandbox
+    after the session. MOCKED in all default tests (asserts it WOULD push the bound
+    ref) — NO real push. Executor prompt no longer instructs the model to push.
 - **This slice (2) built:** the real ARCHITECT phase body, wired into
   `defaultBuildDeps().runPhase('architect')` behind the `BuildDeps` seam.
   - `src/agent-lib/architect.ts` — `createArchitectAgent(ref,octokit,sandbox)`:
@@ -43,13 +63,14 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
     (spec/10 split rule), so the gate can surface it + the executor can consume it.
   - Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
     injectable → default impl tested OFFLINE.
-- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails / executor /
-  reviewer / fix / recheck agent bodies + the gate ask (postGateComment) + the
-  deterministic open-PR are `defaultBuildDeps()` STUBS that throw
-  (TODO(phase-4/agents|channels|github-post)); guardrails BLOCKED-bypass parity;
-  boot-wire of `recoverOrphanRuns`; channels resume entry.
-- **NO LIVE SIDE EFFECTS this slice** — architect wired but NOT run live; all
-  GitHub/sandbox/model interaction MOCKED in tests; no branches/commits/PRs.
+- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails / reviewer / fix /
+  recheck agent bodies + the gate ask (postGateComment) + the deterministic open-PR
+  are `defaultBuildDeps()` STUBS that throw (TODO(phase-4/agents|channels|github-post));
+  guardrails BLOCKED-bypass parity; boot-wire of `recoverOrphanRuns`; channels resume
+  entry. **The LIVE executor PUSH** is the mocked `pushBranch` seam — real push is
+  gated + run later WITH THE USER (never in tests).
+- **NO LIVE SIDE EFFECTS this slice** — executor wired but NOT run live; all
+  GitHub/sandbox/model/PUSH interaction MOCKED in tests; no branches/commits/PRs/pushes.
 - **Blockers:** none.
 
 ## Phase status
@@ -66,16 +87,17 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 2 of N).
-  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT phase
-  (agent config, sandbox+pre-clone+`checkout -B`+teardown, plan artifact pointer,
-  untrusted-content wrapping). New tests: architect-prompt golden+untrusted (7),
-  build-sandbox lifetime/redaction/no-fallback (5), architect agent-config +
-  phase-wiring (5). All control-flow tests still green (inject fakes). Suite
-  **307 passed / 5 skipped** (+17). `flue build` green; discovery = agents{hello} +
-  workflows{build,gated,pr-review}; `grep -c vitest dist/server.mjs` = 0.
-  **Next slice:** wire the real EXECUTOR phase (reads architect-plan.md from the
-  checkout, implements, commits) — then reviewer/fix/recheck, then gate-ask + PR.
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 3 of N).
+  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT phase.
+  Slice 3: real EXECUTOR phase (agent config, sandbox+pre-clone, reads committed
+  plan, implements+commits in-sandbox via git CLI, records summary-pointer+sha,
+  the MOCKED push seam). New tests: executor-prompt golden+untrusted (8),
+  executor agent-config + phase-wiring + push-seam (9). All control-flow + architect
+  tests still green (inject fakes). Suite **324 passed / 5 skipped** (+17).
+  `flue build` green; discovery = agents{hello} + workflows{build,gated,pr-review};
+  `grep -c vitest dist/server.mjs` = 0.
+  **Next slice:** wire the REVIEWER-loop (reviewer:N → fix:N → recheck:N over the
+  pre-cloned checkout) — then the gate-ask (postGateComment) + the deterministic PR.
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
