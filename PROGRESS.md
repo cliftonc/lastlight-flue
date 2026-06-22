@@ -18,6 +18,22 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## ⏸⏸ LOOP PAUSED (user request, 2026-06-22 — user went offline) ⏸⏸
+**DO NOT autonomously dispatch slices or run anything.** If a stray scheduled
+wakeup fires while paused: re-read this, do NOTHING (no slice, no subagent), do
+NOT reschedule — just stop. The loop resumes ONLY when the user re-runs `/loop`.
+- **Clean state:** HEAD = `315fb7c` (web tools, **481 tests green**). Working tree clean.
+- **explore slice (5 slice 6) was IN PROGRESS when paused** — its UNVERIFIED WIP
+  (had 31 tests passing but never ran `flue build`/full suite) is saved in
+  **`git stash@{0}`** (10 new files: explore.ts/explore-phases/explore-run-store/
+  resume-explore/explore-*-post/prompts + tests). To resume explore: either
+  `git stash pop` then verify (`pnpm test` + `flue build` + commit), OR drop the
+  stash and let a fresh subagent redo it from scratch (reads PROGRESS; cheaper/cleaner).
+- **Remaining Phase 5 after explore:** `repo-health`, the read-only **chat agent**
+  (risk #5 latency / #6 per-thread serialization), the **cron-*** jobs (croner + invoke).
+- **Then:** Phase 6 (channels) → 7 (persistence/admin re-back) → 8 (cutover). Plus the
+  DEFERRED Phase-4 LIVE build acceptance (user-gated; drizzle-cube target TBD).
+
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
   complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **481/6 skipped**.
