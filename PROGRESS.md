@@ -18,6 +18,22 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 8 DONE ✅ — read-only CHAT agent (`src/agents/chat.ts`)
+- **DISCOVERED agent** (default `createAgent(({id})=>…)` + `route` open [TODO(phase-6) channel auth]
+  + `description`). `id`=per-THREAD key → durable per-thread session (db.ts sqlite); agent
+  instance==thread, replaces reference messaging_sessions/rehydrate. Thin shell; logic in
+  `src/agent-lib/chat.ts` (CHAT_SUFFIX, parseChatThread id→repo, buildChatAgentConfig) +
+  `chat-token.ts` (mintReadOctokitFor — **read**-profile token, DI seam).
+- **READ-ONLY HARD INVARIANT (spec/11):** ONLY githubReadTools (GET-only, bound per-thread repo),
+  NO web tools (design: web gated to explorer only), NO write/mutating tools, NO sandbox/cwd.
+  persona+chat-suffix instructions (one persona source). Risk #5 latency=sandbox-less+GET-only;
+  risk #6 serialization=FLUE per-instance ordered submission queue (documented, not implemented).
+- **Tests +19** (suite 527→546 passed/6 skipped): chat.test (id-parse, model/thinking, persona+suffix,
+  skill, READ-ONLY asserts [no mutating-verb tool + NO sandbox], per-thread binding) + chat-token.test
+  (DI, read-profile, graceful undefined) + agents/__tests__/chat (shape, route, initialize offline via
+  mocked mint). flue build green; **discovery agents={chat,hello}**, workflows unchanged (9);
+  grep -c vitest dist=1 (inlined text, no module import). **NO LIVE side effect.** Next=security-review/feedback or crons.
+
 ## Phase 5 slice 7 DONE ✅ — `repo-health` workflow ported (cron/CLI repo-scoped scan)
 - **`src/workflows/repo-health.ts`** (`run` → `runRepoHealth(ctx, deps)` DI seam). Input
   `{owner, repo, triggerType?}` — REPO-SCOPED (no issue/PR). Single-phase TOOL-ONLY agent
