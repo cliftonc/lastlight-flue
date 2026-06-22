@@ -25,9 +25,57 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   guidance, parseFlags nits, test-coverage ideas, typing nits — file-referenced).
   So BOTH paths are proven: self-PR COMMENT fallback (#941) + formal substantive
   review (#937). The #941 test comment is LEFT in place (user choice).
-- **Resuming autonomous build (subagent-per-slice):** NEXT = wire the deferred
-  Docker SANDBOX into the reviewer (Phase 3 cleanup), THEN Phase 4 (build workflow
-  + durable approval gate). No further live PR posts unless the user asks.
+- **Resuming autonomous build (subagent-per-slice):** Phase 3 Docker SANDBOX into
+  the reviewer is now WIRED (slice 2 below — caller-owned container, PR pre-cloned,
+  additive w/ tool-only fallback). NEXT = Phase 4 (build workflow + durable approval
+  gate). No further live PR posts unless the user asks.
+
+### Phase 3 · slice 2 — wire the deferred Docker SANDBOX into the reviewer ✅ (2026-06-22)
+- **Wired:** the reviewer now gets a Docker sandbox with the PR **pre-cloned**, per
+  design/phase-3-pr-review.md — WITHOUT breaking the live-proven tool-only path.
+- **Container lifetime = the WORKFLOW (caller), per Spike-2 contract.** New
+  `src/agent-lib/reviewer-sandbox.ts:withReviewerSandbox(spec, token, body, deps)`:
+  `DockerContainer.create({ image:'node:22-bookworm', env:{GIT_TOKEN} })` → pre-clone
+  `git clone --depth 1 --branch <headRef> https://x-access-token:<tok>@github.com/...
+  /workspace` → `body(docker(container))` → **ALWAYS `container.remove()` in a
+  `finally`** (incl. on a thrown body). The adapter (`docker()`) stays a pure mapper.
+- **`createReviewerAgent(ref, octokit, sandbox?)`** now takes an OPTIONAL
+  `SandboxFactory`; when present it adds `sandbox` + `cwd:'/workspace'` so the
+  reviewer can inspect the checked-out code; when omitted it's tool-only (both valid,
+  no existing caller hard-broken).
+- **DI seam:** `pr-review.ts` gains deps `getHeadRef` (deterministic `pulls.get()
+  .head.ref`, workflow code not a model tool), `runReviewer(ctx,ref,octokit,sandbox)`
+  (sandbox threaded), and `sandboxOps: ReviewerSandboxOps` (container factory).
+  Default deps do real Docker; tests inject a FAKE container (no real Docker).
+  `PrReviewResult` gains `usedSandbox`.
+- **DECISION — sandbox is ADDITIVE, not required (recorded).** The reviewer reviewed
+  live tool-only (#937 formal APPROVE, #941 COMMENT). So if container creation OR the
+  clone FAILS, `withReviewerSandbox` **falls back to tool-only** (`body(undefined)`),
+  logs a token-free warning, and the run still produces a review — it does NOT fail
+  the run and does NOT silently swallow. A throw from the reviewer BODY (a real review
+  failure) propagates. The container is torn down either way.
+- **Token hygiene:** the scoped review-write token is baked as `GIT_TOKEN` env at
+  `docker run` + embedded in the clone URL so git auths; it is NEVER logged — any
+  token occurrence in clone stderr is `redact()`-ed before a log/throw. Tests assert
+  no log call carries the raw token. EGRESS still DEFERRED (clone reaches github.com
+  over open network, no SSRF floor) — recorded caveat stands; no untrusted input.
+- **Tests (+9 offline, +1 gated):** `pr-review.test.ts` (+5: creates container w/
+  right image+baked token, issues `git clone --branch <headRef> ... /workspace`,
+  builds reviewer WITH sandbox, token-not-logged, ALWAYS removes — incl. teardown in
+  `finally` when the reviewer THROWS mid-run; clone-fail + create-fail → tool-only
+  fallback). `agent-lib/__tests__/reviewer-sandbox.test.ts` (+4: lifecycle in
+  isolation — baked-env/clone/yield/remove, token-free fallback warning, remove on
+  body-throw). GATED live `test/pr-review-sandbox-live.test.ts`
+  (`skipIf !PR_REVIEW_SANDBOX_LIVE=1 || !docker`): real container clones PUBLIC
+  octocat/Hello-World into /workspace, asserts files land + `git rev-parse` exec, then
+  teardown — agent-less, NO model, NO PR post. Skipped by default.
+- **Verified:** `pnpm typecheck` clean; `pnpm test` **273 passed / 5 skipped** (was
+  264/4). `flue build --target node` still green — discovery exactly
+  **agents={hello}**, **workflows={gated,pr-review}**; `grep -c vitest dist/server.mjs`
+  = **0**; `reviewer-sandbox` inlined into the pr-review entry. No leaked containers
+  (verified `docker ps -a` clean post-run). **NO live PR post / NO live GitHub write.**
+- **Next slice:** Phase 4 — `build` workflow + durable approval gate.
+- **Last commit:** see `git log` (Phase 3 slice 2: Docker sandbox into reviewer).
 
 ### Phase 3 · LIVE ACCEPTANCE ✅ (run by main loop, 2026-06-22)
 - `flue run pr-review` against `cliftonc/drizzle-cube#941` ran END-TO-END: minted
