@@ -20,7 +20,35 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **444/5 skipped**.
+  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **457/5 skipped**.
+- **Phase 5 slice 4 DONE ✅ — `answer` workflow ported** (`src/workflows/answer.ts`,
+  `run` → `runAnswer(ctx, deps)` DI seam). Single-phase, TOOL-ONLY agent (NO sandbox).
+  Mints an **`issues-write`** token (model key `answer`; matches reference answer.yaml).
+  vs issue-comment: answer is a THOROUGH SOURCED reply to a question — reads more repo
+  context, applies the `question` label, leaves the issue OPEN.
+  - **agent** `src/agent-lib/answer.ts` (`createAnswerAgent`: `answer` key, persona,
+    `issue-answer` skill, READ-ONLY github tools bound to ref+token, NO sandbox) +
+    `answer-prompt.ts` (thin; issue title/body/comments + routed question UNTRUSTED-wrapped;
+    trigger metadata outside; contract = produce ONLY answer text).
+  - **answer→deterministic post+label** `src/answer-post.ts` (`postAnswerDeterministically`,
+    bound ref+token, NOT a model tool): `issues.createComment` + applies `question` label
+    (createLabel idempotent; 403/422 best-effort, label never fails the run). **DEDUP** keyed
+    by ISSUE number (answer has no triggering-comment id) — invisible `<!-- lastlight:answer:N -->`
+    marker, author-checked → re-invoke / duplicate-delivery never double-answers (design Q5.4).
+  - **WEB-RESEARCH DEFERRED:** reference answer phase used `web_search`+`unrestricted_egress`+
+    checkout. Web tools NOT built (design phase-5 §DRIFT → later slice as gated defineTools on
+    explorer). This slice ports the answer STRUCTURE + scopes the agent to the repo/GitHub-context
+    path (flags unverified facts); web-research = clearly-marked **TODO(phase-5/web-tools)** seam
+    in createAnswerAgent + answer-prompt. Did NOT block the slice.
+  - **Tests (+13):** run-level (token mint, BOUND ref not model-selectable, dedup pass-through,
+    token-not-logged) + prompt golden (untrusted-wrap incl. hostile question, repo-context scope,
+    no-code-change) + poster security (createComment+addLabels bound ref, dedup floor, human-marker
+    ignored, label 403/422 best-effort).
+  - **flue build green; discovery = agents{hello} + workflows{answer,build,gated,issue-comment,
+    issue-triage,pr-fix,pr-review}**; no vitest import in dist; helpers in agent-lib/
+    (+ answer-post.ts at src/ top-level), tests in nested __tests__/.
+  - **NO LIVE SIDE EFFECT** — all GitHub/model MOCKED; no real comments/labels, no live `flue run`.
+    Last commit: Phase 5 slice 4 (answer). Next slice = `repo-health` or the web-search tools.
 - **Phase 5 slice 3 DONE ✅ — `pr-fix` workflow ported** (`src/workflows/pr-fix.ts`,
   `run` → `runPrFix(ctx, deps)` DI seam). Standalone EXECUTOR-ON-A-PR (no architect/review):
   mints a **`repo-write`** scoped token (PEM wall, downscoped to repo); resolves the PR
@@ -264,7 +292,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
 - [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
-  slice 2: issue-comment ✅; slice 3: pr-fix ✅)
+  slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅ — web-research deferred)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
