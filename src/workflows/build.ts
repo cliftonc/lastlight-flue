@@ -147,7 +147,12 @@ export async function runBuild(
     if (store.shouldRunPhase(run, reviewerPhase)) {
       const rv = await deps.runPhase(ctx, run, reviewerPhase);
       verdictText = rv.text;
-      store.markPhaseDone(id, reviewerPhase, { [`verdict:${cycle}`]: verdictText });
+      // Record the verdict text (→ the gate + recovered on a re-invoke) alongside
+      // any scratch POINTER the phase produced (the reviewer-verdict.md path; spec/10).
+      store.markPhaseDone(id, reviewerPhase, {
+        ...rv.scratch,
+        [`verdict:${cycle}`]: verdictText,
+      });
       run = store.get(id)!;
     } else {
       // Re-invoke after this cycle's reviewer already ran: recover its verdict.
@@ -168,17 +173,24 @@ export async function runBuild(
       return { status: 'paused', gate: reviewerGate };
     }
 
-    // fix → recheck (each idempotency-keyed). TODO(phase-4/agents): real bodies.
+    // fix → recheck (each idempotency-keyed). The fix records its commit-sha
+    // pointer; the recheck (re-review of the fix) records its verdict pointer.
+    // The NEXT cycle's reviewer:<cycle+1> phase is the loop's authoritative re-read
+    // of the verdict (the existing golden contract), so the recheck text is captured
+    // as scratch context only — it does NOT pre-seed the next cycle's verdict.
     const fixPhase = `fix:${cycle}`;
     if (store.shouldRunPhase(run, fixPhase)) {
-      await deps.runPhase(ctx, run, fixPhase);
-      store.markPhaseDone(id, fixPhase);
+      const fx = await deps.runPhase(ctx, run, fixPhase);
+      store.markPhaseDone(id, fixPhase, fx.scratch);
       run = store.get(id)!;
     }
     const recheckPhase = `recheck:${cycle}`;
     if (store.shouldRunPhase(run, recheckPhase)) {
-      await deps.runPhase(ctx, run, recheckPhase);
-      store.markPhaseDone(id, recheckPhase);
+      const rc = await deps.runPhase(ctx, run, recheckPhase);
+      store.markPhaseDone(id, recheckPhase, {
+        ...rc.scratch,
+        [`recheckVerdict:${cycle}`]: rc.text,
+      });
       run = store.get(id)!;
     }
     store.setCycle(id, cycle + 1);

@@ -19,7 +19,10 @@ the typecheck command and the tests covering the fixed files.
 AFTER REVIEW:
 1. APPEND to {{issueDir}}/reviewer-verdict.md under heading "## Re-review after Fix Cycle {{fixCycle}}" (preserve the original verdict above). The new section MUST itself contain a "VERDICT: APPROVED" or "VERDICT: REQUEST_CHANGES" line.
 2. Update status.md with reviewer_status: APPROVED or REQUEST_CHANGES
-3. git add .lastlight/ && git commit -m "review: re-review after fix cycle {{fixCycle}} for #{{issueNumber}}" && git push origin HEAD
+3. git add .lastlight/ && git commit -m "review: re-review after fix cycle {{fixCycle}} for #{{issueNumber}}"
+
+Do NOT push — the harness pushes {{branch}} for you AFTER this session ends (a
+controlled, workflow-owned step over the repo-write token). Just commit locally.
 
 OUTPUT FORMAT — your stdout MUST start with one of these two lines, EXACTLY, on its own line, with no leading whitespace:
 

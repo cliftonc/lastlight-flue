@@ -193,6 +193,34 @@ describe('build — GOLDEN phase-sequence order', () => {
     ]);
   });
 
+  it('a run that never approves runs both cycles then completes at max_cycles', async () => {
+    // reviewer:0 RC → fix:0 → recheck:0 → reviewer:1 RC → fix:1 → recheck:1 → loop
+    // exits at MAX_CYCLES (2); the run still completes (PR opens) — the loop is a cap,
+    // not a hard fail.
+    const t = recordingDeps({
+      gates: { post_architect: false, post_reviewer: false },
+      verdicts: {
+        'reviewer:0': 'VERDICT: REQUEST_CHANGES\n\nStill issues.',
+        'reviewer:1': 'VERDICT: REQUEST_CHANGES\n\nStill issues.',
+      },
+    });
+    const res = await runBuild(ctx({ ...INPUT }), store, t.deps);
+    expect(res.status).toBe('complete');
+    expect(t.phases).toEqual([
+      'guardrails',
+      'architect',
+      'executor',
+      'reviewer:0',
+      'fix:0',
+      'recheck:0',
+      'reviewer:1',
+      'fix:1',
+      'recheck:1',
+    ]);
+    expect(t.prOpens).toEqual([INPUT.runId]);
+    expect(store.get(INPUT.runId)!.reviewerCycle).toBe(2);
+  });
+
   it('a GATED run resumed across re-invokes yields the SAME golden order as a normal run', async () => {
     const t = recordingDeps({ gates: { post_architect: true } });
     await runBuild(ctx({ ...INPUT }), store, t.deps); // pause @ post_architect
@@ -275,6 +303,31 @@ describe('build — idempotency: phases run EXACTLY ONCE across many re-invokes'
     expect(count('architect')).toBe(1);
     expect(count('executor')).toBe(1);
     expect(count('reviewer:0')).toBe(1);
+    expect(t.prOpens).toEqual([INPUT.runId]); // PR opened once
+  });
+
+  it('per-cycle: a mid-loop re-invoke skips a DONE reviewer:0/fix:0/recheck:0', async () => {
+    // post_reviewer gate fires on reviewer:0 RC, then a resume runs fix:0/recheck:0/
+    // reviewer:1; a final DUPLICATE resume must NOT re-run reviewer:0 or fix:0.
+    const t = recordingDeps({
+      gates: { post_architect: false, post_reviewer: true },
+      verdicts: {
+        'reviewer:0': 'VERDICT: REQUEST_CHANGES\n\nNeeds work.',
+        'reviewer:1': 'VERDICT: APPROVED\n\nGood now.',
+      },
+    });
+    const reinvoke = (input: BuildInput) => runBuild(ctx(input), store, t.deps);
+    const o = { storePath: join(dir, 'build.db'), reinvoke };
+
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // pause @ post_reviewer:0
+    await resume(INPUT.runId, 'approve', o); // fix:0 → recheck:0 → reviewer:1 → complete
+    await resume(INPUT.runId, 'approve', o); // duplicate — no-op
+
+    const count = (p: string) => t.phases.filter((x) => x === p).length;
+    expect(count('reviewer:0')).toBe(1);
+    expect(count('fix:0')).toBe(1);
+    expect(count('recheck:0')).toBe(1);
+    expect(count('reviewer:1')).toBe(1);
     expect(t.prOpens).toEqual([INPUT.runId]); // PR opened once
   });
 });

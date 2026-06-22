@@ -11,6 +11,7 @@ import { configureGitAuth } from '../engine/git-auth.ts';
 import { loadConfig } from '../config.ts';
 import { createArchitectAgent } from './architect.ts';
 import { createExecutorAgent } from './executor.ts';
+import { createBuildReviewerAgent, createFixAgent } from './build-reviewer.ts';
 import {
   renderArchitectPrompt,
   architectPlanPath,
@@ -20,6 +21,12 @@ import {
   renderExecutorPrompt,
   executorSummaryPath,
 } from './executor-prompt.ts';
+import {
+  renderReviewerPrompt,
+  renderReReviewerPrompt,
+  renderFixPrompt,
+  reviewerVerdictPath,
+} from './reviewer-prompt.ts';
 import {
   withBuildSandbox,
   defaultBuildSandboxOps,
@@ -130,6 +137,27 @@ export const EXECUTOR_SUMMARY_SCRATCH_KEY = 'executorSummary';
 
 /** The run-record scratch key recording the executor's HEAD commit sha. */
 export const EXECUTOR_SHA_SCRATCH_KEY = 'executorSha';
+
+/** The run-record scratch pointer key for the reviewer-verdict artifact. */
+export const REVIEWER_VERDICT_SCRATCH_KEY = 'reviewerVerdict';
+
+/** The run-record scratch key recording a fix cycle's HEAD commit sha (`fixSha:N`). */
+export function fixShaScratchKey(cycle: number): string {
+  return `fixSha:${cycle}`;
+}
+
+/**
+ * Parse the loop cycle out of a per-cycle phase name (`reviewer:0` / `fix:1` /
+ * `recheck:0`). The build.ts loop keys every reviewer-loop phase this way so each
+ * cycle is independently idempotency-tracked + names the right prompt context.
+ */
+export function cycleFromPhaseName(name: string): number {
+  const m = name.match(/:(\d+)$/);
+  if (!m) {
+    throw new Error(`build: reviewer-loop phase "${name}" is missing its :<cycle> suffix.`);
+  }
+  return Number(m[1]);
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // ARCHITECT phase — the first real build phase body.
@@ -399,15 +427,249 @@ export async function runExecutorPhase(
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// REVIEWER LOOP — reviewer:N → [post_reviewer gate] → fix:N → recheck:N.
+//
+// reviewer:N  — review the executor's COMMITTED changes in the checkout, emit a
+//               VERDICT marker (parsed → the durable loop); the reviewer commits
+//               reviewer-verdict.md in-sandbox, NO GitHub post (internal review).
+// fix:N       — address the reviewer notes (read from the committed verdict file),
+//               run the gate, COMMIT in-sandbox, then PUSH the branch (mocked seam).
+// recheck:N   — the SAME reviewer agent re-prompted with re-reviewer.md re-reviews
+//               the fix → new VERDICT → the loop breaks (APPROVED) or runs another
+//               cycle (build.ts owns max_cycles + the break-on-APPROVED).
+//
+// NO live model / GitHub / Docker / push in tests — every seam is injectable.
+// ───────────────────────────────────────────────────────────────────────────
+
 /**
- * Default production deps. The ARCHITECT + EXECUTOR phase bodies are WIRED; the
- * rest stay STUBBED (later Phase-4 slices). A stubbed phase throws if a live
- * invoke reaches it, so a misconfigured run fails loudly instead of silently
- * no-op'ing.
+ * Injectable seams for the reviewer/recheck phases, so the default
+ * `runPhase('reviewer:N'|'recheck:N')` is testable OFFLINE. Production wires the
+ * real token mint + Octokit + Docker sandbox ops + the reviewer agent-session
+ * runner. A re-review re-prompts the SAME reviewer agent with re-reviewer.md.
+ */
+export interface ReviewerPhaseDeps {
+  /** Mint a `repo-write` scoped installation token for this repo (PEM wall). */
+  mintToken(run: BuildRun): Promise<string>;
+  /** Build an Octokit authenticated with the scoped token. */
+  makeOctokit(token: string): Octokit;
+  /** Container lifecycle ops for the build sandbox (real Docker by default). */
+  sandboxOps: BuildSandboxOps;
+  /**
+   * Run the build reviewer agent session against the pre-cloned checkout (carrying
+   * the executor's committed changes) + the rendered reviewer / re-reviewer prompt;
+   * returns its raw text (ending in the VERDICT marker). The reviewer commits the
+   * verdict artifact in-sandbox via the git CLI but does NOT push.
+   */
+  runReviewerSession(
+    ctx: FlueContext<BuildInput>,
+    ref: RepoRef,
+    octokit: Octokit,
+    sandbox: SandboxFactory,
+    prompt: string,
+    sessionName: string,
+  ): Promise<string>;
+}
+
+/** The real reviewer run: init the agent, open the named session, prompt it. */
+async function runReviewerSession(
+  ctx: FlueContext<BuildInput>,
+  ref: RepoRef,
+  octokit: Octokit,
+  sandbox: SandboxFactory,
+  prompt: string,
+  sessionName: string,
+): Promise<string> {
+  const agent = createBuildReviewerAgent(ref, octokit, sandbox);
+  const harness = await ctx.init(agent);
+  // Top-level NAMED per-cycle session (`reviewer:0` / `recheck:0` — NOT a subagent)
+  // so a post-gate resume re-opens exactly the right cycle's conversation.
+  const session = await harness.session(sessionName);
+  const res = await session.prompt(prompt);
+  return res.text;
+}
+
+/** Default reviewer-phase deps: real token mint + Octokit + Docker + session. */
+export function defaultReviewerPhaseDeps(): ReviewerPhaseDeps {
+  return {
+    mintToken: mintRepoWriteToken,
+    makeOctokit: (token) => new Octokit({ auth: token }),
+    sandboxOps: defaultBuildSandboxOps(),
+    runReviewerSession,
+  };
+}
+
+/**
+ * Run a REVIEWER phase (`reviewer:N` is the first review; `recheck:N` re-reviews
+ * after fix cycle N): mint a repo-write token, build an Octokit, create a Docker
+ * sandbox with the repo pre-cloned at the working branch (carrying the executor's
+ * committed changes + any prior verdict/fix commits — CALLER owns the container
+ * lifetime, torn down in `withBuildSandbox`'s finally), build the reviewer agent on
+ * that sandbox (cwd /workspace), render the prompt (reviewer.md for the first
+ * review, re-reviewer.md for a recheck), run the session, and return its text
+ * (ending in the VERDICT marker the loop parses). NO GitHub post — this is an
+ * internal build review; the verdict drives the loop + the gate surfaces it.
+ */
+export async function runReviewerPhase(
+  ctx: FlueContext<BuildInput>,
+  run: BuildRun,
+  cycle: number,
+  isRecheck: boolean,
+  deps: ReviewerPhaseDeps = defaultReviewerPhaseDeps(),
+): Promise<PhaseResult> {
+  const ref: RepoRef = { owner: run.owner, repo: run.repo };
+  const token = await deps.mintToken(run);
+  const octokit = deps.makeOctokit(token);
+
+  const promptCtx = {
+    owner: run.owner,
+    repo: run.repo,
+    issue: run.issue,
+    branch: run.branch,
+  };
+  const prompt = isRecheck
+    ? renderReReviewerPrompt(promptCtx, cycle)
+    : renderReviewerPrompt(promptCtx);
+  const sessionName = `${isRecheck ? 'recheck' : 'reviewer'}:${cycle}`;
+
+  const text = await withBuildSandbox(
+    { owner: run.owner, repo: run.repo, branch: run.branch },
+    token,
+    (sandbox) =>
+      deps.runReviewerSession(ctx, ref, octokit, sandbox, prompt, sessionName),
+    { ops: deps.sandboxOps, log: ctx.log },
+  );
+
+  return {
+    text,
+    scratch: { [REVIEWER_VERDICT_SCRATCH_KEY]: reviewerVerdictPath(run.issue) },
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FIX phase — addresses the reviewer notes, commits, then PUSHES (mocked seam).
+// ───────────────────────────────────────────────────────────────────────────
+
+/** The result of a fix phase: the agent's text + the post-commit sha. */
+export interface FixRunResult {
+  text: string;
+  /** The branch HEAD sha after the fix committed (the recheck/PR anchor). */
+  sha: string;
+}
+
+/**
+ * Injectable seams for the fix phase, so the default `runPhase('fix:N')` is
+ * testable OFFLINE. Mirrors the executor's seams (mint + octokit + sandbox ops +
+ * session + sha read + the MOCKED push) — the fix is just a scoped re-implementation.
+ */
+export interface FixPhaseDeps {
+  mintToken(run: BuildRun): Promise<string>;
+  makeOctokit(token: string): Octokit;
+  sandboxOps: BuildSandboxOps;
+  /**
+   * Run the fix agent session against the pre-cloned checkout (carrying the
+   * reviewer-verdict.md the agent reads) + the rendered fix prompt; returns its raw
+   * text. The agent COMMITS its fixes in-sandbox via the git CLI but does NOT push.
+   */
+  runFixSession(
+    ctx: FlueContext<BuildInput>,
+    ref: RepoRef,
+    octokit: Octokit,
+    sandbox: SandboxFactory,
+    prompt: string,
+    sessionName: string,
+  ): Promise<string>;
+  /** Read the branch HEAD sha after the fix committed (the recheck/PR anchor). */
+  readHeadSha(container: BuildContainer): Promise<string>;
+  /**
+   * Push the working branch to origin over the repo-write token (the controlled,
+   * workflow-owned side effect — a SEAM so tests assert it WOULD push, with the
+   * bound branch ref, WITHOUT a real push). Shares the executor's push contract.
+   */
+  pushBranch(container: BuildContainer, branch: string): Promise<void>;
+}
+
+/** The real fix run: init the agent, open the per-cycle named session, prompt it. */
+async function runFixSession(
+  ctx: FlueContext<BuildInput>,
+  ref: RepoRef,
+  octokit: Octokit,
+  sandbox: SandboxFactory,
+  prompt: string,
+  sessionName: string,
+): Promise<string> {
+  const agent = createFixAgent(ref, octokit, sandbox);
+  const harness = await ctx.init(agent);
+  const session = await harness.session(sessionName);
+  const res = await session.prompt(prompt);
+  return res.text;
+}
+
+/** Default fix-phase deps: real token mint + Octokit + Docker + session + sha + push. */
+export function defaultFixPhaseDeps(): FixPhaseDeps {
+  return {
+    mintToken: mintRepoWriteToken,
+    makeOctokit: (token) => new Octokit({ auth: token }),
+    sandboxOps: defaultBuildSandboxOps(),
+    runFixSession,
+    readHeadSha,
+    pushBranch,
+  };
+}
+
+/**
+ * Run a FIX phase (`fix:N`): mint a repo-write token, build an Octokit, create a
+ * Docker sandbox with the repo pre-cloned at the working branch (carrying the
+ * reviewer-verdict.md the agent reads — CALLER owns the container lifetime, torn
+ * down in `withBuildSandbox`'s finally), build the fix agent on that sandbox (cwd
+ * /workspace), render the fix prompt (it names the reviewer-verdict path so the
+ * agent fixes ONLY the reported issues), run the session (the agent addresses the
+ * notes + COMMITS in-sandbox via the git CLI), read the committed HEAD sha, then
+ * PUSH the branch over the deterministic seam (mocked in tests). Returns the agent
+ * text + the new sha (the recheck/PR anchor).
+ */
+export async function runFixPhase(
+  ctx: FlueContext<BuildInput>,
+  run: BuildRun,
+  cycle: number,
+  deps: FixPhaseDeps = defaultFixPhaseDeps(),
+): Promise<FixRunResult> {
+  const ref: RepoRef = { owner: run.owner, repo: run.repo };
+  const token = await deps.mintToken(run);
+  const octokit = deps.makeOctokit(token);
+
+  const prompt = renderFixPrompt(
+    { owner: run.owner, repo: run.repo, issue: run.issue, branch: run.branch },
+    cycle,
+  );
+  const sessionName = `fix:${cycle}`;
+
+  return withBuildSandbox(
+    { owner: run.owner, repo: run.repo, branch: run.branch },
+    token,
+    async (sandbox, container) => {
+      const text = await deps.runFixSession(ctx, ref, octokit, sandbox, prompt, sessionName);
+      const sha = await deps.readHeadSha(container);
+      // The CONTROLLED repo-write side effect: push the bound branch (mocked in
+      // tests). Live push is gated + run later with the user.
+      await deps.pushBranch(container, run.branch);
+      return { text, sha };
+    },
+    { ops: deps.sandboxOps, log: ctx.log },
+  );
+}
+
+/**
+ * Default production deps. The ARCHITECT + EXECUTOR + REVIEWER-LOOP (reviewer / fix
+ * / recheck) phase bodies are WIRED; the rest stay STUBBED (later Phase-4 slices:
+ * guardrails / the gate ask / the open-PR). A stubbed phase throws if a live invoke
+ * reaches it, so a misconfigured run fails loudly instead of silently no-op'ing.
  */
 export function defaultBuildDeps(
   architectDeps: ArchitectPhaseDeps = defaultArchitectPhaseDeps(),
   executorDeps: ExecutorPhaseDeps = defaultExecutorPhaseDeps(),
+  reviewerDeps: ReviewerPhaseDeps = defaultReviewerPhaseDeps(),
+  fixDeps: FixPhaseDeps = defaultFixPhaseDeps(),
 ): BuildDeps {
   return {
     async runPhase(ctx, run, name): Promise<PhaseResult> {
@@ -424,10 +686,23 @@ export function defaultBuildDeps(
           },
         };
       }
+      // The reviewer loop is keyed per-cycle (`reviewer:N` / `fix:N` / `recheck:N`).
+      if (name.startsWith('reviewer:')) {
+        return runReviewerPhase(ctx, run, cycleFromPhaseName(name), false, reviewerDeps);
+      }
+      if (name.startsWith('recheck:')) {
+        return runReviewerPhase(ctx, run, cycleFromPhaseName(name), true, reviewerDeps);
+      }
+      if (name.startsWith('fix:')) {
+        const cycle = cycleFromPhaseName(name);
+        const res = await runFixPhase(ctx, run, cycle, fixDeps);
+        return { text: res.text, scratch: { [fixShaScratchKey(cycle)]: res.sha } };
+      }
       throw new Error(
         `build: phase "${name}" body not wired yet (TODO(phase-4/agents)). ` +
-          `The architect + executor phases are wired; guardrails/reviewer/fix/` +
-          `recheck land next. Pass BuildDeps to runBuild() to drive them offline.`,
+          `architect / executor / reviewer-loop (reviewer / fix / recheck) are ` +
+          `wired; guardrails lands next. Pass BuildDeps to runBuild() to drive ` +
+          `them offline.`,
       );
     },
     async postGateComment(_ctx, _run, _gate): Promise<void> {

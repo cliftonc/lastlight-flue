@@ -13,6 +13,11 @@ committing — all of it must pass before you commit.
 AFTER THE GATE PASSES:
 1. APPEND to {{issueDir}}/executor-summary.md under heading "## Fix Cycle {{fixCycle}}" (what was fixed, test/lint/typecheck results)
 2. Update status.md: current_phase = fix_loop_{{fixCycle}}
-3. git add -A && git commit -m "fix: address review feedback for #{{issueNumber}} (cycle {{fixCycle}})" && git push origin HEAD
+3. git add -A && git commit -m "fix: address review feedback for #{{issueNumber}} (cycle {{fixCycle}})"
 
-OUTPUT: What was fixed, test/lint/typecheck results.
+Do NOT push — the harness pushes {{branch}} for you AFTER this session ends (a
+controlled, workflow-owned step over the repo-write token). Just commit locally on
+{{branch}}; leave the working tree clean.
+
+OUTPUT: What was fixed, test/lint/typecheck results, the commit hash (run
+`git rev-parse HEAD` and report it).

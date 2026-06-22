@@ -20,7 +20,29 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
-  slice 2 (real ARCHITECT phase body) DONE ✅; slice 3 (real EXECUTOR phase) DONE ✅.
+  slice 2 (real ARCHITECT) DONE ✅; slice 3 (real EXECUTOR) DONE ✅;
+  slice 4 (real REVIEWER-LOOP) DONE ✅.
+- **This slice (4) built:** the real REVIEWER-LOOP phase bodies (reviewer:N →
+  [post_reviewer gate] → fix:N → recheck:N), wired into `defaultBuildDeps().runPhase`
+  behind the `BuildDeps` seam — the existing build.ts loop control flow drives them.
+  - `src/agent-lib/build-reviewer.ts` — `createBuildReviewerAgent` (review task key,
+    persona, pr-review+building+code-review skills, sandbox REQUIRED, cwd /workspace;
+    reviews the executor's COMMITTED diff in the checkout, NO GitHub post — internal
+    build review) + `createFixAgent` (fix task key→default fallback, persona, building
+    skill, READ-ONLY github tools, sandbox+cwd). Recheck = the SAME reviewer agent
+    re-prompted with re-reviewer.md.
+  - `src/agent-lib/reviewer-prompt.ts` — pure renderers for reviewer.md / re-reviewer.md
+    / fix.md (`fixCycle` for the latter two). Reviewer NOTES are the handoff: committed
+    `reviewer-verdict.md`, named in the fix prompt (read from checkout, NOT inlined).
+  - `runReviewerPhase(cycle,isRecheck)` + `runFixPhase(cycle)` (build-phases.ts): mint
+    repo-write → octokit → `withBuildSandbox` (pre-clone+checkout) → per-cycle named
+    session (`reviewer:N`/`recheck:N`/`fix:N`) → verdict text returned to the loop →
+    `parseReviewerVerdict` drives break/continue. Reviewer records the verdict POINTER;
+    fix reads HEAD sha + PUSHES via the SAME mocked `pushBranch` seam as the executor.
+  - `cycleFromPhaseName` parses the `:N` suffix; `runPhase` routes `reviewer:`/`recheck:`/
+    `fix:` per-cycle. build.ts merges each phase's scratch pointer into `markPhaseDone`.
+  - Prompts edited: reviewer/re-reviewer/fix no longer instruct the model to
+    `git push` (the workflow pushes deterministically — mirrors executor.md).
 - **This slice (3) built:** the real EXECUTOR phase body, wired into
   `defaultBuildDeps().runPhase('executor')` behind the `BuildDeps` seam (runs AFTER
   the post_architect gate). Mirrors the architect:
@@ -63,13 +85,13 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
     (spec/10 split rule), so the gate can surface it + the executor can consume it.
   - Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
     injectable → default impl tested OFFLINE.
-- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails / reviewer / fix /
-  recheck agent bodies + the gate ask (postGateComment) + the deterministic open-PR
-  are `defaultBuildDeps()` STUBS that throw (TODO(phase-4/agents|channels|github-post));
-  guardrails BLOCKED-bypass parity; boot-wire of `recoverOrphanRuns`; channels resume
-  entry. **The LIVE executor PUSH** is the mocked `pushBranch` seam — real push is
-  gated + run later WITH THE USER (never in tests).
-- **NO LIVE SIDE EFFECTS this slice** — executor wired but NOT run live; all
+- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails body + the gate ask
+  (postGateComment) + the deterministic open-PR are `defaultBuildDeps()` STUBS that
+  throw (TODO(phase-4/guardrails|channels|github-post)); guardrails BLOCKED-bypass
+  parity; boot-wire of `recoverOrphanRuns`; channels resume entry. **The LIVE
+  executor/fix PUSH** is the mocked `pushBranch` seam — real push is gated + run later
+  WITH THE USER (never in tests).
+- **NO LIVE SIDE EFFECTS this slice** — reviewer-loop wired but NOT run live; all
   GitHub/sandbox/model/PUSH interaction MOCKED in tests; no branches/commits/PRs/pushes.
 - **Blockers:** none.
 
@@ -87,17 +109,19 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 3 of N).
-  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT phase.
-  Slice 3: real EXECUTOR phase (agent config, sandbox+pre-clone, reads committed
-  plan, implements+commits in-sandbox via git CLI, records summary-pointer+sha,
-  the MOCKED push seam). New tests: executor-prompt golden+untrusted (8),
-  executor agent-config + phase-wiring + push-seam (9). All control-flow + architect
-  tests still green (inject fakes). Suite **324 passed / 5 skipped** (+17).
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 4 of N).
+  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT.
+  Slice 3: real EXECUTOR (mocked push seam). Slice 4: real REVIEWER-LOOP — reviewer:N
+  (reviews committed diff in checkout, emits VERDICT, NO GitHub post) → [post_reviewer
+  gate] → fix:N (addresses notes, commits, MOCKED push) → recheck:N (re-reviewer on
+  the fix); verdict→loop break/continue; per-cycle idempotency (`reviewer:N`/`fix:N`/
+  `recheck:N` keyed). New tests: reviewer-prompt golden (7), build-reviewer agent-config
+  + reviewer/fix phase-wiring + defaultBuildDeps routing (13), build.ts max_cycles +
+  per-cycle idempotency golden (+2). Suite **346 passed / 5 skipped** (+22).
   `flue build` green; discovery = agents{hello} + workflows{build,gated,pr-review};
   `grep -c vitest dist/server.mjs` = 0.
-  **Next slice:** wire the REVIEWER-loop (reviewer:N → fix:N → recheck:N over the
-  pre-cloned checkout) — then the gate-ask (postGateComment) + the deterministic PR.
+  **Next slice:** guardrails body + the gate-ask (postGateComment) + the deterministic
+  open-PR (then boot-wire recoverOrphanRuns + channels resume entry).
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API

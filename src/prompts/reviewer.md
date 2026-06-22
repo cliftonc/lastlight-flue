@@ -39,7 +39,10 @@ AFTER REVIEW:
    (paste actual output)
 
 2. Update status.md with reviewer_status: APPROVED or REQUEST_CHANGES (matching the verdict)
-3. git add .lastlight/ && git commit -m "review: verdict for #{{issueNumber}}" && git push origin HEAD
+3. git add .lastlight/ && git commit -m "review: verdict for #{{issueNumber}}"
+
+Do NOT push — the harness pushes {{branch}} for you AFTER this session ends (a
+controlled, workflow-owned step over the repo-write token). Just commit locally.
 
 OUTPUT FORMAT — your stdout MUST start with one of these two lines, EXACTLY, on its own line, with no leading whitespace:
 
