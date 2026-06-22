@@ -20,7 +20,34 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **412/5 skipped**.
+  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **427/5 skipped**.
+- **Phase 5 slice 2 DONE ✅ — `issue-comment` workflow ported** (`src/workflows/issue-comment.ts`,
+  `run` → `runIssueComment(ctx, deps)` DI seam). Single-phase, TOOL-ONLY agent (NO sandbox —
+  reads issue/PR thread via bound read tools; skill caps at ≤2 reads, no checkout). Mints an
+  **`issues-write`** scoped token (matches reference issue-comment.yaml profile; model key `comment`).
+  - **agent** `src/agent-lib/issue-comment.ts` (`createIssueCommentAgent`: `comment` task key,
+    persona, `issue-comment` skill, READ-ONLY github tools bound to ref+token, NO sandbox) +
+    `issue-comment-prompt.ts` (thin; issue title/body + prior comments + the TRIGGERING comment
+    all UNTRUSTED-wrapped via `wrapUntrusted`; trigger metadata outside; contract = produce reply
+    text only). Agent composes a free-form markdown reply (no marker).
+  - **reply→deterministic post** `src/issue-comment-post.ts` (`postIssueReplyDeterministically`,
+    mirrors github-post.ts/triage-post.ts — bound ref+token, NOT a model tool): posts via
+    `issues.createComment`. **BOT-LOOP floor** (`isBotSender`): skip if triggering sender is the
+    bot / any `[bot]` (reference filters bot senders at the webhook = Phase 6; this is the
+    workflow-local second floor). **DEDUP** (design Q5.4): embeds an invisible
+    `<!-- lastlight:reply-to:<commentId> -->` marker; `alreadyReplied` scans bot-authored
+    comments for it → re-invoke / duplicate-delivery never double-replies (human-pasted marker
+    ignored — author-checked).
+  - DI seam: fake token-minter/octokit/issue-fetch/agent-run/poster → fully offline.
+  - **Tests (+15):** run-level (token mint, BOUND ref+commentId not model-selectable, bot-loop
+    skip-before-mint, dedup pass-through, token-not-logged) + prompt golden (untrusted-wrap incl.
+    hostile trigger, PR/issue phrasing) + poster security (createComment bound ref, bot-loop +
+    dedup floors, per-trigger-id keying, human-marker ignored).
+  - **flue build green; discovery = agents{hello} + workflows{build,gated,issue-comment,
+    issue-triage,pr-review}**; no vitest module import in dist; helpers in agent-lib/
+    (+ issue-comment-post.ts at src/ top-level, not discovered), tests in nested __tests__/.
+  - **NO LIVE SIDE EFFECT** — all GitHub/model MOCKED; no real comments posted, no live `flue run`.
+    Last commit: Phase 5 slice 2 (issue-comment). Next slice = `pr-fix` (or `answer`).
 - **Phase 5 slice 1 DONE ✅ — `issue-triage` workflow ported** (`src/workflows/issue-triage.ts`,
   `export async function run` → `runIssueTriage(ctx, deps)` DI seam). Single-phase,
   TOOL-ONLY agent (NO sandbox — reads issue + dup-search via bound read tools; design
@@ -214,7 +241,8 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   no `import/require 'vitest'` in dist).
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
-- [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅)
+- [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
+  slice 2: issue-comment ✅)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
