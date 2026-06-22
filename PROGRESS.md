@@ -19,8 +19,37 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 5 STARTING** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery, 384 tests); Phases 0-3 ✅.
+- **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
+  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **412/5 skipped**.
+- **Phase 5 slice 1 DONE ✅ — `issue-triage` workflow ported** (`src/workflows/issue-triage.ts`,
+  `export async function run` → `runIssueTriage(ctx, deps)` DI seam). Single-phase,
+  TOOL-ONLY agent (NO sandbox — reads issue + dup-search via bound read tools; design
+  phase-5 §"Single-phase workflows"). Mints an **`issues-write`** scoped token (downscoped
+  to the repo).
+  - **agent** `src/agent-lib/triage.ts` (`createTriageAgent`: triage task key, persona,
+    `issue-triage` skill, READ-ONLY github tools bound to ref+token, NO sandbox) +
+    `triage-prompt.ts` (renders the request; issue title/body/comments UNTRUSTED-wrapped
+    via `wrapUntrusted`, trigger metadata stays outside the wrapper).
+  - **classification→deterministic action** (reconciles the reference's agent-applies-
+    labels-via-MCP-tools with our pr-review verdict→post split): agent emits a
+    `CLASSIFICATION: category=… [state=…] [duplicate] [close]` marker;
+    `triage-classification.ts` parses it (golden-tested, mirrors parseReviewerVerdict)
+    + maps to canonical SKILL.md labels; `src/triage-post.ts`
+    (`applyTriageDeterministically`, mirrors github-post.ts — bound ref+token, NOT a
+    model tool) ensures labels exist (createLabel idempotent; **403 → existing-only
+    fallback**, matching the reference), `addLabels` (idempotent → Q5.4 re-invoke safe),
+    posts the pre-marker comment, and closes on duplicate/already-implemented.
+  - DI seam: fake token-minter/octokit/issue-fetch/agent-run/applier → fully offline.
+  - **Tests (+28):** 17 classification/mapping golden (triage-classification.test.ts);
+    11 run-level + poster security (issue-triage.test.ts — bound ref not model-selectable,
+    correct mocked octokit createLabel/addLabels/createComment/update, token not logged).
+  - **flue build green; discovery = agents{hello} + workflows{build,gated,issue-triage,
+    pr-review}**; no vitest module import in dist; helpers in agent-lib/ (+ triage-post.ts
+    at src/ top-level like github-post.ts, not discovered), tests in nested __tests__/.
+  - **NO LIVE SIDE EFFECT** — all GitHub/model MOCKED; no real labels/comments/close, no
+    live `flue run`. Last commit: Phase 5 slice 1 (issue-triage). Next slice = `issue-comment`
+    (or `pr-fix`).
+- **Phase 4 STARTING-position note retained below.**
 - **⏸ Phase 4 LIVE ACCEPTANCE DEFERRED (user choice 2026-06-22):** the live
   `flue run build` (writes real code, pushes a branch, opens a real PR, pauses at
   the gate for human approval) is user-gated and NOT to be run autonomously — run
@@ -185,7 +214,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   no `import/require 'vitest'` in dist).
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
-- [ ] 5 — Remaining workflows + crons + chat
+- [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover

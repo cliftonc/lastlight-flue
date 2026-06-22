@@ -1,0 +1,256 @@
+/**
+ * `issue-triage` workflow — a Phase 5 single-phase workflow.
+ *
+ * Discoverable as `src/workflows/issue-triage.ts` (filename = workflow name),
+ * invoked via `flue run issue-triage --payload '{"owner":..,"repo":..,"issueNumber":..}'`.
+ *
+ * Control flow (design/phase-5-workflows-chat.md → "Single-phase workflows" +
+ * ~/work/lastlight/workflows/issue-triage.yaml):
+ *   1. Mint an `issues-write` scoped GitHub App token (downscoped to this repo).
+ *   2. Fetch the issue context (title/body/labels/comments) DETERMINISTICALLY over
+ *      the bound octokit — this is workflow code, not a model tool.
+ *   3. Build the triage agent (read tools bound to ref+token, `issue-triage` skill,
+ *      persona, triage model/thinkingLevel, NO sandbox). init → session.prompt with
+ *      the issue context, the untrusted issue text wrapped (wrapUntrusted).
+ *   4. parseTriageClassification(agent output) — the `CLASSIFICATION:` marker.
+ *   5. The WORKFLOW applies labels / comment / close DETERMINISTICALLY (not the
+ *      model) over the scoped token — `applyTriageDeterministically`, mirroring the
+ *      pr-review verdict→post split. Canonical labels are created-if-missing
+ *      (existing-only fallback on 403), matching the reference skill's §0.
+ *
+ * WHY agent-emits-marker + deterministic apply (vs the reference's agent-applies-
+ * labels-via-MCP-tools): we keep the JUDGMENT agent-side but pull the SIDE EFFECT
+ * out of the model surface (spec/09: owner/repo/issue/token never model-selectable).
+ * `triage-classification.ts` documents the seam.
+ *
+ * NO SANDBOX: triage is tool-only (reads the issue + searches duplicates via bound
+ * read tools — no checkout needed). Cheaper + lower-latency than build/review.
+ *
+ * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ *
+ * TESTABILITY: `run` defers to `runIssueTriage(ctx, deps)` with an injectable `deps`
+ * seam (token minter, octokit factory, context fetcher, agent runner, applier). The
+ * default deps wire the real implementations; tests pass fakes so the whole flow
+ * runs with NO live model and NO live GitHub.
+ */
+import type { FlueContext } from "@flue/runtime";
+import { Octokit } from "octokit";
+import {
+  parseTriageClassification,
+  classificationToLabels,
+  extractTriageComment,
+  type TriageClassification,
+} from "../agent-lib/triage-classification.ts";
+import {
+  GITHUB_PERMISSION_PROFILES,
+  type GitAccessProfile,
+} from "../engine/profiles.ts";
+import { configureGitAuth } from "../engine/git-auth.ts";
+import { loadConfig } from "../config.ts";
+import { createTriageAgent } from "../agent-lib/triage.ts";
+import {
+  renderTriagePrompt,
+  type TriagePromptContext,
+} from "../agent-lib/triage-prompt.ts";
+import {
+  applyTriageDeterministically,
+  type IssueRef,
+  type TriageApplied,
+} from "../triage-post.ts";
+
+/** The workflow input payload (identifies the issue + trigger). */
+export interface IssueTriageInput {
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  /** Optional trigger provenance: "webhook" | "cron" | "cli". */
+  triggerType?: string;
+}
+
+/** The workflow result. */
+export interface IssueTriageResult {
+  classification: TriageClassification;
+  /** Whether the marker was missing → conservative needs-triage fallback. */
+  viaFallback: boolean;
+  /** The labels actually applied (after create-if-missing / existing-only). */
+  labelsApplied: string[];
+  commented: boolean;
+  commentUrl?: string;
+  closed: boolean;
+}
+
+/** The `issues-write` profile this workflow always runs under (spec/09 / design). */
+export const ISSUE_TRIAGE_PROFILE: GitAccessProfile = "issues-write";
+
+/** Issue context fetched deterministically for the prompt (workflow code, not a tool). */
+export interface IssueContext {
+  title: string;
+  body: string;
+  author?: string;
+  labels: string[];
+  comments: { author?: string; body: string }[];
+}
+
+/**
+ * Injectable dependencies — the seams that make `run()` testable without a live
+ * model or GitHub. The default factory wires the real implementations.
+ */
+export interface IssueTriageDeps {
+  /** Mint an `issues-write` scoped installation token for this repo. */
+  mintToken(input: IssueTriageInput): Promise<string>;
+  /** Build an Octokit authenticated with the scoped token. */
+  makeOctokit(token: string): Octokit;
+  /** Fetch the issue context (title/body/labels/comments) over the bound octokit. */
+  fetchIssue(octokit: Octokit, ref: IssueRef): Promise<IssueContext>;
+  /**
+   * Run the triage agent for this issue and return its raw text output. Wraps
+   * agent-init + session.prompt so tests can return canned CLASSIFICATION output.
+   */
+  runTriage(
+    ctx: FlueContext<IssueTriageInput>,
+    ref: IssueRef,
+    octokit: Octokit,
+    issue: IssueContext,
+  ): Promise<string>;
+  /** Deterministically apply the classification (labels / comment / close). */
+  apply(
+    octokit: Octokit,
+    ref: IssueRef,
+    opts: { labels: string[]; comment?: string; close: boolean },
+  ): Promise<TriageApplied>;
+}
+
+/** Mint an issues-write token downscoped to the target repo via the ported git-auth. */
+async function mintIssuesWriteToken(input: IssueTriageInput): Promise<string> {
+  const cfg = loadConfig();
+  if (!cfg.githubApp) {
+    throw new Error(
+      "issue-triage: GitHub App not configured (GITHUB_APP_ID / _PRIVATE_KEY_PATH / _INSTALLATION_ID). Cannot mint an issues-write token.",
+    );
+  }
+  const { token } = await configureGitAuth({
+    appId: cfg.githubApp.appId,
+    privateKeyPath: cfg.githubApp.privateKeyPath,
+    installationId: cfg.githubApp.installationId,
+    botName: cfg.botLogin.replace(/\[bot\]$/, ""),
+    repositories: [input.repo],
+    permissions: GITHUB_PERMISSION_PROFILES[ISSUE_TRIAGE_PROFILE],
+  });
+  return token;
+}
+
+/** Fetch the issue + its comments deterministically (workflow code, not a model tool). */
+async function fetchIssueContext(octokit: Octokit, ref: IssueRef): Promise<IssueContext> {
+  const { data: issue } = await octokit.rest.issues.get({
+    owner: ref.owner,
+    repo: ref.repo,
+    issue_number: ref.issue_number,
+  });
+  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+    owner: ref.owner,
+    repo: ref.repo,
+    issue_number: ref.issue_number,
+    per_page: 100,
+  });
+  return {
+    title: issue.title ?? "",
+    body: issue.body ?? "",
+    author: issue.user?.login,
+    labels: (issue.labels ?? []).map((l) => (typeof l === "string" ? l : (l.name ?? ""))),
+    comments: comments.map((c) => ({ author: c.user?.login, body: c.body ?? "" })),
+  };
+}
+
+/** The real triage run: init the agent, open a session, prompt with the issue context. */
+async function runTriageSession(
+  ctx: FlueContext<IssueTriageInput>,
+  ref: IssueRef,
+  octokit: Octokit,
+  issue: IssueContext,
+): Promise<string> {
+  const agent = createTriageAgent(ref, octokit);
+  const harness = await ctx.init(agent);
+  const session = await harness.session("triage");
+  const promptCtx: TriagePromptContext = {
+    owner: ref.owner,
+    repo: ref.repo,
+    issueNumber: ref.issue_number,
+    title: issue.title,
+    body: issue.body,
+    author: issue.author,
+    labels: issue.labels,
+    comments: issue.comments,
+    triggerType: ctx.payload.triggerType,
+  };
+  const res = await session.prompt(renderTriagePrompt(promptCtx));
+  return res.text;
+}
+
+/** Default production dependencies. */
+export function defaultDeps(): IssueTriageDeps {
+  return {
+    mintToken: mintIssuesWriteToken,
+    makeOctokit: (token) => new Octokit({ auth: token }),
+    fetchIssue: fetchIssueContext,
+    runTriage: runTriageSession,
+    apply: applyTriageDeterministically,
+  };
+}
+
+/**
+ * The testable core. Drives the full flow over injected dependencies; production
+ * uses `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
+ */
+export async function runIssueTriage(
+  ctx: FlueContext<IssueTriageInput>,
+  deps: IssueTriageDeps = defaultDeps(),
+): Promise<IssueTriageResult> {
+  const { owner, repo, issueNumber } = ctx.payload;
+  const ref: IssueRef = { owner, repo, issue_number: issueNumber };
+
+  // 1. Mint the issues-write scoped token + an Octokit bound to it.
+  const token = await deps.mintToken(ctx.payload);
+  const octokit = deps.makeOctokit(token);
+
+  // 2. Fetch the issue context deterministically (workflow code, not a model tool).
+  const issue = await deps.fetchIssue(octokit, ref);
+
+  // 3. Run the triage agent (tool-only, read tools bound to ref+token). The agent
+  //    reads + searches for duplicates and emits a CLASSIFICATION marker.
+  const output = await deps.runTriage(ctx, ref, octokit, issue);
+
+  // 4. Parse the CLASSIFICATION marker (the code↔prompt contract).
+  const { classification, viaFallback } = parseTriageClassification(output);
+  if (viaFallback) {
+    ctx.log.warn(
+      "issue-triage: classification via fallback (marker missing/unparseable)",
+      { owner, repo, issueNumber },
+    );
+  }
+
+  // 5. DETERMINISTIC apply (workflow, not the model). Labels mapped from the
+  //    classification; the agent's pre-marker text (if any) becomes the comment.
+  const labels = classificationToLabels(classification);
+  const comment = extractTriageComment(output);
+  const applied = await deps.apply(octokit, ref, {
+    labels,
+    comment: comment || undefined,
+    close: classification.close,
+  });
+
+  return {
+    classification,
+    viaFallback,
+    labelsApplied: applied.labelsApplied,
+    commented: applied.commented,
+    commentUrl: applied.commentUrl,
+    closed: applied.closed,
+  };
+}
+
+/** Flue workflow entry — discovered as the `issue-triage` workflow. */
+export async function run(
+  ctx: FlueContext<IssueTriageInput>,
+): Promise<IssueTriageResult> {
+  return runIssueTriage(ctx);
+}
