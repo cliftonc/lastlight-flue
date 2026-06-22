@@ -340,6 +340,40 @@ describe('build — boot orphan recovery', () => {
     expect(recovered).toEqual(['active-run']);
     expect(reinvoked).toEqual(['active-run']);
   });
+
+  it('boot recovery re-invokes the active orphan through the REAL build + leaves paused', async () => {
+    // An active orphan that crashed mid-phase: boot recovery re-invokes it with the
+    // real runBuild as the reinvoke seam (NOT mocked), so it actually runs to
+    // completion. The paused run is left alone (awaiting a human).
+    const t = recordingDeps({ gates: { post_architect: false } }); // no gate → completes
+    store.getOrCreate('active-orphan', { owner: 'o', repo: 'r', issue: 5, branch: 'b', taskId: 't' });
+    store.getOrCreate('paused-orphan', { owner: 'o', repo: 'r', issue: 6, branch: 'b', taskId: 't' });
+    store.setPending('paused-orphan', 'post_architect');
+
+    const recovered = await recoverOrphanRuns({
+      storePath: join(dir, 'build.db'),
+      reinvoke: (input: BuildInput) => runBuild(ctx(input), store, t.deps),
+    });
+    expect(recovered).toEqual(['active-orphan']); // paused left alone
+    expect(store.get('active-orphan')!.status).toBe('complete');
+    expect(store.get('paused-orphan')!.status).toBe('paused'); // untouched
+
+    // Breaker: a run already AT the cap that boot recovery re-invokes must
+    // terminalize on this pass — it does NOT proceed and does NOT loop. (The full
+    // crash-loop progression is covered by the restart-breaker describe.)
+    store.getOrCreate('wedged', { owner: 'o', repo: 'r', issue: 9, branch: 'b', taskId: 't' });
+    for (let i = 0; i < 3; i++) store.bumpRestart('wedged'); // already at the cap (3)
+    const gateDeps = recordingDeps({ gates: { post_architect: false } });
+    await recoverOrphanRuns({
+      storePath: join(dir, 'build.db'),
+      reinvoke: (input: BuildInput) => runBuild(ctx(input), store, gateDeps.deps),
+    });
+    const wedged = store.get('wedged')!;
+    expect(wedged.status).toBe('failed'); // bumped to 4 > cap → breaker tripped
+    expect(wedged.failReason).toContain('restart-breaker');
+    // The wedged run's phases never ran on the breaker trip.
+    expect(gateDeps.phases).toEqual([]);
+  });
 });
 
 describe('build — idempotency: phases run EXACTLY ONCE across many re-invokes', () => {

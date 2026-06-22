@@ -219,6 +219,14 @@ export class BuildRunStore {
     return rows.map((r) => this.hydrate(r));
   }
 
+  /** Paused runs parked at a gate — the pending-approvals queue (awaiting a human). */
+  listPaused(): BuildRun[] {
+    const rows = this.db
+      .prepare("SELECT * FROM build_runs WHERE status = 'paused'")
+      .all() as unknown as BuildRunRow[];
+    return rows.map((r) => this.hydrate(r));
+  }
+
   close(): void {
     if (this.closed) return; // idempotent — double-close is a no-op
     this.closed = true;

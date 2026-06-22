@@ -19,9 +19,32 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
-  slice 2 (real ARCHITECT) DONE ✅; slice 3 (real EXECUTOR) DONE ✅;
-  slice 4 (real REVIEWER-LOOP) DONE ✅; slice 5 (guardrails + gate-ask + open-PR) DONE ✅.
+- **Phase 4 IN PROGRESS** — slices 1-5 DONE ✅ (control flow+gate+run-record;
+  ARCHITECT; EXECUTOR; REVIEWER-LOOP; guardrails+gate-ask+open-PR). **Slice 6
+  (this slice) DONE ✅ — durable gate is now RESUMABLE end-to-end + recovers on boot.**
+- **This slice (6) built:** the RESUME path wired to real triggers + boot recovery.
+  - **Approvals server surface** (`src/admin/approvals.ts` + `createApp` routes) —
+    replaced the `/admin/api/approvals` 501 stub. `GET /admin/api/approvals` lists
+    PAUSED build runs (id=runId, gate, kind, workflowRunId, summary[repo#issue+plan/
+    verdict pointer], restartCount, createdAt:null[Phase-7]); `POST /admin/api/
+    approvals/:id/respond {decision:'approved'|'rejected'}` maps to
+    `resume(runId,'approve'|'reject')`. Matches `src/cli.ts` cmdApprovals exactly.
+    Operator-auth gated (mounted under the existing `/admin/api/*` requireOperator
+    middleware — 401 without token). Thin `ApprovalsBackend` SEAM over the build
+    run-store (+ injected `resume`/`reinvoke`) so routes test offline; default export
+    wires `createDefaultApprovalsBackend()`. Added `BuildRunStore.listPaused()`.
+  - **IDEMPOTENCY:** unchanged from slice 1 — `resume()` no-ops on an already-resolved
+    run (double-approve = no second re-invoke; reject-after-complete = no-op). Backend
+    404s an unknown runId; 400s an invalid decision. reinvoke seam stays injectable
+    (default spawns `flue run build`, Spike-3 path). NO GitHub post in resume.
+  - **BOOT recovery hook** (`src/app.ts` module scope) — `runBootRecovery()` calls
+    `recoverOrphanRuns()`: re-invokes `active` orphans (crashed mid-phase, idempotent
+    via phasesDone), LEAVES `paused` runs for a human (slice-1 + flue-ref §0
+    Node-no-workflow-recovery). WHERE: app.ts module-eval (dist/server.mjs inlines it,
+    owns serve()/listen) — run-ONCE (`bootRecoveryStarted` guard), NON-BLOCKING
+    (detached `void` promise, listen not awaited), NON-FATAL (errors logged). Skipped
+    under `VITEST`/`LASTLIGHT_SKIP_BOOT_RECOVERY=1` so unit imports don't trigger it.
+    Restart-count BREAKER (≤3 in build.ts) caps a wedged run — boot re-invoke bumps it.
   **The build workflow's PHASES are now COMPLETE.**
 - **This slice (5) built:** the three remaining phase bodies — guardrails + the
   deterministic gate-ask + the deterministic open-PR — behind the `BuildDeps` seam.
@@ -110,21 +133,21 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
     (spec/10 split rule), so the gate can surface it + the executor can consume it.
   - Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
     injectable → default impl tested OFFLINE.
-- **REMAINING for Phase 4 (all user-gated, SEPARATE later slices):** (1) the durable
-  RESUME-from-GitHub-comment wiring — `resume()` exists + is tested with an injected
-  reinvoker, but the channel/webhook entry that maps an `@last-light approve`/`reject`
-  comment → `resume(runId, decision)` is NOT wired (TODO(phase-4/channels)); (2) the
-  BOOT orphan-recovery wire-up — `recoverOrphanRuns()` exists + tested but is not yet
-  called from app boot (TODO(phase-4/boot)); (3) the LIVE build acceptance — a real
-  `flue run build` end-to-end (clone→commit→PUSH→gate comment→PR) on a real issue, run
-  WITH THE USER (the mocked `pushBranch`/`postGateComment`/`openPullRequest` seams
-  become live). NONE done this slice.
-- **NO LIVE SIDE EFFECTS this slice** — guardrails/gate-ask/open-PR wired but NOT run
-  live; all GitHub/sandbox/model/PUSH/PR/comment interaction MOCKED in tests; no
-  branches/commits/PRs/pushes/comments posted.
-- **Blockers:** none. (Open-PR idempotency uses existing run-record state + an
-  `pulls.list` head-filter; gate resume mechanism is unchanged from slice 1's tested
-  `resume()` seam — no ambiguity surfaced.)
+- **REMAINING for Phase 4 (user-gated):** (1) the **LIVE build acceptance** — a real
+  `flue run build` end-to-end (clone→commit→PUSH→gate comment→PR→approve→resume→PR)
+  on a real issue, run WITH THE USER (the mocked `pushBranch`/`postGateComment`/
+  `openPullRequest` seams become live). NEXT SLICE. (2) The **Phase-6** channel/
+  webhook resume entry — mapping a GitHub `@last-light approve`/`reject` COMMENT →
+  `resume(runId,decision)` (the dashboard + CLI HTTP path is now LIVE this slice;
+  the GitHub-comment trigger lands with channels, TODO(phase-4/channels) in resume.ts).
+- **NO LIVE SIDE EFFECTS this slice** — approvals endpoints + boot recovery wired but
+  exercised ONLY against fakes/temp sqlite in tests; resume's default reinvoke (spawn
+  `flue run build`) is NEVER invoked live; no GitHub writes, no PR, no real
+  `flue run build`, no branches/commits/pushes/comments posted.
+- **Blockers:** none. CLI approvals contract met without Phase-7 data — only the
+  paused build run-store rows are needed (createdAt is honestly null until Phase-7).
+  Boot hook runs cleanly in the generated entry (module-eval, guarded/non-blocking/
+  non-fatal); verified `flue build` green + no real vitest import in dist.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker
@@ -140,22 +163,22 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 5 of N).
-  Slice 1: durable control flow + gate + run-record. Slice 2: ARCHITECT. Slice 3:
-  EXECUTOR (mocked push). Slice 4: REVIEWER-LOOP. Slice 5: guardrails + gate-ask +
-  open-PR — **the build workflow's PHASES are COMPLETE.** guardrails (READY/BLOCKED +
-  bootstrap-bypass parity), deterministic gate-ask comment (bound ref, idempotent,
-  records comment id), deterministic open-PR (bound ref, pr.md body, reuse-open-PR
-  idempotency, records prNumber). gateEnabled now positive-enable from config.
-  New tests: build-github-post pure+security (12), guardrails agent-config + prompt +
-  bypass + phase-wiring (11), gate-ask/open-PR phase-wiring (5), build.ts guardrails
-  PROCEED/BLOCKED/bypass + gate-comment-id idempotency golden (+4); one obsolete
-  "guardrails unwired" test repurposed. Suite **374 passed / 5 skipped** (+28).
-  `flue build` green; discovery = agents{hello} + workflows{build,gated,pr-review};
-  `grep -c vitest dist/server.mjs` = 1 (the word "vitest" inside the inlined guardrails
-  prompt text — a listed test-runner example, NOT the vitest module).
-  **Next slice (user-gated):** wire `resume()` to a channel/webhook approve/reject entry
-  + boot-wire `recoverOrphanRuns` + the LIVE `flue run build` acceptance.
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 6 of N).
+  Slices 1-5: control flow+gate+run-record; ARCHITECT; EXECUTOR; REVIEWER-LOOP;
+  guardrails+gate-ask+open-PR (PHASES COMPLETE). **Slice 6 (this): durable gate is
+  RESUMABLE end-to-end via the app + recovers on boot.** Approvals server surface
+  (`GET /admin/api/approvals` lists paused runs; `POST :id/respond` → resume) matching
+  the CLI contract, operator-auth gated, idempotent (resume no-ops), 404/400 guards;
+  `ApprovalsBackend` seam over the build run-store (+`listPaused`). Boot orphan recovery
+  hooked at app.ts module-eval (run-once/non-blocking/non-fatal; re-invokes active,
+  leaves paused; breaker ≤3). New tests: approvals endpoints+auth+idempotency+default
+  backend (10 in app.test) + boot-recovery breaker (1 in build.test). Suite
+  **384 passed / 5 skipped** (+10). `flue build` green; discovery = agents{hello} +
+  workflows{build,gated,pr-review}; `grep -c vitest dist/server.mjs` = 1 (the inlined
+  guardrails prompt text — a test-runner example, NOT a vitest module import; verified
+  no `import/require 'vitest'` in dist).
+  **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
+  end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API

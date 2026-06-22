@@ -15,6 +15,11 @@ import {
   type OperatorAuthConfig,
 } from './admin/auth.ts';
 import { mountDashboard } from './admin/dashboard.ts';
+import {
+  createDefaultApprovalsBackend,
+  type ApprovalsBackend,
+} from './admin/approvals.ts';
+import { recoverOrphanRuns } from './resume.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -118,6 +123,15 @@ export interface CreateAppOptions {
   serveDashboard?: boolean;
   /** Override the dashboard assets root (absolute path). Tests inject a fixture. */
   dashboardRoot?: string;
+  /**
+   * The approvals backend gating the durable build gate (Phase 4 · resume wiring):
+   * lists PAUSED build runs (pending gates) and maps approve/reject to
+   * `resume(runId, decision)`. Mounted under `/admin/api/*` (operator-auth gated).
+   * Injected so the routes are testable offline with a fake store + fake resume.
+   * When omitted, the approvals routes 501 (honest) — the default export wires the
+   * real build-run-store-backed backend.
+   */
+  approvals?: ApprovalsBackend;
 }
 
 /**
@@ -242,14 +256,46 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
     });
   }
 
+  // ── Approvals — the durable build gate (Phase 4 · resume wiring) ──────────
+  // Backed by the injected ApprovalsBackend seam (build run-store + resume).
+  // Operator-auth gated by the `/admin/api/*` middleware above. Matches the CLI
+  // contract (`src/cli.ts` cmdApprovals): GET lists paused runs; POST
+  // `:id/respond { decision: 'approved'|'rejected' }` maps to resume(approve|reject).
+  // Without a backend the routes 501 (honest) — wired by the default export.
+  const approvals = opts.approvals;
+  if (approvals) {
+    app.get('/admin/api/approvals', async (c) => {
+      const rows = await approvals.list();
+      return c.json({ approvals: rows });
+    });
+    app.post('/admin/api/approvals/:id/respond', async (c) => {
+      const id = c.req.param('id') ?? '';
+      const body = await c.req
+        .json<{ decision?: string }>()
+        .catch((): { decision?: string } => ({}));
+      // The CLI sends 'approved'/'rejected'; map to the resume decision.
+      const decision =
+        body.decision === 'approved'
+          ? 'approve'
+          : body.decision === 'rejected'
+            ? 'reject'
+            : null;
+      if (!decision) {
+        return c.json({ error: 'decision must be "approved" or "rejected"' }, 400);
+      }
+      const result = await approvals.respond(id, decision);
+      if (!result) return c.json({ error: 'approval not found' }, 404);
+      return c.json(result);
+    });
+  } else {
+    app.get('/admin/api/approvals', (c) =>
+      c.json({ error: 'not_implemented', route: '/admin/api/approvals', slice: 'phase-4 (no approvals backend wired)' }, 501),
+    );
+  }
+
   // Genuinely-Phase-7 routes (not backable by listRuns/getRun/listAgents):
-  // per-phase stats rollups, session transcripts (EventStreamStore), and the
-  // approvals queue (app run-store pendingGate). Stay 501 — honest, not fake.
-  for (const path of [
-    '/admin/api/stats',
-    '/admin/api/sessions',
-    '/admin/api/approvals',
-  ] as const) {
+  // per-phase stats rollups + session transcripts (EventStreamStore). Stay 501.
+  for (const path of ['/admin/api/stats', '/admin/api/sessions'] as const) {
     app.get(path, (c) =>
       c.json({ error: 'not_implemented', route: path, slice: 'phase-7' }, 501),
     );
@@ -297,7 +343,49 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
 // the configured run store, and the throw can only surface at request time, not
 // at import. Tests use `createApp({ runsReader: fake })` and never touch these.
 const liveRunsReader: RunsReader = { listRuns, getRun, listAgents };
-const app = createApp({ runsReader: liveRunsReader });
+const app = createApp({
+  runsReader: liveRunsReader,
+  approvals: createDefaultApprovalsBackend(),
+});
 app.route('/', flue());
+
+// ── Boot orphan recovery (Phase 4 · resume wiring) ───────────────────────────
+// Flue does NOT recover workflows on Node (flue-reference §0); durability is
+// app-owned. On a fresh server start we reconcile the build run-store: re-invoke
+// every `status='active'` run that crashed mid-phase (idempotent — phasesDone
+// skips completed phases) and LEAVE `paused` runs for a human (slice-1 semantics).
+// The restart-count breaker in build.ts caps a wedged run at MAX_RESTART_RESUMES.
+//
+// WHERE THIS RUNS: app.ts's module scope is evaluated at boot — the generated
+// `dist/server.mjs` inlines it and owns serve()/listen() (flue-reference §0). So
+// this fires ONCE, at module-eval, BEFORE listen returns. It is:
+//   - run-once: a module-level guard (`bootRecoveryStarted`) so a re-import (HMR /
+//     test double-import) can't double-trigger it;
+//   - non-blocking: kicked off as a detached promise — listen() is NOT awaited on
+//     it, so a slow recovery never delays the server accepting requests;
+//   - non-fatal: errors are logged, never thrown, so a recovery failure can't
+//     crash the server entry.
+// CAVEAT: in unit tests app.ts is imported (createApp is exercised), which would
+// also trigger this. It is suppressed when LASTLIGHT_SKIP_BOOT_RECOVERY is set OR
+// when not running a real server (vitest sets VITEST=true) — see runBootRecovery.
+let bootRecoveryStarted = false;
+function runBootRecovery(): void {
+  if (bootRecoveryStarted) return;
+  bootRecoveryStarted = true;
+  // Skip in test/import contexts: only the real built server should reconcile.
+  if (process.env.LASTLIGHT_SKIP_BOOT_RECOVERY === '1' || process.env.VITEST) {
+    return;
+  }
+  void recoverOrphanRuns()
+    .then((ids) => {
+      if (ids.length) {
+        console.log(`[boot] recovered ${ids.length} orphaned build run(s): ${ids.join(', ')}`);
+      }
+    })
+    .catch((err: unknown) => {
+      console.error('[boot] orphan recovery failed (non-fatal):', err);
+    });
+}
+runBootRecovery();
 
 export default app;

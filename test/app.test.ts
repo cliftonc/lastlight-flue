@@ -74,14 +74,21 @@ describe('app-owned surface (createApp, in-process)', () => {
     }
   });
 
-  it('genuinely-Phase-7 admin routes stay 501 (stats/sessions/approvals)', async () => {
-    for (const path of ['/admin/api/stats', '/admin/api/sessions', '/admin/api/approvals']) {
+  it('genuinely-Phase-7 admin routes stay 501 (stats/sessions)', async () => {
+    for (const path of ['/admin/api/stats', '/admin/api/sessions']) {
       const res = await app.request(path);
       expect(res.status).toBe(501);
       const body = (await res.json()) as Record<string, unknown>;
       expect(body.error).toBe('not_implemented');
       expect(body.slice).toBe('phase-7');
     }
+  });
+
+  it('approvals 501 with NO approvals backend wired (honest, not fake)', async () => {
+    const res = await app.request('/admin/api/approvals');
+    expect(res.status).toBe(501);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('not_implemented');
   });
 
   it('unknown route → 404 (Hono default, no flue() mounted)', async () => {
@@ -342,5 +349,202 @@ describe('operator auth on /admin/api/*', () => {
     const body = (await login.json()) as Record<string, unknown>;
     expect(body.authDisabled).toBe(true);
     expect(typeof body.token).toBe('string');
+  });
+});
+
+// ── Approvals surface (Phase 4 · resume wiring) ──────────────────────────────
+// The durable build gate, driven by the CLI (`lastlight approvals` /
+// approve / reject). GET lists PAUSED build runs; POST `:id/respond
+// { decision }` maps to resume(approve|reject). Backend is an injected fake so
+// the routes are exercised OFFLINE — no build run-store, no `flue run` spawn.
+describe('approvals endpoints (Phase 4 resume wiring)', () => {
+  type RespondCall = { id: string; decision: 'approve' | 'reject' };
+
+  function fakeBackend(overrides: {
+    rows?: import('../src/admin/approvals.ts').ApprovalSummary[];
+    respond?: (
+      id: string,
+      decision: 'approve' | 'reject',
+    ) => Promise<import('../src/admin/approvals.ts').ApprovalRespondResult | null> | import('../src/admin/approvals.ts').ApprovalRespondResult | null;
+  } = {}) {
+    const calls: RespondCall[] = [];
+    const backend: import('../src/admin/approvals.ts').ApprovalsBackend = {
+      list: async () =>
+        overrides.rows ?? [
+          {
+            id: 'run-1',
+            gate: 'post_architect',
+            kind: 'architect',
+            workflowRunId: 'run-1',
+            summary: 'o/r#7 — .lastlight/issue-7/architect-plan.md',
+            restartCount: 0,
+            createdAt: null,
+          },
+        ],
+      respond: async (id: string, decision: 'approve' | 'reject') => {
+        calls.push({ id, decision });
+        if (overrides.respond) return overrides.respond(id, decision);
+        return { ok: true, status: decision === 'reject' ? 'failed' : 'complete', decision };
+      },
+    };
+    return { backend, calls };
+  }
+
+  it('GET /admin/api/approvals lists paused runs in the CLI shape', async () => {
+    const { backend } = fakeBackend();
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const res = await app.request('/admin/api/approvals');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { approvals: Array<Record<string, unknown>> };
+    expect(body.approvals).toHaveLength(1);
+    expect(body.approvals[0]!.id).toBe('run-1');
+    expect(body.approvals[0]!.gate).toBe('post_architect');
+    expect(body.approvals[0]!.workflowRunId).toBe('run-1');
+  });
+
+  it('POST approve → resume("approve")', async () => {
+    const { backend, calls } = fakeBackend();
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const res = await app.request('/admin/api/approvals/run-1/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.status).toBe('complete');
+    expect(calls).toEqual([{ id: 'run-1', decision: 'approve' }]);
+  });
+
+  it('POST reject → resume("reject") (terminalize)', async () => {
+    const { backend, calls } = fakeBackend();
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const res = await app.request('/admin/api/approvals/run-1/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'rejected' }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.status).toBe('failed');
+    expect(calls).toEqual([{ id: 'run-1', decision: 'reject' }]);
+  });
+
+  it('double-approve is idempotent — second resume is a no-op at the data layer', async () => {
+    // The fake mimics resume()'s idempotency: a re-approve of an already-complete
+    // run returns 'complete' without a second re-invoke. The endpoint just relays.
+    let approveCount = 0;
+    const { backend } = fakeBackend({
+      respond: () => {
+        approveCount++;
+        return { ok: true, status: 'complete', decision: 'approve' };
+      },
+    });
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const body = JSON.stringify({ decision: 'approved' });
+    const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body };
+    const r1 = await app.request('/admin/api/approvals/run-1/respond', opts);
+    const r2 = await app.request('/admin/api/approvals/run-1/respond', opts);
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    // Endpoint relays each call; idempotency itself lives in resume() (covered by
+    // the resume/build tests). Here we assert the route is a clean pass-through.
+    expect(approveCount).toBe(2);
+  });
+
+  it('unknown runId → 404', async () => {
+    const { backend } = fakeBackend({ respond: () => null });
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const res = await app.request('/admin/api/approvals/nope/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('approval not found');
+  });
+
+  it('invalid decision → 400', async () => {
+    const { backend } = fakeBackend();
+    const app = createApp({ approvals: backend, authConfig: { password: '', secret: 'x' } });
+    const res = await app.request('/admin/api/approvals/run-1/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'maybe' }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('operator-auth gates approvals — 401 without a token', async () => {
+    const SECRET = 'approvals-secret';
+    const { backend } = fakeBackend();
+    const app = createApp({ approvals: backend, authConfig: { password: 'hunter2', secret: SECRET } });
+    const list = await app.request('/admin/api/approvals');
+    expect(list.status).toBe(401);
+    const respond = await app.request('/admin/api/approvals/run-1/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(respond.status).toBe(401);
+    // …and 200 with a valid token.
+    const token = createToken(SECRET, 'password');
+    const ok = await app.request('/admin/api/approvals', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(ok.status).toBe(200);
+  });
+});
+
+// ── Default approvals backend over a real build run-store (offline) ───────────
+// Exercises createDefaultApprovalsBackend against an on-disk BuildRunStore with an
+// INJECTED fake resume — no `flue run` spawn, no GitHub. Asserts list maps paused
+// runs and respond routes the decision through resume + 404s an unknown id.
+describe('default approvals backend (build run-store + injected resume)', () => {
+  it('lists paused runs and routes respond through resume', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { BuildRunStore } = await import('../src/build-run-store.ts');
+    const { createDefaultApprovalsBackend } = await import('../src/admin/approvals.ts');
+
+    const dir = mkdtempSync(join(tmpdir(), 'apr-'));
+    const storePath = join(dir, 'b.db');
+    try {
+      const store = new BuildRunStore(storePath);
+      store.getOrCreate('paused-run', { owner: 'o', repo: 'r', issue: 7, branch: 'b', taskId: 't' });
+      store.markPhaseDone('paused-run', 'architect', {
+        architectPlan: '.lastlight/issue-7/architect-plan.md',
+      });
+      store.setPending('paused-run', 'post_architect');
+      store.getOrCreate('active-run', { owner: 'o', repo: 'r', issue: 8, branch: 'b', taskId: 't' });
+      store.close();
+
+      const calls: Array<{ id: string; decision: string }> = [];
+      const fakeResume = (async (id: string, decision: string) => {
+        calls.push({ id, decision });
+        return { status: decision === 'reject' ? 'failed' : 'complete' };
+      }) as unknown as typeof import('../src/resume.ts').resume;
+
+      const backend = createDefaultApprovalsBackend({ storePath, resume: fakeResume });
+      const rows = await backend.list();
+      // Only the PAUSED run is surfaced (the active one is not an approval).
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.id).toBe('paused-run');
+      expect(rows[0]!.gate).toBe('post_architect');
+      expect(rows[0]!.summary).toContain('o/r#7');
+      expect(rows[0]!.summary).toContain('architect-plan.md');
+
+      const ok = await backend.respond('paused-run', 'approve');
+      expect(ok?.status).toBe('complete');
+      expect(calls).toEqual([{ id: 'paused-run', decision: 'approve' }]);
+
+      // Unknown id → null (route 404s).
+      const missing = await backend.respond('no-such-run', 'approve');
+      expect(missing).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
