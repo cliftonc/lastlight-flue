@@ -18,6 +18,43 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 7 DONE ✅ — `repo-health` workflow ported (cron/CLI repo-scoped scan)
+- **`src/workflows/repo-health.ts`** (`run` → `runRepoHealth(ctx, deps)` DI seam). Input
+  `{owner, repo, triggerType?}` — REPO-SCOPED (no issue/PR). Single-phase TOOL-ONLY agent
+  (NO sandbox; gathers metrics via bound `github_*` read tools — listIssues/listPRs/
+  searchIssues/getRepository). Mints an **`issues-write`** scoped token (see profile note).
+- **agent** `src/agent-lib/repo-health.ts` (`createHealthAgent`: `health` key, persona,
+  `repo-health` skill, READ-ONLY github tools bound to ref+token, NO sandbox) +
+  `repo-health-prompt.ts` (thin; repo slug + trigger metadata; the repo
+  DESCRIPTION/topics — user-authored text the agent summarizes — are `wrapUntrusted`-wrapped;
+  contract = produce ONLY the report markdown).
+- **report→deterministic delivery + IDEMPOTENCY** `src/repo-health-post.ts`
+  (`deliverHealthReport`, bound ref+token, NOT a model tool): delivers the report to an
+  idempotent per-repo TRACKING ISSUE — find the existing OPEN, bot-authored, marker-carrying
+  (`<!-- lastlight:repo-health:owner/repo -->`) issue → **UPDATE** its title+body; else
+  **CREATE** one. So the weekly cron / crash re-invoke never piles up duplicate issues.
+  Marker author-checked (human can't hijack); PRs skipped; `repo-health` label best-effort
+  (403 skip / 422 ok). Empty report → nothing touched.
+- **PROFILE DEVIATION (documented in module + poster):** reference repo-health is READ-only
+  and surfaces the report via the Slack delivery channel / CLI stdout (no GitHub write). The
+  channel sink is Phase 6 (not built), so this slice delivers via the one durable,
+  deterministic, idempotent surface now available — a tracking issue — hence `issues-write`.
+  Slack/channel delivery lands behind the same `deliver` seam with Phase 6 (TODO(phase-6/channels)).
+- **Tests: +15 (suite 512 → 527 passed / 6 skipped).** run-level (token mint, BOUND ref not
+  model-selectable, agent gets bound ref+fetched meta, idempotent updated=true pass-through,
+  empty-report warn, token-not-logged) + prompt golden (untrusted-wrap incl. hostile
+  description/topic, no-metadata snapshot drops out, report contract) + deliverer security
+  (create-when-absent, UPDATE-existing-not-duplicate, marker per-repo, human-marker ignored,
+  PR skipped, label 403/422).
+- **flue build green; discovery NOW INCLUDES repo-health** = agents{hello} + workflows{answer,
+  build,explore,gated,issue-comment,issue-triage,pr-fix,pr-review,**repo-health**}. Helpers in
+  src/agent-lib/ (+ repo-health-post.ts at src/ top-level), tests in nested __tests__/ — no
+  phantom. `grep -c vitest dist/server.mjs` = 1 (inlined prompt text, NOT a vitest module
+  import — verified no `from 'vitest'`/`require('vitest')`).
+- **NO LIVE SIDE EFFECT** — all GitHub/model MOCKED or injected; no real issue create/update,
+  no live `flue run`. Last commit: Phase 5 slice 7 (repo-health). Next slice = security-review/
+  security-feedback, or chat, or crons (incl. the cron-health schedule that triggers repo-health).
+
 ## ▶ RESUMED 2026-06-22 — explore VERIFIED + committed (stash popped & dropped)
 
 ## Phase 5 slice 6 DONE ✅ — `explore` workflow (Socratic reply-gate loop) — VERIFIED THE WIP
@@ -378,8 +415,9 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
   slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅; slice 5: web tools
   [web_search/web_fetch + server-side SSRF guard, gated-not-global] ✅; slice 6: explore
-  [Socratic reply-gate loop + web-tools-gated + deterministic publish] ✅ → next: repo-health
-  or chat or crons)
+  [Socratic reply-gate loop + web-tools-gated + deterministic publish] ✅; slice 7: repo-health
+  [repo-scoped cron/CLI scan → idempotent tracking-issue delivery] ✅ → next: security-review/
+  security-feedback or chat or crons)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
