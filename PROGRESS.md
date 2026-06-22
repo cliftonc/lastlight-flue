@@ -16,23 +16,38 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase 4 IN PROGRESS** — slice 1 (durable control flow + gate + run-record) DONE ✅.
-- **This slice built:** the real build run-record (`src/build-run-store.ts`:
-  phasesDone idempotency keys, pointers-only scratch, pendingGate, reviewerCycle,
-  restartCount w/ ≤3 breaker, status, app runId ≠ Flue runId); `src/workflows/build.ts`
-  as `run()` control-flow skeleton (guardrails→architect→[post_architect GATE]→
-  executor→reviewer-loop(reviewer:N→[post_reviewer GATE]→fix:N→recheck:N, max_cycles=2)
-  →PR) over a `BuildDeps` DI seam (`src/agent-lib/build-phases.ts`); `src/resume.ts`
-  (`resume(runId, approve|reject)` + `recoverOrphanRuns`) re-invoking via the SAME
-  cross-process `flue run` mechanism Spike-3 proved (injectable `reinvoke` seam).
-- **STUBBED / deferred (later Phase-4 slices):** real architect/executor/reviewer/
-  fix/recheck agent sessions + live PR creation are `defaultBuildDeps()` STUBS that
-  throw (TODO(phase-4/agents|channels|github-post|boot)); guardrails BLOCKED-bypass
-  parity; boot-wire of `recoverOrphanRuns`; channels resume entry (invokeWorkflowAttached).
-- **NO LIVE SIDE EFFECTS this slice** — all GitHub/sandbox/model interaction stubbed;
-  no branches/commits/PRs created. The live "open a PR" acceptance is a LATER slice.
-- **Blockers:** none. Q4.1/Q4.2 (re-invoke re-runs run(), app runId stable) already
-  answered by Spike 3 — leaned on, not re-proven live.
+- **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
+  slice 2 (real ARCHITECT phase body) DONE ✅.
+- **This slice (2) built:** the real ARCHITECT phase body, wired into
+  `defaultBuildDeps().runPhase('architect')` behind the `BuildDeps` seam.
+  - `src/agent-lib/architect.ts` — `createArchitectAgent(ref,octokit,sandbox)`:
+    model=resolveModel('architect'), thinkingLevel=resolveThinking('architect'),
+    instructions=loadPersona() (carries security.md), read-only github tools (closed
+    over ref/octokit), `building` skill, sandbox + cwd=/workspace. Top-level NAMED
+    session `architect` (NOT a subagent — resume can re-open it).
+  - `src/agent-lib/build-sandbox.ts` — `withBuildSandbox` (mirrors reviewer-sandbox;
+    caller-owns-lifetime): creates a node+git container w/ repo-write token baked as
+    env, FULL-clones the repo + `checkout -B <branch>`, ALWAYS `remove()`s in finally.
+    NO tool-only fallback (architect needs the workspace → clone/checkout failure
+    THROWS, token-redacted). EGRESS still deferred.
+  - `src/agent-lib/architect-prompt.ts` — renders `src/prompts/architect.md`
+    (build-time markdown import, inlined) w/ repo/branch/issueDir/issueNumber +
+    a contextSnapshot. `src/engine/untrusted.ts` — ported `wrapUntrusted` markers:
+    issue title/body/comment wrapped UNTRUSTED (spec/07); trigger metadata stays
+    outside; injected markers stripped so hostile text can't escape the wrapper.
+  - Plan PERSISTENCE: agent writes+commits `.lastlight/issue-<N>/architect-plan.md`
+    on the branch (durable handoff); run-record scratch stores the POINTER only
+    (spec/10 split rule), so the gate can surface it + the executor can consume it.
+  - Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
+    injectable → default impl tested OFFLINE.
+- **STILL STUBBED / deferred (later Phase-4 slices):** guardrails / executor /
+  reviewer / fix / recheck agent bodies + the gate ask (postGateComment) + the
+  deterministic open-PR are `defaultBuildDeps()` STUBS that throw
+  (TODO(phase-4/agents|channels|github-post)); guardrails BLOCKED-bypass parity;
+  boot-wire of `recoverOrphanRuns`; channels resume entry.
+- **NO LIVE SIDE EFFECTS this slice** — architect wired but NOT run live; all
+  GitHub/sandbox/model interaction MOCKED in tests; no branches/commits/PRs.
+- **Blockers:** none.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker
@@ -48,15 +63,16 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 1 of N).
-  Slice 1 done: durable control flow + gate + run-record skeleton. Tests: gate
-  pause/resume/reject, post_reviewer mid-loop gate, golden phase-sequence (normal +
-  fix-cycle + resumed-matches-normal), exactly-once idempotency, restart breaker
-  (4th re-invoke → failed), boot orphan recovery, run-store unit. Suite **290 passed
-  / 5 skipped** (+17). `flue build` green; discovery = agents{hello} +
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 2 of N).
+  Slice 1: durable control flow + gate + run-record. Slice 2: real ARCHITECT phase
+  (agent config, sandbox+pre-clone+`checkout -B`+teardown, plan artifact pointer,
+  untrusted-content wrapping). New tests: architect-prompt golden+untrusted (7),
+  build-sandbox lifetime/redaction/no-fallback (5), architect agent-config +
+  phase-wiring (5). All control-flow tests still green (inject fakes). Suite
+  **307 passed / 5 skipped** (+17). `flue build` green; discovery = agents{hello} +
   workflows{build,gated,pr-review}; `grep -c vitest dist/server.mjs` = 0.
-  **Next slice:** wire the real architect phase (top-level harness session, NOT a
-  subagent) per design order, then executor.
+  **Next slice:** wire the real EXECUTOR phase (reads architect-plan.md from the
+  checkout, implements, commits) — then reviewer/fix/recheck, then gate-ask + PR.
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API

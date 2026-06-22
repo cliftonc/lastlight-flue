@@ -36,8 +36,10 @@ import {
   type BuildResult,
   type BuildDeps,
   MAX_CYCLES,
+  ARCHITECT_PLAN_SCRATCH_KEY,
   defaultBuildDeps,
 } from '../agent-lib/build-phases.ts';
+import { architectPlanPath } from '../agent-lib/architect-prompt.ts';
 
 export type { BuildInput, BuildResult } from '../agent-lib/build-phases.ts';
 
@@ -100,9 +102,15 @@ export async function runBuild(
   }
 
   // ── architect (writes+commits architect-plan.md in prod) ─────────────────────
+  // The plan is the durable cross-phase HANDOFF (spec/07): the agent writes +
+  // commits it to the branch; the run-record stores only the POINTER (spec/10
+  // split rule — never the plan blob), so the executor reads it from the checkout
+  // and the post_architect gate can surface it to the human.
   if (store.shouldRunPhase(run, 'architect')) {
     await deps.runPhase(ctx, run, 'architect');
-    store.markPhaseDone(id, 'architect', { architectPlan: '.lastlight/architect-plan.md' });
+    store.markPhaseDone(id, 'architect', {
+      [ARCHITECT_PLAN_SCRATCH_KEY]: architectPlanPath(run.issue),
+    });
     run = store.get(id)!;
   }
 
