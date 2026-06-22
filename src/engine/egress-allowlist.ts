@@ -12,9 +12,22 @@ import { isIP } from "node:net";
  * collector hosts through it. Port the rest when the egress-hardening slice lands.
  */
 
-const INTERNAL_HOSTNAMES = new Set(["localhost", "metadata.google.internal"]);
+/**
+ * Hostnames that always denote an internal/metadata endpoint regardless of what
+ * they resolve to. Exported for the `web_fetch` SSRF guard.
+ */
+export const INTERNAL_HOSTNAMES = new Set(["localhost", "metadata.google.internal"]);
 
-function isPrivateOrInternalIp(host: string): boolean {
+/**
+ * True if `host` is an IP literal in a private / loopback / link-local / unique-
+ * local range (including the cloud-metadata literal 169.254.169.254 inside
+ * 169.254.0.0/16, and IPv6 ::1 / fc00::/7 / fe80::/10 / IPv4-mapped forms).
+ * Non-IP strings (hostnames) return false — resolve them first, then re-check
+ * the resolved address. Exported so the host-side `web_fetch` SSRF guard
+ * (src/tools/web.ts) reuses exactly this range coverage rather than a parallel,
+ * drift-prone copy.
+ */
+export function isPrivateOrInternalIp(host: string): boolean {
   const ip = host.replace(/^\[|\]$/g, "");
   const family = isIP(ip);
   if (family === 4) {

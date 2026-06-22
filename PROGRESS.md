@@ -20,7 +20,45 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
 - **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **457/5 skipped**.
+  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **481/6 skipped**.
+- **Phase 5 slice 5 DONE ✅ — web tools built** (`src/tools/web.ts` — FACTORIES returning
+  Flue `defineTool`s, GATED, not global). Resolves the design phase-5 §DRIFT (Flue has NO
+  built-in web_search/web_fetch).
+  - **`web_search(opts?)`** — queries a provider; precedence **Tavily › Exa › Brave** by
+    KEY PRESENCE (`TAVILY_API_KEY` primary; `EXA_API_KEY`/`BRAVE_API_KEY` optional aliases).
+    Provider + key are **CLOSED OVER**, NEVER model-selectable params (model supplies only
+    `query` + optional `count`≤10). **No provider key → graceful "unavailable" string, never
+    a throw.** Provider clients (Tavily POST /search, Exa POST /search, Brave GET web/search)
+    implemented host-side (reference used agentic-pi's built-in, nothing to port → built from
+    the public provider HTTP shapes). Returns formatted title/url/snippet; key never logged/returned.
+  - **`web_fetch(opts?)`** — fetches a model URL host-side, HTML→text, truncated (20k).
+    🚨 **SERVER-SIDE SSRF GUARD** (`guardFetchUrl`, non-stub): runs on the NODE server (NOT
+    the sandbox → deferred egress floor does NOT cover it). REFUSES non-http(s) schemes +
+    any host that IS or **RESOLVES TO** a private/loopback/link-local/unique-local/metadata
+    address (127/8, 10/8, 172.16/12, 192.168/16, **169.254.0.0/16 incl. 169.254.169.254**,
+    ::1, fc00::/7, fe80::/10) + `localhost`/`metadata.google.internal` by NAME. **Resolves
+    the host first** (injectable `resolveHost` for testability) → defeats DNS-rebinding-to-private;
+    `redirect:'error'` so a redirect can't escape the check. Reuses exported
+    `isPrivateOrInternalIp`/`INTERNAL_HOSTNAMES` from `engine/egress-allowlist.ts` (one source
+    of range coverage, no drift). Blocked URL → refusal string, NO request issued.
+  - **GATED-not-global:** `webTools(opts?)` returns `[web_search, web_fetch]` for an agent to
+    opt into via `tools:[...]`; bound onto the explorer agent + opt-in phases LATER, NOT added
+    to every agent. `hasWebSearchProvider()` helper. **`answer` left as-is** (web-research seam
+    stays a TODO — explore is the first real consumer next slice).
+  - **Tests (+24, +1 skipped live):** web_search (Tavily-primary + Exa/Brave fallback +
+    precedence; query sent + results formatted; no-key graceful; key NOT a param + never in
+    output) + web_fetch SSRF (refuses 169.254.169.254/127/10/192.168/172.16/::1 literals,
+    localhost+metadata by name, file/gopher/ftp schemes, **hostname that RESOLVES to private/
+    metadata** via injected resolver; ALLOWS a public-resolving URL; fetches+cleans HTML;
+    resolver not a model param) + `webTools`/`hasWebSearchProvider`. Gated live Tavily smoke
+    `skipIf(!WEB_TOOLS_LIVE=1)` — SKIPPED by default, NOT run.
+  - **flue build green; discovery UNCHANGED = agents{hello} + workflows{answer,build,gated,
+    issue-comment,issue-triage,pr-fix,pr-review}** — `web.ts` is in `src/tools/` (NOT a
+    discovered dir) → no phantom entry; no real vitest module import in dist (`grep vitest`=1
+    = the inlined guardrails prompt example, not an import).
+  - **NO LIVE WEB CALL by default** — provider HTTP + DNS resolver MOCKED/injected in every
+    default test; `web_fetch`/`web_search` never hit the network under `pnpm test`. No live
+    `flue run`. Next slice = **`explore`** (first consumer of the web tools).
 - **Phase 5 slice 4 DONE ✅ — `answer` workflow ported** (`src/workflows/answer.ts`,
   `run` → `runAnswer(ctx, deps)` DI seam). Single-phase, TOOL-ONLY agent (NO sandbox).
   Mints an **`issues-write`** token (model key `answer`; matches reference answer.yaml).
@@ -292,7 +330,8 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
 - [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
-  slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅ — web-research deferred)
+  slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅; slice 5: web tools
+  [web_search/web_fetch + server-side SSRF guard, gated-not-global] ✅ → next: explore)
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
