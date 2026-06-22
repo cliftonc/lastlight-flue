@@ -14,6 +14,9 @@ reads BUILD-LOOP.md + PROGRESS.md, does ONE slice, runs tests, commits, updates
 PROGRESS.md), then relay its short summary and schedule the next wakeup. Do NOT
 do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
+- **COMMIT DIRECTLY ON `main`.** This is a linear greenfield build — every slice
+  commits to `main`. Do NOT create feature branches (ignore the generic
+  "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
 - **Phase 4 IN PROGRESS** — slice 1 (control flow + gate + run-record) DONE ✅;
