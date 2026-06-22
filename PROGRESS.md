@@ -16,6 +16,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 ## Current position
 - **Phase:** 3 — Vertical slice `pr-review` **✅ LIVE MILESTONE MET**. Phase 2 ✅,
   Phase 1 ✅, Phase 0 ✅.
+- **SUBSTANTIVE REVIEW PROVEN ✅ (2026-06-22):** `flue run pr-review` on
+  `cliftonc/drizzle-cube#937` (non-bot author `cliftonc`, 32 files +2627/-14) →
+  `VERDICT: APPROVED` → **formal `pulls.createReview` APPROVE** (selfAuthored:false
+  → formal-review path, not the COMMENT fallback): review 4540832141
+  (https://github.com/cliftonc/drizzle-cube/pull/937#pullrequestreview-4540832141).
+  The review was genuinely substantive (composite-PK semantics, --out/--check CI
+  guidance, parseFlags nits, test-coverage ideas, typing nits — file-referenced).
+  So BOTH paths are proven: self-PR COMMENT fallback (#941) + formal substantive
+  review (#937). The #941 test comment is LEFT in place (user choice).
+- **Resuming autonomous build (subagent-per-slice):** NEXT = wire the deferred
+  Docker SANDBOX into the reviewer (Phase 3 cleanup), THEN Phase 4 (build workflow
+  + durable approval gate). No further live PR posts unless the user asks.
 
 ### Phase 3 · LIVE ACCEPTANCE ✅ (run by main loop, 2026-06-22)
 - `flue run pr-review` against `cliftonc/drizzle-cube#941` ran END-TO-END: minted
