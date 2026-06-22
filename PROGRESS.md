@@ -19,9 +19,15 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 4 IN PROGRESS** — slices 1-5 DONE ✅ (control flow+gate+run-record;
-  ARCHITECT; EXECUTOR; REVIEWER-LOOP; guardrails+gate-ask+open-PR). **Slice 6
-  (this slice) DONE ✅ — durable gate is now RESUMABLE end-to-end + recovers on boot.**
+- **Phase 5 STARTING** (remaining workflows + crons + chat). Phase 4 ✅ structurally
+  complete (all phases + resume + boot recovery, 384 tests); Phases 0-3 ✅.
+- **⏸ Phase 4 LIVE ACCEPTANCE DEFERRED (user choice 2026-06-22):** the live
+  `flue run build` (writes real code, pushes a branch, opens a real PR, pauses at
+  the gate for human approval) is user-gated and NOT to be run autonomously — run
+  it later WITH THE USER supervising the gate. Until then, treat the build workflow
+  as done-pending-live-proof. Also pending: Phase-6 GitHub-comment resume trigger.
+- **Phase 4 detail (slices 1-6) below; archive has full notes.**
+- **Phase 4 slice 6 DONE ✅ — durable gate RESUMABLE end-to-end + boot recovery.**
 - **This slice (6) built:** the RESUME path wired to real triggers + boot recovery.
   - **Approvals server surface** (`src/admin/approvals.ts` + `createApp` routes) —
     replaced the `/admin/api/approvals` 501 stub. `GET /admin/api/approvals` lists
