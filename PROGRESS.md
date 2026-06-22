@@ -16,14 +16,23 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase 3 (pr-review vertical slice) DONE ✅.** All of Phase 0/1/2/3 complete.
-- **NEXT = Phase 4** — `build` workflow + durable approval gate.
-- **Blockers:** none. No further live PR posts unless the user asks (the #941 test
-  comment is left in place; both review paths are proven — see below).
-- **Phase 3 LIVE milestone met:** both post paths proven on real infra —
-  self-PR COMMENT fallback (`cliftonc/drizzle-cube#941`) + formal substantive
-  APPROVE review (`#937`, non-bot author, 32 files). Docker sandbox now wired into
-  the reviewer (additive, tool-only fallback). Details in PROGRESS-ARCHIVE.md.
+- **Phase 4 IN PROGRESS** — slice 1 (durable control flow + gate + run-record) DONE ✅.
+- **This slice built:** the real build run-record (`src/build-run-store.ts`:
+  phasesDone idempotency keys, pointers-only scratch, pendingGate, reviewerCycle,
+  restartCount w/ ≤3 breaker, status, app runId ≠ Flue runId); `src/workflows/build.ts`
+  as `run()` control-flow skeleton (guardrails→architect→[post_architect GATE]→
+  executor→reviewer-loop(reviewer:N→[post_reviewer GATE]→fix:N→recheck:N, max_cycles=2)
+  →PR) over a `BuildDeps` DI seam (`src/agent-lib/build-phases.ts`); `src/resume.ts`
+  (`resume(runId, approve|reject)` + `recoverOrphanRuns`) re-invoking via the SAME
+  cross-process `flue run` mechanism Spike-3 proved (injectable `reinvoke` seam).
+- **STUBBED / deferred (later Phase-4 slices):** real architect/executor/reviewer/
+  fix/recheck agent sessions + live PR creation are `defaultBuildDeps()` STUBS that
+  throw (TODO(phase-4/agents|channels|github-post|boot)); guardrails BLOCKED-bypass
+  parity; boot-wire of `recoverOrphanRuns`; channels resume entry (invokeWorkflowAttached).
+- **NO LIVE SIDE EFFECTS this slice** — all GitHub/sandbox/model interaction stubbed;
+  no branches/commits/PRs created. The live "open a PR" acceptance is a LATER slice.
+- **Blockers:** none. Q4.1/Q4.2 (re-invoke re-runs run(), app runId stable) already
+  answered by Spike 3 — leaned on, not re-proven live.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello-world agent (openai/*); Docker
@@ -39,7 +48,15 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   deterministic poster (verdict→createReview, self-PR→COMMENT fallback); Docker
   sandbox wired in (additive). LIVE proven (#941 COMMENT, #937 formal APPROVE).
   Suite **273 passed / 5 skipped**. Last commit: Phase 3 slice 2 (Docker sandbox).
-- [ ] **4 — build + durable approval gate** ← **NEXT.**
+- [~] **4 — build + durable approval gate** ← **IN PROGRESS** (slice 1 of N).
+  Slice 1 done: durable control flow + gate + run-record skeleton. Tests: gate
+  pause/resume/reject, post_reviewer mid-loop gate, golden phase-sequence (normal +
+  fix-cycle + resumed-matches-normal), exactly-once idempotency, restart breaker
+  (4th re-invoke → failed), boot orphan recovery, run-store unit. Suite **290 passed
+  / 5 skipped** (+17). `flue build` green; discovery = agents{hello} +
+  workflows{build,gated,pr-review}; `grep -c vitest dist/server.mjs` = 0.
+  **Next slice:** wire the real architect phase (top-level harness session, NOT a
+  subagent) per design order, then executor.
 - [ ] 5 — Remaining workflows + crons + chat
 - [ ] 6 — Channels (replace connectors + router)
 - [ ] 7 — Persistence + re-back admin API
