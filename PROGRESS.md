@@ -14,8 +14,27 @@ do the slice work inline. (Cloud `/schedule` is unsuitable here: the build needs
 local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 
 ## Current position
-- **Phase:** 3 — Vertical slice `pr-review` **🔶 IN PROGRESS** (slice 1 done; live
-  acceptance pending). Phase 2 ✅, Phase 1 ✅, Phase 0 ✅.
+- **Phase:** 3 — Vertical slice `pr-review` **✅ LIVE MILESTONE MET**. Phase 2 ✅,
+  Phase 1 ✅, Phase 0 ✅.
+
+### Phase 3 · LIVE ACCEPTANCE ✅ (run by main loop, 2026-06-22)
+- `flue run pr-review` against `cliftonc/drizzle-cube#941` ran END-TO-END: minted
+  review-write token → reviewer agent activated `pr-review`+`code-review` skills,
+  read the PR (`github_get_pull_request`) → emitted `VERDICT: REQUEST_CHANGES`
+  marker → workflow posted DETERMINISTICALLY via the **bot's-own-PR COMMENT
+  fallback** (`selfAuthored:true → COMMENT`). Posted: issue comment 4764305596
+  (https://github.com/cliftonc/drizzle-cube/pull/941#issuecomment-4764305596),
+  `postKind:"comment"`, by `last-light[bot]`.
+- **Proven:** the full pipeline (token mint → Flue agent + skills + bound read
+  tools → verdict contract → deterministic post + self-PR COMMENT fallback) works
+  on real infra. Two integration bugs were found+fixed getting here (clean Flue
+  discovery `slice 1.5`; build-time agent-context inlining `f333e91`).
+- **NUANCE / not-yet-shown:** because #941 is the bot's OWN PR, the reviewer
+  (correctly, per persona/security rules) DECLINED a substantive self-review and
+  posted a conflict-of-interest note instead — so a substantive CODE review on a
+  human-authored PR is still unproven. Candidate follow-up: run pr-review on a
+  non-bot PR. Also DEFERRED from Phase 3: the Docker SANDBOX in the reviewer
+  (currently tool-only) — wire `docker()` so the reviewer can check out + build.
 
 ### Phase 3 · slice 1.5 — BUILD-BREAK FIX: clean Flue discovery ✅ (UNBLOCKS the live run)
 - **Bug:** `flue run pr-review` crashed at its build step with "Vitest failed to
