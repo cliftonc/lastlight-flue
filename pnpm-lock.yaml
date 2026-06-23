@@ -20,6 +20,9 @@ importers:
       '@flue/runtime':
         specifier: 1.0.0-beta.2
         version: 1.0.0-beta.2(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3)
+      '@flue/slack':
+        specifier: 1.0.0-beta.1
+        version: 1.0.0-beta.1
       '@hono/node-server':
         specifier: ^2.0.5
         version: 2.0.5(hono@4.12.26)
@@ -603,6 +606,10 @@ packages:
 
   '@flue/sdk@1.0.0-beta.1':
     resolution: {integrity: sha512-61VS3lcPey8ZHLGC6lk94yzuNxSHqaROqmgrswnoH2E/1ILR+ZYoLmKYTbQuOi0lulBl/ykh1WlvTQztFg2/nA==}
+
+  '@flue/slack@1.0.0-beta.1':
+    resolution: {integrity: sha512-fpzIEn65i411o4VTrdP35TIh7g3EUUKKBprpBm/o4VR0YJ0xFm2no3vszhM+AgsI5DMXDSBcW5gLZ6WPzojLww==}
+    engines: {node: '>=22.19.0'}
 
   '@google/genai@1.52.0':
     resolution: {integrity: sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q==}
@@ -1249,6 +1256,10 @@ packages:
   '@sindresorhus/is@7.2.0':
     resolution: {integrity: sha512-P1Cz1dWaFfR4IR+U13mqqiGsLFf1KbayybWwdd2vfctdV6hDpUkgCY0nKOLLTMSoRd/jJNjtbqzf13K8DCCXQw==}
     engines: {node: '>=18'}
+
+  '@slack/types@3.0.0-rc.1':
+    resolution: {integrity: sha512-xJZm26o5YK95OdM8BliTE+LijNhMGAwLWWpSpfnrPno4DyLBthNAjC7SG/9Ow2gB7oXCeYadpF/nzlYz7XaATg==}
+    engines: {node: '>= 20', npm: '>=9.6.4'}
 
   '@smithy/core@3.25.1':
     resolution: {integrity: sha512-zpDbpXBCBsxfLtG2GEUyfgvHvSFrw5CwDZSNzL0v52gx/c3oPlPbm+7W7num8xs6vyiUBn+bvYPHcQDOXZynCQ==}
@@ -3309,6 +3320,11 @@ snapshots:
     dependencies:
       '@durable-streams/client': 0.2.6
 
+  '@flue/slack@1.0.0-beta.1':
+    dependencies:
+      '@slack/types': 3.0.0-rc.1
+      hono: 4.12.22
+
   '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.29.0(zod@4.4.3))':
     dependencies:
       google-auth-library: 10.7.0
@@ -3892,6 +3908,8 @@ snapshots:
     optional: true
 
   '@sindresorhus/is@7.2.0': {}
+
+  '@slack/types@3.0.0-rc.1': {}
 
   '@smithy/core@3.25.1':
     dependencies:

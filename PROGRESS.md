@@ -19,9 +19,10 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 6 IN PROGRESS — GitHub channel ✅** (Slack channel = next, STOP-AND-ASK).
-  Phases 0-5 ✅ (Phase 4 LIVE build acceptance DEFERRED). Suite **655 passed / 6 skipped**.
-- **NEXT = Phase 6 Slack channel** — BLOCKED on `SLACK_SIGNING_SECRET` (STOP-AND-ASK).
+- **Phase 6 IN PROGRESS — GitHub ✅ + Slack ✅ (OFFLINE/MOCKED).** Phases 0-5 ✅
+  (Phase 4 LIVE build DEFERRED). Suite **696 passed / 6 skipped**.
+- **NEXT = Phase 6 wrap** (router/maintainer-gate finalize, classifier-LLM + reply
+  posts) or **Phase 7**. Slack LIVE verification DEFERRED (needs SLACK_SIGNING_SECRET).
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -53,6 +54,21 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   pr-fix|pr-comment|security-feedback|issue-comment, reply-gate→explore. DEFERRED(TODO 6/7):
   classifier-LLM wiring, decline-reply post, conversation→runId gate correlation, check_run routes.
   `@flue/github 1.0.0-beta.1` (verified, NO drift — flue-ref §8). +41 tests. Last commit: P6 GitHub channel.
+- **Slack channel ✅ OFFLINE/MOCKED** (LIVE deferred — needs `SLACK_SIGNING_SECRET`):
+  `src/channels/slack.ts` `createSlackChannel({ signingSecret, events, commands })` →
+  discovered `/channels/slack/{events,commands}` (interactions omitted — no Block Kit).
+  NON-discovered helpers: SCREEN (`slack-screener.ts`: bot/self/subtype filter +
+  SLACK_ALLOWED_USERS allowlist[empty=all] + dedupe on Events API `event_id`) → MAP
+  (`slack-mapper.ts`→`LastLightEvent`, stripMention, thread `conversationKey`=durable
+  chat session key) → ROUTE (`slack-router.ts`, code-based: DEFAULT chat→`dispatch(chat,
+  {id:key,input})` / explore|question|security→workflow via invoker / reply-gate→explore).
+  `/approve /reject`→`resume(runId,decision)`. GRACEFUL-MISSING-SECRET: placeholder
+  (`offline-placeholder-no-real-slack-verifies`) → constructs/boots w/o throw; NEVER
+  persist trigger_id/response_url (asserted). DONE: chat-dispatch + workflow routes +
+  command→resume(by-text-runId). TODO(6/7): classifier-LLM wiring (chat fallback now);
+  conversation→runId gate correlation (BuildRunStore has no convKey col; `gateLookup`
+  seam ready). `@flue/slack 1.0.0-beta.1` verified (flue-ref §8; deps @slack/types+hono,
+  NOT @slack/web-api). +41 tests. discovery channels{github,slack}. Last commit: P6 Slack channel.
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
 
@@ -111,10 +127,11 @@ Durable, reusable facts the loop/subagents rely on. Where a fact is also in
   Crons built `{paused:true}`; positive-enable; per-repo failure isolated; overlap-skip.
 
 ### Carried unknowns / blockers / deferred
-- **🚨 Phase-6 Slack BLOCKED — needs `SLACK_SIGNING_SECRET`** (HTTP Events API). NOT in
-  `secrets/.env` (source `~/work/lastlight/.env` only has the Socket-Mode app token) →
-  the **Slack channel is STOP-AND-ASK**. The **GitHub channel is UNBLOCKED**
-  (`WEBHOOK_SECRET` present) — build it first.
+- **⏸ Slack LIVE DEFERRED — needs `SLACK_SIGNING_SECRET`** (HTTP Events API). The Slack
+  channel CODE is built+tested OFFLINE/MOCKED (constructs with a placeholder; server
+  boots + `flue build` passes w/o the secret). NOT in `secrets/.env` (source only has the
+  Socket-Mode app token) → no live signed request verifies until the user adds the real
+  secret. Set `SLACK_SIGNING_SECRET` to activate live ingress, then verify with the user.
 - **⏸ Phase-4 LIVE build acceptance DEFERRED (user-gated):** the live `flue run build`
   (writes real code, pushes a branch, opens a REAL PR, pauses at the gate for human
   approval) is NOT to be run autonomously — run it later WITH THE USER supervising the

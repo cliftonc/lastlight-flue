@@ -22,6 +22,7 @@
     "@flue/cli": "1.0.0-beta.1",
     "@flue/github": "1.0.0-beta.1",
     "@flue/runtime": "1.0.0-beta.2",
+    "@flue/slack": "1.0.0-beta.1",
     "@hono/node-server": "^2.0.5",
     "@octokit/auth-app": "7.2.2",
     "chalk": "^5.6.2",

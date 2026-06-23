@@ -582,6 +582,28 @@ export const channel = createSlackChannel({
   normalized model). `trigger_id`/`response_url` are short-lived — **never**
   persist them into dispatch input, model context, logs, or sessions.
 - `commands` is the surface for Last Light's `/approve` `/reject`.
+- **✅ INSTALLED-VERIFIED `@flue/slack` 1.0.0-beta.1 (2026-06-23, Phase 6):** API
+  matches the design — minor drift only. Verified against `node_modules/@flue/slack/
+  dist/index.d.mts`. `createSlackChannel({ signingSecret, bodyLimit?, events?({c,
+  payload}), interactions?({c, payload}), commands?({c, payload}) })` → `SlackChannel
+  { routes, conversationKey(ref: SlackThreadRef), parseConversationKey(id) }`.
+  `SlackThreadRef = { teamId, channelId, threadTs }`. Events callback `payload` =
+  `SlackEventsApiPayload` (`SlackEventCallbackPayload` with `type:'event_callback'`,
+  `event_id`, `event_time`, `team_id`, `event: SlackEvent` | `app_rate_limited`).
+  Commands `payload` = `SlackSlashCommandPayload` (`command`, `text`, `response_url`,
+  `trigger_id`, `user_id`, `team_id`, `channel_id`, …). Handler return: `undefined`→
+  empty 200, JSON→JSON, Hono/Fetch `Response` passthrough. The channel **verifies
+  signature+timestamp (within 5 min) over exact bytes, answers `url_verification`
+  internally, and does NOT dedupe Events API retries** (app owns it). `createSlackChannel`
+  **THROWS on an empty `signingSecret`** (`assertOption`, module-eval) AND if NO
+  handler is given (`requires an events, interactions, or commands handler`). ⚠ **DRIFT
+  vs design:** deps are **`@slack/types` 3.0.0-rc.1 + `hono`** only — **NOT `@slack/
+  web-api@^8`** (the design's note is stale; web-api is for OUTBOUND posting, not
+  ingress, and isn't needed for the channel). Our env var is **`SLACK_SIGNING_SECRET`**.
+  The discovered `src/channels/slack.ts` exporting `channel` publishes **`/channels/
+  slack/events`** + **`/channels/slack/commands`** (we omit `interactions` — no Block
+  Kit approve/reject). LIVE Slack is INACTIVE until `SLACK_SIGNING_SECRET` is set
+  (offline placeholder keeps construction/boot from throwing; no real request verifies).
 
 **Dispatch/invoke** (`@flue/runtime`): `dispatch(agent, { id, input })` routes
 an event to a persistent agent instance; `invoke(workflow, { input })` starts a
