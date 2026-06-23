@@ -18,6 +18,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 11 DONE ✅ — `pr-comment` ported (kind:comment, single-phase, TOOL-ONLY)
+- **`src/workflows/pr-comment.ts`** (`run`→`runPrComment(ctx,deps)` DI seam): PR-side analogue of issue-comment
+  (Q on a PR → agent reads PR+thread → evidence-cited reply → DETERMINISTIC createComment on bound PR). Distinct
+  b/c PR Qs need the DIFF + 8-read cap: workflow fetches PR+unified DIFF deterministically and seeds the prompt;
+  agent `agent-lib/pr-comment.ts` = `pr-comment` skill, persona, model key `comment`, read tools (incl. diff), NO sandbox.
+- **REUSES (by import, no shared edits)** `issue-comment-post.ts` poster + `isBotSender`/dedup-marker guards (PR
+  accepts issue comments, same endpoint) + `IssueCommentRef`. Profile `issues-write`. Prompt
+  `agent-lib/pr-comment-prompt.ts` UNTRUSTED-wraps title/body/DIFF/comments + triggering Q.
+- **Tests +10** (587→597 passed/6 skipped): run-level (right profile, BOUND ref incl. diff, `comment` model key,
+  bot-loop pre-mint, dedup, token-not-logged) + prompt golden (untrusted diff/Q, prNumber/8-read) + poster reuse smoke.
+  flue build green; **discovery+=pr-comment** (workflows=12); grep -c vitest dist=1. **NO LIVE SIDE EFFECT**, no shared edits. Next=**crons** (FINAL).
+
 ## Phase 5 slice 10 DONE ✅ — `security-feedback` ported (kind:health, single-phase, TOOL-ONLY)
 - **`src/workflows/security-feedback.ts`** (`run`→`runSecurityFeedback(ctx,deps,today)` DI seam): CONSUMER of
   the `Security scan — <date>` issue security-review files. Mints `issues-write`; FETCHES + PARSES the parent
