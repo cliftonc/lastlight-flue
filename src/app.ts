@@ -21,6 +21,7 @@ import {
 } from './admin/approvals.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
+import { startCrons, stopCrons } from './crons.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -28,9 +29,12 @@ import { recoverOrphanExploreRuns } from './resume-explore.ts';
 // server (`dist/server.mjs`); the generated entry validates it has `.fetch`,
 // then calls `serve({ fetch: app.fetch, port: PORT||3000 })` and registers its
 // OWN SIGINT/SIGTERM handlers (see PROGRESS.md "Shutdown/signal finding" and
-// flue-reference §0). So `app.ts` does NOT call `listen()` and CANNOT own the
-// top-level signal traps — graceful shutdown of app-owned resources (crons, db)
-// must hang off a custom Node entry in a later slice (see NEXT in PROGRESS.md).
+// flue-reference §0). So `app.ts` does NOT call `listen()` and is NOT the
+// AUTHORITATIVE signal trap. Graceful shutdown of app-owned resources is
+// FINALIZED (Phase 5) as ADDITIVE `process.on('SIGTERM'|'SIGINT', …)` handlers
+// in this module's scope (they run alongside Flue's generated-entry handler,
+// which owns agent/db shutdown + process.exit) — NOT a forked server entry. The
+// crons.stop() handler is registered at the bottom of this file.
 //
 // Phase-2 slice 1 (foundation): the real composition SHAPE the rest of Phase 2
 // builds on — `createApp()` (app-owned routes, unit-testable WITHOUT flue()),
@@ -400,5 +404,30 @@ function runBootRecovery(): void {
     });
 }
 runBootRecovery();
+
+// ── Cron scheduler start + graceful shutdown (Phase 5 · FINAL slice) ──────────
+// The four scheduled jobs (cron-health/security/triage/review → repo-health/
+// security-review/issue-triage/pr-review, each fanning out over the managed
+// repos) are armed HERE at module-eval, alongside the boot-recovery hook above —
+// run-once, non-blocking (croner schedules its own timers), non-fatal, and
+// SKIPPED under VITEST/LASTLIGHT_SKIP_CRONS (see startCrons). See src/crons.ts.
+startCrons();
+
+// GRACEFUL SHUTDOWN — FINALIZED DECISION (flue-reference §0 + the slice-2/5
+// leaning): an ADDITIVE `process.on('SIGTERM'|'SIGINT', …)` handler that stops
+// the crons. This is NOT a forked server entry. The GENERATED `dist/server.mjs`
+// owns serve()/listen() AND its own SIGINT/SIGTERM handler (agentCoordinator
+// shutdown + persistence close + process.exit) — Node signal handlers are
+// ADDITIVE, so the handler below runs TOO, before Flue's async shutdown finishes,
+// and halts every cron timer so no new tick fires mid-shutdown. It is non-fatal
+// (stopCrons swallows + logs) and does NOT call process.exit (Flue owns exit
+// timing). Suppressed under tests so the in-process Vitest worker isn't trapped.
+if (!process.env.VITEST && process.env.LASTLIGHT_SKIP_CRONS !== '1') {
+  for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(sig, () => {
+      stopCrons();
+    });
+  }
+}
 
 export default app;

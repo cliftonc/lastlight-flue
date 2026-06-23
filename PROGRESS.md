@@ -18,6 +18,23 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 12 DONE ✅ — CRONS + graceful-shutdown FINALIZE → **PHASE 5 COMPLETE**
+- **`src/crons.ts`** (top-level, NOT discovered): `CronRegistry` of the 4 reference crons —
+  cron-health(`0 9 * * 1`→repo-health), cron-security(`0 10 * * 1`→security-review),
+  cron-triage(`*/15`→issue-triage, webhook-gated), cron-review(`*/30`→pr-review, webhook-gated).
+  Each tick FANS OUT over `config.managedRepos` (split owner/repo) → INVOKES per repo via the
+  `resume.ts` mechanism (spawn `flue run <wf> --payload`, INJECTABLE seam). POSITIVE-ENABLE =
+  not in `disabled.crons` AND (webhook-gated ⇒ webhooks off). Crons built `{paused:true}` → no
+  timer until `start()`; per-repo failure isolated; overlap-skip.
+- **VITEST-INERT:** `startCrons()` run-once + skipped under VITEST/LASTLIGHT_SKIP_CRONS → tests/imports
+  NEVER schedule a real timer or spawn `flue run`. Wired at app.ts module scope beside boot-recovery.
+- **SHUTDOWN FINALIZED** (twice-deferred): additive `process.on('SIGTERM'|'SIGINT')→stopCrons()` in
+  app.ts (runs alongside Flue's generated-entry handler; NOT a forked server entry; non-fatal, no exit).
+- **Tests +17** (597→614 passed/6 skipped): defs/schedule, positive-enable+webhook gating, fanout (1
+  invoke/repo, right payload), failure-isolation, no-timer-until-start, VITEST-inert start/stop. croner@9
+  added. flue build green; discovery UNCHANGED (agents{chat,hello}+12 wf, no phantom); grep -c vitest dist=1
+  (no module import). **NO LIVE SIDE EFFECT.** Phase 5 ✅ COMPLETE. Next = **Phase 6 channels**.
+
 ## Phase 5 slice 11 DONE ✅ — `pr-comment` ported (kind:comment, single-phase, TOOL-ONLY)
 - **`src/workflows/pr-comment.ts`** (`run`→`runPrComment(ctx,deps)` DI seam): PR-side analogue of issue-comment
   (Q on a PR → agent reads PR+thread → evidence-cited reply → DETERMINISTIC createComment on bound PR). Distinct
@@ -164,8 +181,9 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   Next slice = **repo-health** (or chat, or crons).
 
 ## Current position
-- **Phase 5 IN PROGRESS** (remaining workflows + crons + chat). Phase 4 ✅ structurally
-  complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **481/6 skipped**.
+- **Phase 5 ✅ COMPLETE** (all 12 workflows + chat + web tools + crons + shutdown). Phase 4 ✅
+  structurally complete (all phases + resume + boot recovery); Phases 0-3 ✅. Suite **614/6 skipped**.
+  NEXT = **Phase 6 channels**.
 - **Phase 5 slice 5 DONE ✅ — web tools built** (`src/tools/web.ts` — FACTORIES returning
   Flue `defineTool`s, GATED, not global). Resolves the design phase-5 §DRIFT (Flue has NO
   built-in web_search/web_fetch).
@@ -474,13 +492,14 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   no `import/require 'vitest'` in dist).
   **Next slice (user-gated, WITH THE USER):** the LIVE `flue run build` acceptance
   end-to-end on a real issue (the mocked push/gate-comment/open-PR seams go live).
-- [~] 5 — Remaining workflows + crons + chat ← **IN PROGRESS** (slice 1: issue-triage ✅;
+- [x] **5 — Remaining workflows + crons + chat** ✅ **COMPLETE** (all 12 workflows + chat agent +
+  web tools + crons + shutdown finalized). (slice 1: issue-triage ✅;
   slice 2: issue-comment ✅; slice 3: pr-fix ✅; slice 4: answer ✅; slice 5: web tools
   [web_search/web_fetch + server-side SSRF guard, gated-not-global] ✅; slice 6: explore
   [Socratic reply-gate loop + web-tools-gated + deterministic publish] ✅; slice 7: repo-health
-  [repo-scoped cron/CLI scan → idempotent tracking-issue delivery] ✅ → next: security-review/
-  security-feedback or chat or crons)
-- [ ] 6 — Channels (replace connectors + router)
+  [repo-scoped cron/CLI scan → idempotent tracking-issue delivery] ✅; slices 8-11: chat agent /
+  security-review / security-feedback / pr-comment ✅; slice 12: crons + shutdown finalize ✅)
+- [ ] 6 — Channels (replace connectors + router) ← **NEXT**
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
 
@@ -539,9 +558,9 @@ Durable, reusable facts the loop/subagents rely on. Where a fact is also in
   allowlist + metadata-CIDR/SSRF floor, via re-hosted CoreDNS/nginx in the Docker
   factory or E2B `allowOut`/`denyOut` (fed by the ported `egress-allowlist.ts`).
   Dev containers currently have full network + no SSRF floor (known, recorded).
-- **Graceful-shutdown finalize** — leaning toward additive
-  `process.on('SIGTERM', () => crons.stop())` (fires alongside Flue's handler), NOT
-  a forked server entry; finalize when crons land (Phase 5).
+- **Graceful-shutdown FINALIZED (Phase 5 ✅)** — additive `process.on('SIGTERM'|'SIGINT',
+  () => stopCrons())` in app.ts module scope (fires alongside Flue's generated-entry handler),
+  NOT a forked server entry. See `src/crons.ts` + app.ts.
 - **`TODO(phase-7)` admin routes:** `stats`/`sessions`/`approvals` still honest 501;
   RunPointer/RunRecord lacks `currentPhase`/`repo`/`issueNumber`/`restartCount`
   (app-run-store joins) → returned as explicit `null`, never fabricated.
