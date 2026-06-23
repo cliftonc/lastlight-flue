@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory, AgentCreateContext, FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
@@ -23,7 +23,11 @@ import {
 import { loadPersona } from "../persona.ts";
 import { renderGuardrailsPrompt } from "../guardrails-prompt.ts";
 import type { BuildRun } from "../../build-run-store.ts";
+import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
+
+// The shared per-run workspace registry is module-level — reset between tests.
+afterEach(() => resetBuildWorkspacesForTests());
 import { UNTRUSTED_OPEN } from "../../engine/untrusted.ts";
 
 // Phase 4 — guardrails agent CONFIG + phase WIRING + the BLOCKED-bypass parity,
@@ -170,6 +174,8 @@ describe("runGuardrailsPhase — wiring over injected deps (no live model / GitH
     expect(res.scratch?.[GUARDRAILS_REPORT_SCRATCH_KEY]).toBe(
       ".lastlight/issue-42/guardrails-report.md",
     );
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
   });
 
@@ -185,6 +191,8 @@ describe("runGuardrailsPhase — wiring over injected deps (no live model / GitH
       throw new Error("model exploded mid-guardrails");
     };
     await expect(runGuardrailsPhase(ctx(), RUN, deps)).rejects.toThrow("mid-guardrails");
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
   });
 });

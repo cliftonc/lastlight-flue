@@ -74,6 +74,7 @@ import {
 import { ThreadsStore } from './threads-store.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
+import { reapStaleBuildContainers } from './agent-lib/build-sandbox.ts';
 import { startCrons, stopCrons } from './crons.ts';
 import { startOtel } from './otel.ts';
 
@@ -875,6 +876,16 @@ function runBootRecovery(): void {
     })
     .catch((err: unknown) => {
       console.error('[boot] explore orphan recovery failed (non-fatal):', err);
+    });
+  // Sweep stale build sandbox containers left by a hard kill (SIGKILL skips the
+  // in-process exit handler). Best-effort + non-fatal; only removes app=lastlight
+  // containers older than the default age threshold.
+  void reapStaleBuildContainers()
+    .then((n) => {
+      if (n) console.log(`[boot] reaped ${n} stale build container(s)`);
+    })
+    .catch((err: unknown) => {
+      console.error('[boot] build-container reap failed (non-fatal):', err);
     });
 }
 runBootRecovery();

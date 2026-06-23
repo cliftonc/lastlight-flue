@@ -6,6 +6,7 @@ import {
   type ArchitectPhaseDeps,
   type BuildInput,
 } from '../build-phases.ts';
+import { resetBuildWorkspacesForTests } from '../build-sandbox.ts';
 import type { BuildContainer, BuildSandboxOps } from '../build-sandbox.ts';
 import type { BuildRun } from '../../build-run-store.ts';
 import {
@@ -45,6 +46,7 @@ function ctx(): FlueContext<BuildInput> {
 
 afterEach(() => {
   setExecutionRecorder(null);
+  resetBuildWorkspacesForTests();
 });
 
 /** A stub build container whose git exec always succeeds (no real Docker). */

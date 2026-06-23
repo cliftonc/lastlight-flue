@@ -68,7 +68,7 @@ import {
   type SecurityPromptContext,
   SECURITY_NO_FINDINGS,
 } from "../agent-lib/security-review-prompt.ts";
-import { withBuildSandbox, type BuildSandboxOps } from "../agent-lib/build-sandbox.ts";
+import { withBuildSandbox, closeBuildWorkspace, type BuildSandboxOps } from "../agent-lib/build-sandbox.ts";
 import {
   fileSecurityScanIssue,
   type FiledSecurityScan,
@@ -194,27 +194,35 @@ async function runSecuritySession(
   sandboxOps?: BuildSandboxOps,
 ): Promise<string> {
   const branch = meta.defaultBranch ?? "main";
-  return withBuildSandbox(
-    { owner: ref.owner, repo: ref.repo, branch },
-    token,
-    async (sandbox) => {
-      const agent = createSecurityAgent(ref, octokit, sandbox);
-      const harness = await ctx.init(agent);
-      const session = await harness.session("security-review");
-      const promptCtx: SecurityPromptContext = {
-        owner: ref.owner,
-        repo: ref.repo,
-        defaultBranch: meta.defaultBranch,
-        description: meta.description,
-        topics: meta.topics,
-        triggerType: ctx.payload.triggerType,
-        scanDate,
-      };
-      const res = await session.prompt(renderSecurityPrompt(promptCtx));
-      return res.text;
-    },
-    { ops: sandboxOps, log: ctx.log },
-  );
+  // security-review is SINGLE-phase (one scan, no commit/push), so it does not
+  // share its workspace across phases — it creates one container and tears it
+  // down right after the scan via `closeBuildWorkspace` in the finally.
+  const taskId = `security:${ref.owner}/${ref.repo}:${scanDate}`;
+  try {
+    return await withBuildSandbox(
+      { owner: ref.owner, repo: ref.repo, branch, taskId },
+      token,
+      async (sandbox) => {
+        const agent = createSecurityAgent(ref, octokit, sandbox);
+        const harness = await ctx.init(agent);
+        const session = await harness.session("security-review");
+        const promptCtx: SecurityPromptContext = {
+          owner: ref.owner,
+          repo: ref.repo,
+          defaultBranch: meta.defaultBranch,
+          description: meta.description,
+          topics: meta.topics,
+          triggerType: ctx.payload.triggerType,
+          scanDate,
+        };
+        const res = await session.prompt(renderSecurityPrompt(promptCtx));
+        return res.text;
+      },
+      { ops: sandboxOps, log: ctx.log },
+    );
+  } finally {
+    await closeBuildWorkspace(taskId, ctx.log);
+  }
 }
 
 /** Default production dependencies. */

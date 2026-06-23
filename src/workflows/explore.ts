@@ -46,6 +46,7 @@ import {
   type ExploreDeps,
   defaultExploreDeps,
 } from "../agent-lib/explore-phases.ts";
+import { closeBuildWorkspace } from "../agent-lib/build-sandbox.ts";
 
 export type { ExploreInput, ExploreResult } from "../agent-lib/explore-phases.ts";
 
@@ -219,6 +220,9 @@ export async function run(ctx: FlueContext<ExploreInput>): Promise<ExploreResult
     return await runExplore(ctx, store);
   } finally {
     store.close();
+    // Tear down the shared per-run workspace (keyed by the explore run id, the
+    // same key the phases pass as taskId to withBuildSandbox). Best-effort.
+    await closeBuildWorkspace(ctx.payload.runId, ctx.log);
   }
 }
 

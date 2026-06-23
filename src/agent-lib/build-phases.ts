@@ -321,7 +321,7 @@ export async function runGuardrailsPhase(
   });
 
   const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
     token,
     (sandbox) => deps.runGuardrailsSession(ctx, ref, octokit, sandbox, prompt),
     { ops: deps.sandboxOps, log: ctx.log },
@@ -443,7 +443,7 @@ export async function runArchitectPhase(
   });
 
   const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
     token,
     (sandbox) => deps.runArchitectSession(ctx, ref, octokit, sandbox, prompt),
     { ops: deps.sandboxOps, log: ctx.log },
@@ -596,7 +596,7 @@ export async function runExecutorPhase(
   });
 
   return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
     token,
     async (sandbox, container) => {
       const text = await deps.runExecutorSession(ctx, ref, octokit, sandbox, prompt);
@@ -724,7 +724,7 @@ export async function runReviewerPhase(
   const sessionName = `${isRecheck ? 'recheck' : 'reviewer'}:${cycle}`;
 
   const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
     token,
     (sandbox) =>
       deps.runReviewerSession(ctx, ref, octokit, sandbox, prompt, sessionName),
@@ -842,7 +842,7 @@ export async function runFixPhase(
   const sessionName = `fix:${cycle}`;
 
   return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
     token,
     async (sandbox, container) => {
       const text = await deps.runFixSession(ctx, ref, octokit, sandbox, prompt, sessionName);

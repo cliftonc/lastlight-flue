@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory, AgentCreateContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import type { FlueContext } from "@flue/runtime";
@@ -30,7 +30,10 @@ import {
 } from "../../config.ts";
 import { loadPersona } from "../persona.ts";
 import type { BuildRun } from "../../build-run-store.ts";
+import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
+
+afterEach(() => resetBuildWorkspacesForTests());
 
 // Phase 4 — reviewer-loop (reviewer / fix / recheck) agent CONFIG + phase WIRING,
 // all offline (no live model / GitHub / Docker / push). Config is asserted by
@@ -226,6 +229,8 @@ describe("runReviewerPhase — wiring (reviewer:N + recheck:N) over injected dep
     await expect(runReviewerPhase(ctx(), RUN, 0, false, deps)).rejects.toThrow(
       "model exploded mid-review",
     );
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
   });
 });
@@ -286,6 +291,8 @@ describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no rea
       throw new Error("model exploded mid-fix");
     };
     await expect(runFixPhase(ctx(), RUN, 0, deps)).rejects.toThrow("model exploded mid-fix");
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
     expect(calls.pushed).toEqual([]); // a failed fix never pushes
   });

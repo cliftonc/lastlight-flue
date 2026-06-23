@@ -43,6 +43,7 @@ import {
   bootstrapBypass,
 } from '../agent-lib/build-phases.ts';
 import { architectPlanPath } from '../agent-lib/architect-prompt.ts';
+import { closeBuildWorkspace } from '../agent-lib/build-sandbox.ts';
 
 export type { BuildInput, BuildResult } from '../agent-lib/build-phases.ts';
 
@@ -232,9 +233,13 @@ export async function runBuild(
 /** Flue workflow entry — discovered as the `build` workflow. */
 export async function run(ctx: FlueContext<BuildInput>): Promise<BuildResult> {
   const store = new BuildRunStore(storePath());
+  const { taskId } = seedFrom(ctx.payload);
   try {
     return await runBuild(ctx, store);
   } finally {
     store.close();
+    // Tear down the shared per-run workspace container (created lazily by the
+    // first phase; one per taskId, reused across phases). Best-effort.
+    await closeBuildWorkspace(taskId, ctx.log);
   }
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory, AgentCreateContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import type { FlueContext } from "@flue/runtime";
@@ -15,8 +15,11 @@ import {
 import { resolveModel, resolveThinking, setRuntimeConfig, resetRuntimeConfigForTests } from "../../config.ts";
 import { loadPersona } from "../persona.ts";
 import type { BuildRun } from "../../build-run-store.ts";
+import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
 import { UNTRUSTED_OPEN } from "../../engine/untrusted.ts";
+
+afterEach(() => resetBuildWorkspacesForTests());
 
 // Phase 4 — architect agent CONFIG + phase WIRING, all offline (no live model /
 // GitHub / Docker). The agent's config is asserted by invoking its `initialize`
@@ -144,6 +147,8 @@ describe("runArchitectPhase — wiring over injected deps (no live model / GitHu
     expect(calls.refSeen).toEqual(REF);
     // The container was created (pre-clone) and torn down in finally.
     expect((deps.sandboxOps.createContainer as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
   });
 
@@ -169,6 +174,8 @@ describe("runArchitectPhase — wiring over injected deps (no live model / GitHu
     await expect(runArchitectPhase(ctx(), RUN, deps)).rejects.toThrow(
       "model exploded mid-architect",
     );
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
   });
 

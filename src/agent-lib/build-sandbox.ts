@@ -1,29 +1,38 @@
 /**
- * Build sandbox lifecycle — the CALLER-owned container around a build phase.
+ * Build sandbox lifecycle — ONE shared workspace per run, reused across phases.
  *
- * Mirrors `reviewer-sandbox.ts` (the Spike-2 caller-owns-lifetime contract:
- * spec/flue-reference §0, docs/api/sandbox-api.md). The sandbox ADAPTER
- * (`docker()`) is a pure mapper and must NOT manage container lifetime; THIS
- * module is the caller: it `DockerContainer.create()`s a node+git image with the
- * scoped repo-write token baked as env, PRE-CLONES the repo into `/workspace`,
- * checks out (creating if absent) the build working branch, hands a
- * `docker(container)` factory to a `body` callback, and ALWAYS `remove()`s the
- * container in a `finally` — even on error.
+ * Mirrors the original Last Light model (spec/06-workflow-engine.md: "`taskId`
+ * scopes one persistent sandbox workspace across phases" — the executor reads the
+ * architect's plan "from the same checkout"). A build is several phases
+ * (guardrails → architect → executor → reviewer loop), and they MUST operate on
+ * the SAME checkout: each phase commits onto the working branch and the next
+ * builds on top. So the container + clone is created ONCE per `taskId` (a tiny
+ * in-process registry) and REUSED by every phase; it is torn down by
+ * `closeBuildWorkspace(taskId)` at the end of the run (build.ts / explore.ts
+ * `run()` finally), NOT per phase.
  *
- * DIFFERENCE FROM the reviewer sandbox: the architect (and later executor/fix)
- * REQUIRES the workspace — it writes + commits `architect-plan.md` there. So
- * there is NO tool-only fallback: a provisioning/clone failure THROWS (the build
- * phase genuinely can't proceed), unlike the reviewer where the sandbox is
- * additive. The build branch may not exist yet → we clone the default branch and
- * `checkout -B <branch>` so a fresh build starts from a clean working branch.
+ * WHY (regression fixed): the prior version called `withBuildSandbox` per phase,
+ * each time spinning a fresh container + `git clone` + `git checkout -B <branch>`
+ * from the DEFAULT branch — discarding the prior phase's commit (which lives only
+ * on the remote branch) and leaking one unnamed container per phase. That caused
+ * non-fast-forward push failures in the executor and a pile of orphaned
+ * containers. Now: one container per run, and the clone CONTINUES the existing
+ * remote branch if present.
  *
  * The repo-write token is baked at `docker run` (never on a logged command line),
  * the clone URL embeds it for HTTPS auth, and we NEVER log the token or the
  * tokenized URL (we redact it out of any stderr before throwing/logging).
  *
+ * CONTAINER HYGIENE: every container is named `lastlight-build-<taskId>-<t>` and
+ * labelled `app=lastlight`, so leaks are identifiable. A process exit/signal
+ * handler force-removes tracked containers on a clean shutdown, and
+ * `reapStaleBuildContainers()` (called at server boot) sweeps stragglers left by
+ * a hard kill (SIGKILL skips the handler).
+ *
  * ⚠ EGRESS DEFERRED: the container has full network + no SSRF floor — the clone
  * reaches github.com over the open network. Do NOT run untrusted input through it.
  */
+import { spawn, spawnSync } from "node:child_process";
 import { DockerContainer, docker } from "../sandboxes/docker.ts";
 import type { SandboxFactory } from "@flue/runtime";
 
@@ -33,12 +42,17 @@ export const BUILD_IMAGE = "node:22-bookworm";
 /** The directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
 export const BUILD_WORKSPACE = "/workspace";
 
-/** Identify the repo + working branch to pre-clone + check out. */
+/** Docker label applied to every build container (for cleanup/identification). */
+export const BUILD_CONTAINER_LABEL = "app=lastlight";
+
+/** Identify the repo + working branch + the run this workspace belongs to. */
 export interface BuildCloneSpec {
   owner: string;
   repo: string;
-  /** The build working branch to checkout -B (created from the default branch). */
+  /** The build working branch — continued from its remote tip if it exists. */
   branch: string;
+  /** The run key the workspace is scoped to (one shared container per taskId). */
+  taskId: string;
 }
 
 /** Minimal container surface this module depends on (lets tests inject a fake). */
@@ -51,6 +65,8 @@ export interface BuildContainer {
   remove(): Promise<void>;
   /** A Flue SandboxFactory adapting this container (pure mapper). */
   sandbox(): SandboxFactory;
+  /** Docker container id, when known — used for synchronous exit-time cleanup. */
+  id?: string;
 }
 
 /** Container-provisioning ops, injected so tests mock Docker entirely. */
@@ -58,6 +74,8 @@ export interface BuildSandboxOps {
   createContainer(opts: {
     image: string;
     env: Record<string, string>;
+    name?: string;
+    labels?: Record<string, string>;
   }): Promise<BuildContainer>;
 }
 
@@ -65,8 +83,14 @@ export interface BuildSandboxOps {
 export function defaultBuildSandboxOps(): BuildSandboxOps {
   return {
     async createContainer(opts) {
-      const container = await DockerContainer.create({ image: opts.image, env: opts.env });
+      const container = await DockerContainer.create({
+        image: opts.image,
+        env: opts.env,
+        name: opts.name,
+        labels: opts.labels,
+      });
       return {
+        id: container.id,
         exec: (command, options) => execInContainer(container, command, options),
         remove: () => container.remove(),
         sandbox: () => docker(container),
@@ -85,13 +109,25 @@ async function execInContainer(
   return env.exec(command, options);
 }
 
+// ── Per-run workspace registry (one shared container per taskId) ───────────────
+
+/** Live workspaces in THIS process, keyed by taskId. */
+const workspaces = new Map<string, BuildContainer>();
+
+/** Sanitize a taskId into a docker-name-safe segment. */
+function sanitizeName(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_.-]+/g, "-").slice(0, 100) || "run";
+}
+
 /**
- * Create a container, bake the token, pre-clone the repo into `/workspace`, check
- * out (creating if absent) the build working branch, and invoke `body(sandbox)`.
- * The container is ALWAYS removed in a `finally`. Provisioning/clone failure
- * THROWS (the build phase needs the workspace; there is NO tool-only fallback) —
- * the error message is token-redacted. `body`'s own throws propagate (real phase
- * failures), but the container is still torn down.
+ * Get-or-create the shared workspace container for `spec.taskId`, then run
+ * `body(sandbox, container)` over it. The FIRST call for a taskId creates the
+ * container + clones (continuing the existing remote branch); later calls REUSE
+ * it (no new container, no re-clone), so every phase shares one checkout. The
+ * container is NOT removed here — `closeBuildWorkspace(taskId)` owns teardown at
+ * run end. A provisioning/clone failure THROWS (no tool-only fallback; the build
+ * needs the workspace) — token-redacted — and the half-created container is
+ * removed so a failed open never leaks.
  */
 export async function withBuildSandbox<T>(
   spec: BuildCloneSpec,
@@ -103,36 +139,61 @@ export async function withBuildSandbox<T>(
   } = {},
 ): Promise<T> {
   const ops = deps.ops ?? defaultBuildSandboxOps();
-  let container: BuildContainer | undefined;
 
-  try {
-    container = await ops.createContainer({
+  let container = workspaces.get(spec.taskId);
+  if (!container) {
+    const created = await ops.createContainer({
       image: BUILD_IMAGE,
       // Bake the token as env so in-container `git push`/`gh` can use it too.
       env: { GIT_TOKEN: token },
+      name: `lastlight-build-${sanitizeName(spec.taskId)}-${Date.now().toString(36)}`,
+      labels: { app: "lastlight", taskId: spec.taskId },
     });
-    await preCloneRepo(container, spec, token);
-    const sandbox = container.sandbox();
-    // The container is handed to the body too (after the agent session) so the
-    // workflow can run deterministic git steps — e.g. the executor's branch PUSH —
-    // over the same checkout via the sandbox git CLI (not a model tool).
-    return await body(sandbox, container);
-  } finally {
-    if (container) await safeRemove(container, deps.log);
+    try {
+      await preCloneRepo(created, spec, token);
+    } catch (err) {
+      // A failed open must not leak the container or register a broken workspace.
+      await safeRemove(created, deps.log);
+      throw err;
+    }
+    container = created;
+    workspaces.set(spec.taskId, container);
+    ensureExitCleanup();
   }
+
+  const sandbox = container.sandbox();
+  // The container is handed to the body too (after the agent session) so the
+  // workflow can run deterministic git steps — e.g. the executor's branch PUSH —
+  // over the same checkout via the sandbox git CLI (not a model tool).
+  return body(sandbox, container);
 }
 
 /**
- * The pr-fix variant of `withBuildSandbox`: pre-clone the repo and check out an
- * EXISTING PR head branch (NOT `checkout -B`, which would create a new branch).
- * The fix must land on — and push back to — the PR's own head branch, so we clone
- * that branch directly (`git clone --branch <headRef>`). Caller-owns-lifetime
- * (container created here, ALWAYS `remove()`d in a `finally`), the container is
- * handed to the body so the workflow can run the deterministic in-sandbox push over
- * the same checkout. Like `withBuildSandbox`, there is NO tool-only fallback — the
- * fix genuinely needs the workspace, so a provisioning/clone failure THROWS
- * (token-redacted). The `headRef` is workflow-resolved (`pulls.get().head.ref`),
- * never model-chosen.
+ * Tear down the shared workspace container for `taskId`. Idempotent +
+ * best-effort: a teardown error is swallowed (logged) so it never masks a real
+ * phase result. Call this in the workflow's `run()` finally.
+ */
+export async function closeBuildWorkspace(
+  taskId: string,
+  log?: { warn(msg: string, meta?: unknown): void },
+): Promise<void> {
+  const container = workspaces.get(taskId);
+  if (!container) return;
+  workspaces.delete(taskId);
+  await safeRemove(container, log);
+}
+
+/** Drop all registered workspaces WITHOUT touching Docker — test isolation only. */
+export function resetBuildWorkspacesForTests(): void {
+  workspaces.clear();
+}
+
+/**
+ * The pr-fix variant: pre-clone the repo and check out an EXISTING PR head branch
+ * (NOT `checkout -B`). pr-fix is a SINGLE-phase workflow, so it does NOT share a
+ * workspace — it keeps the simple caller-owns-lifetime contract: create here,
+ * ALWAYS `remove()` in a `finally`. The `headRef` is workflow-resolved
+ * (`pulls.get().head.ref`), never model-chosen.
  *
  * ⚠ EGRESS DEFERRED: the container has full network + no SSRF floor — do not run
  * untrusted input through it.
@@ -153,6 +214,8 @@ export async function withPrFixSandbox<T>(
     container = await ops.createContainer({
       image: BUILD_IMAGE,
       env: { GIT_TOKEN: token },
+      name: `lastlight-prfix-${sanitizeName(spec.headRef)}-${Date.now().toString(36)}`,
+      labels: { app: "lastlight" },
     });
     await preCloneHeadBranch(container, spec, token);
     const sandbox = container.sandbox();
@@ -184,7 +247,12 @@ async function preCloneHeadBranch(
   }
 }
 
-/** Clone the repo into `/workspace` and checkout -B the working branch. */
+/**
+ * Clone the repo into `/workspace` and check out the build working branch,
+ * CONTINUING it from its remote tip if it already exists (so a later phase /
+ * resume builds on the prior phase's commit instead of resetting to the default
+ * branch). A brand-new branch is created from the default branch with `-B`.
+ */
 async function preCloneRepo(
   container: BuildContainer,
   spec: BuildCloneSpec,
@@ -202,11 +270,22 @@ async function preCloneRepo(
   if (clone.exitCode !== 0) {
     throw new Error(`git clone failed (${clone.exitCode}): ${redact(clone.stderr.trim(), token)}`);
   }
-  // Check out (or create) the build working branch from the default branch.
-  const checkout = await container.exec(
-    `git checkout -B ${shellArg(spec.branch)}`,
+  // Continue the working branch from its remote tip if it exists; otherwise create
+  // it fresh from the default branch. `git clone` already fetched all remote heads,
+  // so `refs/remotes/origin/<branch>` is present iff the remote branch exists.
+  const remoteRef = `refs/remotes/origin/${spec.branch}`;
+  const exists = await container.exec(
+    `git rev-parse --verify --quiet ${shellArg(remoteRef)}`,
     { cwd: BUILD_WORKSPACE, timeoutMs: 60_000 },
   );
+  const checkoutCmd =
+    exists.exitCode === 0
+      ? `git checkout -B ${shellArg(spec.branch)} ${shellArg(`origin/${spec.branch}`)}`
+      : `git checkout -B ${shellArg(spec.branch)}`;
+  const checkout = await container.exec(checkoutCmd, {
+    cwd: BUILD_WORKSPACE,
+    timeoutMs: 60_000,
+  });
   if (checkout.exitCode !== 0) {
     throw new Error(
       `git checkout -B ${spec.branch} failed (${checkout.exitCode}): ${redact(checkout.stderr.trim(), token)}`,
@@ -235,4 +314,94 @@ async function safeRemove(
   } catch (err) {
     log?.warn("build: container teardown failed", { reason: String(err) });
   }
+}
+
+// ── Container hygiene: exit-time cleanup + stale reaper ────────────────────────
+
+let exitCleanupArmed = false;
+
+/**
+ * Arm a process `'exit'` handler (once) that SYNCHRONOUSLY force-removes any
+ * still-registered containers — the last-resort net for a workspace that wasn't
+ * closed via `closeBuildWorkspace` (a crash/interrupt before `run()`'s finally).
+ *
+ * Only `'exit'` is hooked — deliberately NOT SIGINT/SIGTERM: this app's signal
+ * handling is owned by Flue's generated entry, and app.ts's own handlers are
+ * ADDITIVE and never call `process.exit` (Flue owns exit ordering — see app.ts).
+ * A signal-driven shutdown still ends with `process.exit`, which fires `'exit'`,
+ * so this net runs then too — without us racing Flue's agent/db teardown. SIGKILL
+ * can't be caught at all; those leaks are swept by `reapStaleBuildContainers` at
+ * the next boot. Skipped under VITEST so the runner's lifecycle is untouched.
+ */
+function ensureExitCleanup(): void {
+  if (exitCleanupArmed || process.env.VITEST) return;
+  exitCleanupArmed = true;
+
+  process.once("exit", () => {
+    const ids = [...workspaces.values()]
+      .map((c) => c.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    workspaces.clear();
+    if (ids.length === 0) return;
+    try {
+      spawnSync("docker", ["rm", "-f", ...ids], { stdio: "ignore", timeout: 30_000 });
+    } catch {
+      /* best-effort — nothing useful to do during shutdown */
+    }
+  });
+}
+
+/** Run the host `docker` CLI, resolving stdout/exit code. Best-effort (never rejects). */
+function dockerCli(args: string[], timeoutMs = 30_000): Promise<{ stdout: string; exitCode: number }> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn("docker", args, { stdio: ["ignore", "pipe", "ignore"] });
+      const out: Buffer[] = [];
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.stdout.on("data", (d: Buffer) => out.push(d));
+      child.on("error", () => {
+        clearTimeout(timer);
+        resolve({ stdout: "", exitCode: 1 });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ stdout: Buffer.concat(out).toString("utf8"), exitCode: code ?? 1 });
+      });
+    } catch {
+      resolve({ stdout: "", exitCode: 1 });
+    }
+  });
+}
+
+/**
+ * Sweep stale `app=lastlight` build containers older than `maxAgeMs` (default 2h).
+ * Catches leaks from a hard kill (SIGKILL) that skipped the exit handler. Fully
+ * best-effort + non-fatal: any docker error is swallowed. Run at server boot.
+ */
+export async function reapStaleBuildContainers(maxAgeMs = 2 * 60 * 60_000): Promise<number> {
+  let reaped = 0;
+  try {
+    const list = await dockerCli([
+      "ps",
+      "-aq",
+      "--filter",
+      `label=${BUILD_CONTAINER_LABEL}`,
+    ]);
+    if (list.exitCode !== 0) return 0;
+    const ids = list.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+    const now = Date.now();
+    for (const id of ids) {
+      const insp = await dockerCli(["inspect", "-f", "{{.State.StartedAt}}", id]);
+      const startedAt = Date.parse(insp.stdout.trim());
+      // If we can't read the age, treat it as stale (a leak worth removing).
+      const age = Number.isNaN(startedAt) ? Infinity : now - startedAt;
+      if (age > maxAgeMs) {
+        const rm = await dockerCli(["rm", "-f", id]);
+        if (rm.exitCode === 0) reaped += 1;
+      }
+    }
+  } catch {
+    /* best-effort — never throw at boot */
+  }
+  return reaped;
 }

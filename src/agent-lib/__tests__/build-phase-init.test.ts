@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory, FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
@@ -10,7 +10,10 @@ import {
 } from "../build-phases.ts";
 import { setRuntimeConfig, resetRuntimeConfigForTests } from "../../config.ts";
 import type { BuildRun } from "../../build-run-store.ts";
+import { resetBuildWorkspacesForTests } from "../build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
+
+afterEach(() => resetBuildWorkspacesForTests());
 
 // Regression for the multi-phase `ctx.init()` collision.
 //

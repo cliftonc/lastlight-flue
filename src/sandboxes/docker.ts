@@ -113,6 +113,8 @@ export interface DockerContainerOptions {
   env?: Record<string, string>;
   /** Optional explicit container name. */
   name?: string;
+  /** Docker labels (`--label k=v`) — used to identify + reap app-owned containers. */
+  labels?: Record<string, string>;
 }
 
 /**
@@ -129,6 +131,7 @@ export class DockerContainer {
     const image = opts.image ?? DEFAULT_IMAGE;
     const args = ['run', '-d', '--workdir', WORKSPACE];
     if (opts.name) args.push('--name', opts.name);
+    for (const [k, val] of Object.entries(opts.labels ?? {})) args.push('--label', `${k}=${val}`);
     if (opts.workspaceHostDir) args.push('-v', `${opts.workspaceHostDir}:${WORKSPACE}`);
     for (const [k, val] of Object.entries(opts.env ?? {})) args.push('-e', `${k}=${val}`);
     // Keep the container alive; the agent/workflow drives work via `docker exec`.

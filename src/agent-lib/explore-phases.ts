@@ -177,7 +177,7 @@ async function runResearchPhase(
   const taskKey = phaseKind === "synthesize" ? SYNTHESIZE_TASK_KEY : EXPLORE_TASK_KEY;
 
   return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: exploreBranch(run) },
+    { owner: run.owner, repo: run.repo, branch: exploreBranch(run), taskId: run.id },
     token,
     async (sandbox) => {
       const agent = createExploreAgent(ref, octokit, { taskKey, sandbox, withWebTools: true });

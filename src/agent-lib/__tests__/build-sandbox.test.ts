@@ -1,33 +1,45 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory } from "@flue/runtime";
 import {
   withBuildSandbox,
   withPrFixSandbox,
+  closeBuildWorkspace,
+  resetBuildWorkspacesForTests,
   BUILD_IMAGE,
   type BuildContainer,
   type BuildSandboxOps,
 } from "../build-sandbox.ts";
 
-// Phase 4 — the build sandbox lifecycle: caller-owned container, pre-clone +
-// checkout of the working branch, ALWAYS torn down, token never logged, and (unlike
-// the additive reviewer sandbox) NO tool-only fallback — a clone failure THROWS.
+// Phase 4 — the build sandbox lifecycle. The workspace is now SHARED per run
+// (keyed by taskId): one container + checkout, REUSED across phases, torn down by
+// closeBuildWorkspace at run end (NOT per phase). The clone continues the existing
+// remote branch if present. Token is never logged; a failed open never leaks.
 
 const SANDBOX = { __fake: true } as unknown as SandboxFactory;
-const SPEC = { owner: "octocat", repo: "widget", branch: "lastlight/42" };
+const SPEC = { owner: "octocat", repo: "widget", branch: "lastlight/42", taskId: "widget-42-build" };
 const TOKEN = "ghs_build_test_token";
 
+// Each test starts from a clean registry (the registry is module-level state).
+afterEach(() => resetBuildWorkspacesForTests());
+
 function makeContainer(
-  opts: { cloneExitCode?: number; checkoutExitCode?: number; stderr?: string } = {},
+  opts: {
+    cloneExitCode?: number;
+    /** Exit code of `git rev-parse` for the remote branch. 0 = branch exists. */
+    revParseExitCode?: number;
+    checkoutExitCode?: number;
+    stderr?: string;
+  } = {},
 ) {
   const execCalls: string[] = [];
   let removed = 0;
   const container: BuildContainer = {
     async exec(command) {
       execCalls.push(command);
-      const isClone = command.includes("git clone");
-      const exitCode = isClone
-        ? opts.cloneExitCode ?? 0
-        : opts.checkoutExitCode ?? 0;
+      let exitCode = 0;
+      if (command.includes("git clone")) exitCode = opts.cloneExitCode ?? 0;
+      else if (command.includes("git rev-parse")) exitCode = opts.revParseExitCode ?? 1; // default: no remote branch
+      else if (command.includes("git checkout")) exitCode = opts.checkoutExitCode ?? 0;
       return { stdout: "", stderr: opts.stderr ?? "", exitCode };
     },
     async remove() {
@@ -38,8 +50,8 @@ function makeContainer(
   return { container, execCalls, removed: () => removed };
 }
 
-describe("withBuildSandbox — caller-owned lifetime + pre-clone", () => {
-  it("creates the container w/ baked token, clones, checks out -B the branch, yields the sandbox, removes in finally", async () => {
+describe("withBuildSandbox — shared per-run workspace (created once, reused, closed at run end)", () => {
+  it("creates the container (named + labelled, baked token), clones, checks out -B the branch, yields the sandbox, and REGISTERS it (no per-call removal)", async () => {
     const c = makeContainer();
     const createContainer = vi.fn(async () => c.container);
     const ops: BuildSandboxOps = { createContainer };
@@ -57,41 +69,77 @@ describe("withBuildSandbox — caller-owned lifetime + pre-clone", () => {
 
     expect(result).toBe("plan-text");
     expect(seen).toBe(SANDBOX);
-    // Token baked as env, never on a logged command line.
-    expect(createContainer).toHaveBeenCalledWith({
-      image: BUILD_IMAGE,
-      env: { GIT_TOKEN: TOKEN },
-    });
+    // Token baked as env (never on a logged command line); named + labelled for cleanup.
+    expect(createContainer).toHaveBeenCalledWith(
+      expect.objectContaining({
+        image: BUILD_IMAGE,
+        env: { GIT_TOKEN: TOKEN },
+        name: expect.stringContaining("lastlight-build-"),
+        labels: { app: "lastlight", taskId: SPEC.taskId },
+      }),
+    );
     const clone = c.execCalls.find((x) => x.includes("git clone"))!;
     expect(clone).toContain("/workspace");
+    // No remote branch (rev-parse fails by default) → fresh -B from default.
     const checkout = c.execCalls.find((x) => x.includes("git checkout -B"))!;
     expect(checkout).toContain("'lastlight/42'");
+    expect(checkout).not.toContain("origin/lastlight/42");
+    // NOT removed per call — the run owns teardown.
+    expect(c.removed()).toBe(0);
+
+    // closeBuildWorkspace tears it down.
+    await closeBuildWorkspace(SPEC.taskId);
     expect(c.removed()).toBe(1);
   });
 
-  it("clone failure THROWS (no tool-only fallback) — token-redacted — container still removed", async () => {
+  it("REUSES the container for the same taskId — no 2nd create, no 2nd clone", async () => {
+    const c = makeContainer();
+    const createContainer = vi.fn(async () => c.container);
+    const ops: BuildSandboxOps = { createContainer };
+
+    await withBuildSandbox(SPEC, TOKEN, async () => "a", { ops });
+    await withBuildSandbox(SPEC, TOKEN, async () => "b", { ops });
+
+    expect(createContainer).toHaveBeenCalledTimes(1);
+    expect(c.execCalls.filter((x) => x.includes("git clone")).length).toBe(1);
+  });
+
+  it("CONTINUES an existing remote branch (checkout -B <branch> origin/<branch>)", async () => {
+    const c = makeContainer({ revParseExitCode: 0 }); // remote branch exists
+    const ops: BuildSandboxOps = { createContainer: vi.fn(async () => c.container) };
+
+    await withBuildSandbox(SPEC, TOKEN, async () => "x", { ops });
+
+    const checkout = c.execCalls.find((x) => x.includes("git checkout -B"))!;
+    expect(checkout).toContain("'lastlight/42'");
+    expect(checkout).toContain("'origin/lastlight/42'");
+  });
+
+  it("clone failure THROWS (token-redacted), removes the half-created container, and does NOT register", async () => {
     const c = makeContainer({
       cloneExitCode: 128,
       stderr: `auth https://x-access-token:${TOKEN}@github.com failed`,
     });
-    const ops: BuildSandboxOps = { createContainer: vi.fn(async () => c.container) };
+    const createContainer = vi.fn(async () => c.container);
+    const ops: BuildSandboxOps = { createContainer };
 
     await expect(
       withBuildSandbox(SPEC, TOKEN, async () => "unreached", { ops }),
     ).rejects.toThrow(/git clone failed/);
-    // The error message must NOT leak the token.
+    // The failed container is removed, and nothing is registered.
+    expect(c.removed()).toBe(1);
+    await closeBuildWorkspace(SPEC.taskId);
+    expect(c.removed()).toBe(1); // no-op — nothing was registered
+
+    // Token never leaked in the error message.
     await withBuildSandbox(SPEC, TOKEN, async () => "x", { ops }).catch((err) => {
       expect(String(err)).not.toContain(TOKEN);
       expect(String(err)).toContain("<redacted-token>");
     });
-    expect(c.removed()).toBeGreaterThanOrEqual(1);
   });
 
-  it("checkout failure THROWS (token-redacted)", async () => {
-    const c = makeContainer({
-      checkoutExitCode: 1,
-      stderr: `fatal something ${TOKEN}`,
-    });
+  it("checkout failure THROWS (token-redacted) and removes the half-created container", async () => {
+    const c = makeContainer({ checkoutExitCode: 1, stderr: `fatal something ${TOKEN}` });
     const ops: BuildSandboxOps = { createContainer: vi.fn(async () => c.container) };
     await expect(
       withBuildSandbox(SPEC, TOKEN, async () => "x", { ops }),
@@ -99,7 +147,7 @@ describe("withBuildSandbox — caller-owned lifetime + pre-clone", () => {
     expect(c.removed()).toBe(1);
   });
 
-  it("createContainer failure propagates; nothing to remove", async () => {
+  it("createContainer failure propagates; nothing registered", async () => {
     const createContainer = vi.fn(async () => {
       throw new Error("docker: cannot connect");
     });
@@ -108,7 +156,7 @@ describe("withBuildSandbox — caller-owned lifetime + pre-clone", () => {
     ).rejects.toThrow("docker: cannot connect");
   });
 
-  it("body throw propagates BUT container is removed in finally", async () => {
+  it("body throw propagates BUT the container is KEPT (not removed) — closeBuildWorkspace removes it", async () => {
     const c = makeContainer();
     const ops: BuildSandboxOps = { createContainer: vi.fn(async () => c.container) };
     await expect(
@@ -116,15 +164,22 @@ describe("withBuildSandbox — caller-owned lifetime + pre-clone", () => {
         throw new Error("architect boom");
       }, { ops }),
     ).rejects.toThrow("architect boom");
+    // Kept alive for the next phase / explicit teardown.
+    expect(c.removed()).toBe(0);
+    await closeBuildWorkspace(SPEC.taskId);
     expect(c.removed()).toBe(1);
+  });
+
+  it("closeBuildWorkspace is a no-op for an unknown taskId", async () => {
+    await expect(closeBuildWorkspace("never-opened")).resolves.toBeUndefined();
   });
 });
 
 // pr-fix variant: clone + check out the EXISTING PR head branch (NOT `checkout -B`),
-// hand the container to the body (for the deterministic push), no tool-only fallback.
+// SINGLE-phase so it keeps the simple per-call create + remove-in-finally contract.
 const PR_SPEC = { owner: "octocat", repo: "widget", headRef: "feature/login" };
 
-describe("withPrFixSandbox — pre-clone the EXISTING PR head branch", () => {
+describe("withPrFixSandbox — pre-clone the EXISTING PR head branch (single-phase, per-call lifetime)", () => {
   it("clones --branch <headRef> (not -B), yields sandbox+container, removes in finally", async () => {
     const c = makeContainer();
     const createContainer = vi.fn(async () => c.container);
@@ -146,12 +201,10 @@ describe("withPrFixSandbox — pre-clone the EXISTING PR head branch", () => {
     expect(out).toBe("fixed");
     expect(seenSandbox).toBe(SANDBOX);
     expect(seenContainer).toBe(c.container);
-    expect(createContainer).toHaveBeenCalledWith({
-      image: BUILD_IMAGE,
-      env: { GIT_TOKEN: TOKEN },
-    });
+    expect(createContainer).toHaveBeenCalledWith(
+      expect.objectContaining({ image: BUILD_IMAGE, env: { GIT_TOKEN: TOKEN } }),
+    );
     const clone = c.execCalls.find((x) => x.includes("git clone"))!;
-    // Clones the existing branch — NOT a `checkout -B` that would create a new one.
     expect(clone).toContain("--branch 'feature/login'");
     expect(c.execCalls.some((x) => x.includes("git checkout -B"))).toBe(false);
     expect(c.removed()).toBe(1);

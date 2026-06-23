@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { FlueContext, SandboxFactory } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
@@ -16,8 +16,11 @@ import {
   SECURITY_SCAN_LABEL,
   type FiledSecurityScan,
 } from "../../security-review-post.ts";
+import { resetBuildWorkspacesForTests } from "../../agent-lib/build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../../agent-lib/build-sandbox.ts";
 import { GITHUB_PERMISSION_PROFILES } from "../../engine/profiles.ts";
+
+afterEach(() => resetBuildWorkspacesForTests());
 import type { RepoRef } from "../../tools/github-read.ts";
 
 const BOT = "last-light[bot]";
@@ -216,16 +219,25 @@ describe("runSecurityReview — real sandbox clone + ALWAYS-teardown over a fake
       runSecurityAgent: async (_c, ref, _o, token, meta, scanDate, sandboxOps) => {
         // Re-implement the default clone path but call sessionImpl instead of the model,
         // so we exercise withBuildSandbox (clone + teardown) without a model.
-        const { withBuildSandbox } = await import("../../agent-lib/build-sandbox.ts");
-        return withBuildSandbox(
-          { owner: ref.owner, repo: ref.repo, branch: meta.defaultBranch ?? "main" },
-          token,
-          async (sandbox) => {
-            sawSandbox = sandbox;
-            return sessionImpl(sandbox);
-          },
-          { ops: sandboxOps },
+        const { withBuildSandbox, closeBuildWorkspace } = await import(
+          "../../agent-lib/build-sandbox.ts"
         );
+        // Mirror the real runSecuritySession: single-phase, so create + close
+        // around the scan (the shared workspace isn't reused here).
+        const taskId = `security:${ref.owner}/${ref.repo}:${scanDate}`;
+        try {
+          return await withBuildSandbox(
+            { owner: ref.owner, repo: ref.repo, branch: meta.defaultBranch ?? "main", taskId },
+            token,
+            async (sandbox) => {
+              sawSandbox = sandbox;
+              return sessionImpl(sandbox);
+            },
+            { ops: sandboxOps },
+          );
+        } finally {
+          await closeBuildWorkspace(taskId);
+        }
       },
       fileIssue: async () => ({
         filed: true,

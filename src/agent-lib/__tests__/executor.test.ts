@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import type { SandboxFactory, AgentCreateContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import type { FlueContext } from "@flue/runtime";
@@ -20,8 +20,11 @@ import {
 } from "../../config.ts";
 import { loadPersona } from "../persona.ts";
 import type { BuildRun } from "../../build-run-store.ts";
+import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
 import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
 import { UNTRUSTED_OPEN } from "../../engine/untrusted.ts";
+
+afterEach(() => resetBuildWorkspacesForTests());
 
 // Phase 4 — executor agent CONFIG + phase WIRING, all offline (no live model /
 // GitHub / Docker / PUSH). Config is asserted by invoking the agent's `initialize`
@@ -203,6 +206,8 @@ describe("runExecutorPhase — wiring over injected deps (no live model / GitHub
     await expect(runExecutorPhase(ctx(), RUN, deps)).rejects.toThrow(
       "model exploded mid-executor",
     );
+    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
+    await closeBuildWorkspace(RUN.taskId);
     expect(fc.removed()).toBe(1);
     expect(calls.pushed).toEqual([]); // a failed run never pushes
   });
