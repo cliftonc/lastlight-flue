@@ -48,6 +48,7 @@ import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenEvent, SlackEventDedupe } from "../agent-lib/slack-screener.ts";
 import { toLastLightEvent } from "../agent-lib/slack-mapper.ts";
+import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
 import {
   routeEvent,
   routeCommand,
@@ -235,17 +236,14 @@ export async function handleCommand(
 }
 
 /**
- * Production single-shot LLM runner for the classifier/screener. Wiring a no-tools
- * classifier agent + session.prompt is the Phase-6 follow-up (shared with the
- * GitHub channel). Until then it fails CLOSED by throwing — the classifier catches
- * and defaults to CHAT (the safe default), and the screener fails open (unflagged).
+ * Production single-shot LLM runner for the classifier/screener: the SAME small
+ * no-tools chat call the GitHub channel uses (`createClassifierRunner`, resolving
+ * the `classifier` model). It only refines an NL Slack message; CHAT is the safe
+ * default. If the model is unreachable it throws — the classifier catches and
+ * defaults to CHAT, the screener fails open — so a model outage still converses.
  */
 function defaultPromptRunner() {
-  return async (): Promise<string> => {
-    // TODO(phase-6/classifier-llm): build a no-tools classifier agent
-    // (resolveModel('classifier')) + session.prompt and return its text.
-    throw new Error("classifier LLM not wired (phase-6 follow-up)");
-  };
+  return createClassifierRunner();
 }
 
 /**

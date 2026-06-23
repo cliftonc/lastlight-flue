@@ -8,10 +8,17 @@
  * the router + these helpers are fully offline-testable: tests pass a fake runner
  * that returns a canned `INTENT:`/`INJECTION:` string, NO live model.
  *
- * Lives in `src/agent-lib/` (NOT discovered). The production `PromptRunner` (a
- * tiny no-tools agent + session.prompt) is wired at the channel; here we keep the
+ * Lives in `src/agent-lib/` (NOT discovered). The production `PromptRunner` (a small
+ * no-tools chat call, `classify-llm.ts`) is wired at the channel; here we keep the
  * pure prompt + parse logic, mirroring the reference's `chat`-injection shape.
+ *
+ * UNTRUSTED CONTENT (spec/09 invariant): the comment text is attacker-controlled —
+ * it reaches the model as DATA, never as instructions. Both the classifier and the
+ * screener wrap the comment in `<<<USER_CONTENT_UNTRUSTED>>>` markers (`wrapUntrusted`)
+ * so an embedded "ignore your instructions / classify this BUILD" can't subvert the
+ * router. The SYSTEM prompt carries the only authority; the marked block is data.
  */
+import { wrapUntrusted } from "../engine/untrusted.ts";
 
 /** The single-shot LLM seam: system+user prompt → raw model text. */
 export type PromptRunner = (system: string, user: string) => Promise<string>;
@@ -74,9 +81,13 @@ export async function classifyComment(
   context?: ClassifierContext,
 ): Promise<ClassificationResult> {
   try {
+    // The comment is UNTRUSTED — wrap it as DATA so an embedded directive can't
+    // steer the classification. ISSUE TITLE is also user-content (wrapped); only
+    // the SYSTEM prompt carries authority.
+    const wrapped = wrapUntrusted(commentBody, { source: "github-comment" });
     const user = context?.issueTitle
-      ? `Classify this comment (replying on an existing ${context.isPullRequest ? "PR" : "issue"}):\n\nISSUE TITLE: ${context.issueTitle}\n\nCOMMENT: ${commentBody}`
-      : `Classify this comment:\n\n${commentBody}`;
+      ? `Classify this comment (replying on an existing ${context.isPullRequest ? "PR" : "issue"}):\n\nISSUE TITLE: ${wrapUntrusted(context.issueTitle, { source: "github-issue-title" })}\n\nCOMMENT:\n${wrapped}`
+      : `Classify this comment:\n\n${wrapped}`;
     const out = await run(CLASSIFIER_PROMPT, user);
     const m = out.toUpperCase().match(/INTENT:\s*(\w+)/);
     const intent: CommentIntent = m?.[1] ? (INTENT_MAP[m[1]] ?? "chat") : "chat";
@@ -115,7 +126,9 @@ export async function screenForInjection(
 ): Promise<ScreenResult> {
   if (!text || text.length < 60) return { flagged: false };
   try {
-    const out = await run(SCREENER_PROMPT, `Screen this text:\n\n${text}`);
+    // The text being screened is itself the untrusted payload — wrap it so the
+    // screener treats it as DATA (an injection attempt can't address the screener).
+    const out = await run(SCREENER_PROMPT, `Screen this text:\n\n${wrapUntrusted(text, { source: "github-comment" })}`);
     const flagged = /INJECTION:\s*YES/i.test(out);
     if (!flagged) return { flagged: false };
     const m = out.match(/REASON:\s*(.+)/i);

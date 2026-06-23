@@ -109,6 +109,118 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
   });
 });
 
+// Phase 6 POLISH — classifier + decline-reply through the full channel pipeline.
+describe("handleDelivery — classifier + decline-reply (offline, no live LLM/GitHub)", () => {
+  function comment(body: string, association: string, sender = "alice", id = `c-${Math.random()}`): GitHubWebhookDelivery {
+    return delivery(
+      "issue_comment",
+      {
+        action: "created",
+        sender: { login: sender },
+        repository: { full_name: "cliftonc/lastlight" },
+        issue: { number: 11, title: "T", pull_request: undefined },
+        comment: { body, author_association: association },
+      },
+      id,
+    );
+  }
+
+  it("maintainer NL @mention → classified intent routes to the right workflow (fake classifier, no live LLM)", async () => {
+    const invokeWorkflow = vi.fn(async () => {});
+    const res = await handleDelivery(comment("@last-light can you implement dark mode?", "OWNER"), key, {
+      botLogin: BOT,
+      // The classifier is INJECTED — a fake returns BUILD; the LLM `run` must never fire.
+      router: {
+        run: async () => {
+          throw new Error("LLM must not be called when classify is injected");
+        },
+        classify: async () => ({ intent: "build" }),
+        screen: async () => ({ flagged: false }),
+      },
+      dispatch: { invokeWorkflow },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res).toMatchObject({ status: "accepted", workflow: "build" });
+    expect(invokeWorkflow).toHaveBeenCalledWith("build", expect.objectContaining({ issue: 11 }));
+  });
+
+  it("explicit @last-light approve bypasses the classifier (LLM never called)", async () => {
+    const run = vi.fn(async () => "INTENT: BUILD");
+    const resumeGate = vi.fn(async () => {});
+    const res = await handleDelivery(comment("@last-light approve", "OWNER"), key, {
+      botLogin: BOT,
+      router: { run },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}), resumeGate },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("resume");
+    expect(run).not.toHaveBeenCalled(); // explicit command → deterministic, no LLM
+  });
+
+  it("non-maintainer @mention of a privileged action → posts a decline on the bound ref", async () => {
+    const reply = vi.fn<NonNullable<DispatchDeps["reply"]>>(async () => {});
+    const invokeWorkflow = vi.fn(async () => {});
+    const res = await handleDelivery(comment("@last-light build me a feature", "NONE", "rando"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM on a decline"); } },
+      dispatch: { invokeWorkflow, reply },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("reply");
+    expect(reply).toHaveBeenCalledTimes(1);
+    // The reply seam is handed the EVENT (owner/repo/issue bound) + a maintainer-only message.
+    const [ev, message] = reply.mock.calls[0]!;
+    expect(ev).toMatchObject({ owner: "cliftonc", repoName: "lastlight", issueNumber: 11 });
+    expect(message).toMatch(/maintainers/);
+    expect(invokeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("SILENT: a bot sender is screened out → no reply, no invoke (no loop)", async () => {
+    const reply = vi.fn(async () => {});
+    const invokeWorkflow = vi.fn(async () => {});
+    const res = await handleDelivery(comment("@last-light build", "NONE", BOT), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: { invokeWorkflow, reply },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("filtered");
+    expect(reply).not.toHaveBeenCalled(); // never reply to the bot → no loop
+    expect(invokeWorkflow).not.toHaveBeenCalled();
+  });
+
+  it("SILENT: a non-managed repo comment → no reply, no invoke", async () => {
+    const reply = vi.fn(async () => {});
+    const d = delivery("issue_comment", {
+      action: "created",
+      sender: { login: "rando" },
+      repository: { full_name: "stranger/unmanaged" },
+      issue: { number: 12, title: "T" },
+      comment: { body: "@last-light build", author_association: "NONE" },
+    });
+    const res = await handleDelivery(d, key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}), reply },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("filtered");
+    expect(reply).not.toHaveBeenCalled();
+  });
+
+  it("SILENT: a comment with NO @mention → ignored, no reply", async () => {
+    const reply = vi.fn(async () => {});
+    const res = await handleDelivery(comment("just chatting, no mention here", "OWNER"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}), reply },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("ignore");
+    expect(reply).not.toHaveBeenCalled();
+  });
+});
+
 // Phase 6 — CONVERSATION→runId GATE CORRELATION: an @last-light approve/reject on a
 // conversation with a paused build run resolves the runId and resumes; no paused run
 // is a clean no-op. The convKey here is the test `key()` serializer (the channel's

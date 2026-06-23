@@ -36,6 +36,8 @@ import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenDelivery, DeliveryDedupe } from "../agent-lib/github-screener.ts";
 import { toLastLightEvent } from "../agent-lib/github-mapper.ts";
+import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
+import { postDeclineReply } from "../agent-lib/github-decline-reply.ts";
 import {
   routeEvent,
   dispatchRoute,
@@ -142,11 +144,21 @@ function defaultDispatchDeps(gateLookup = defaultGateLookup()): DispatchDeps {
       if (!runId) return;
       await resumeBuild(runId, decision);
     },
-    reply: async (_ev, _message) => {
-      // TODO(phase-6/router-reply): post the decline via a scoped issues-write
-      // token (the deterministic-post spine). Deferred — needs the bound Octokit
-      // reply helper; the decision is already computed + tested. No-op for now so
-      // a non-maintainer mention is silently dropped rather than erroring.
+    reply: async (ev, message) => {
+      // DECLINE-REPLY (Phase 6): the router decided to decline (a non-maintainer
+      // @mentioned the bot to trigger a privileged action). Post the brief
+      // deterministic explanation over a SCOPED issues-write token, with owner/repo/
+      // issue CLOSED OVER (never model-selectable; the deterministic-post spine).
+      // Bot/self senders never reach here (the screener drops bot senders, and
+      // `routeEvent` only emits `reply` on a non-maintainer human @mention), so no
+      // reply loop. A missing GitHub App / post error is swallowed — a failed
+      // courtesy reply must not 500 the webhook.
+      try {
+        await postDeclineReply(ev, message);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[channels/github] decline-reply failed: ${msg}`);
+      }
     },
   };
 }
@@ -200,18 +212,15 @@ export async function handleDelivery(
 }
 
 /**
- * Production single-shot LLM runner for the classifier/screener. A tiny no-tools
- * agent + session.prompt is the Flue-idiomatic single-shot call; wiring it is the
- * Phase-6 follow-up (the classifier/screener only run on maintainer NL comments).
- * Until then it fails CLOSED to chat/fail-open-screen by throwing — both callers
- * catch and default safely (intent=chat, flagged=false).
+ * Production single-shot LLM runner for the classifier/screener: a small no-tools
+ * chat call to the `resolveModel('classifier')` provider (`createClassifierRunner`,
+ * shared with the Slack channel). It runs ONLY on maintainer @mention NL comments
+ * (deterministic routes never reach it). If the model is unreachable (no API key /
+ * upstream error) it throws — the classifier catches and defaults to CHAT (the safe
+ * fallback), the screener fails open — so a model outage degrades, never crashes.
  */
 function defaultPromptRunner() {
-  return async (): Promise<string> => {
-    // TODO(phase-6/classifier-llm): build a no-tools classifier agent
-    // (resolveModel('classifier')) + session.prompt and return its text.
-    throw new Error("classifier LLM not wired (phase-6 follow-up)");
-  };
+  return createClassifierRunner();
 }
 
 /**

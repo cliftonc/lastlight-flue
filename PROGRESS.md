@@ -19,18 +19,30 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 6 IN PROGRESS — GitHub ✅ + Slack ✅ + GATE CORRELATION ✅ (OFFLINE/MOCKED).**
-  Phases 0-5 ✅ (Phase 4 LIVE build DEFERRED). Suite **712 passed / 6 skipped**.
-- **Gate correlation wired:** `conversation_key` col on BUILD+EXPLORE run-records
-  (migration-safe `ALTER`-if-missing; existing rows null) + `setConversationKey` +
-  `findPausedRunByConversation(convKey)→runId` (only paused+pending, terminal never
-  returned; explore also matches legacy `trigger_id`). Build/explore gate-pause path
-  records the convKey (input carries `conversationKey`; GitHub build payload now passes
-  `ev.conversationKey`). GitHub @approve/reject + Slack /approve-reject resolve
-  convKey→runId→resume (both channels' `gateLookup` seam FILLED; no paused run = clean
-  no-op). **"/approve resolves a gate" acceptance now met offline.** `flue build` green.
-- **NEXT = Phase 6 polish** (classifier-LLM + decline-reply) or **Phase 7**. Slack
-  runtime-capable; full live e2e needs a public endpoint (Phase 8).
+- **Phase 6 ✅ COMPLETE — channels: GitHub + Slack + gate correlation + classifier-LLM
+  + decline-reply (OFFLINE/MOCKED).** Phases 0-5 ✅ (Phase 4 LIVE build DEFERRED).
+  Suite **730 passed / 6 skipped**.
+- **Classifier-LLM wired** (`src/agent-lib/classify-llm.ts`, shared by both channels'
+  default `PromptRunner`): a small NO-TOOLS chat call to `resolveModel('classifier')`'s
+  provider (openai default, anthropic adapter too), bounded (max_tokens+8s timeout),
+  fetch injected. Comment+title UNTRUSTED-wrapped (`wrapUntrusted`) in the classify/
+  screen user prompts. EXPLICIT slash commands (@approve/reject/security-review) still
+  route deterministically — the LLM never fires. Low-conf/unknown/model-outage → classifier
+  defaults CHAT (GitHub→issue-comment, Slack→chat), screener fails OPEN. NL only.
+- **Decline-reply wired** (`src/agent-lib/github-decline-reply.ts` → GitHub `reply` seam):
+  a NON-MAINTAINER @mention of a privileged action → brief deterministic decline posted
+  on the bound issue ref over a scoped `issues-write` token (reuses
+  `postIssueReplyDeterministically`: bot-loop floor + dedup, NEVER model-selectable).
+  SILENT (no reply, no loop): bot/self sender, non-managed repo, ignored action, no
+  @mention — all screened/routed to `ignore` upstream so a bot is never replied to.
+- **+18 tests** (classify-llm 8, decline-reply 4, channel classifier/decline pipeline 6):
+  fake-classifier routing, explicit-command LLM-bypass, untrusted-wrap, fail-safe→chat,
+  decline posts on bound ref, silent drops post nothing. `flue build` green; discovery
+  channels{github,slack}; dist vitest=1 (inlined text, 0 module imports).
+- Phase-6 deferrals: full LIVE Slack e2e needs a public HTTPS endpoint (Phase 8);
+  GitHub `check_run` re-review routes still TODO; durable channel dedup = Phase 7.
+- **NEXT = Phase 7** (persistence + re-back admin API). Gate correlation
+  (`conversation_key` col + `findPausedRunByConversation`) detailed in Phase status.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -50,7 +62,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - [x] **5 — Remaining workflows + crons + chat** ✅ COMPLETE — issue-triage,
   issue-comment, pr-fix, answer, web-tools, explore, repo-health, chat,
   security-review, security-feedback, pr-comment, crons+shutdown. Last commit `7718f71`.
-- [~] **6 — Channels** — **GitHub channel ✅** (Slack = next): `src/channels/github.ts`
+- [x] **6 — Channels ✅ COMPLETE** — **GitHub channel ✅**: `src/channels/github.ts`
   `createGitHubChannel({ webhookSecret, webhook })` → discovered `/channels/github/webhook`.
   Pipeline (NON-discovered helpers): DEDUPE (`DeliveryDedupe` on `deliveryId`) → SCREEN
   (`github-screener.ts`: ignored-actions/allowlist/bot self-loop[PR exception]/bot-authored-PR/
@@ -59,8 +71,8 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   injected `invokeWorkflow`=spawn `flue run`). Classifier+screener (`github-classify.ts`) parallel,
   maintainer-NL-only, LLM behind injected seam. ROUTES: issue.opened/reopened→issue-triage,
   pr.opened/sync/reopened→pr-review, @mention→approve/reject(resume)|security-review|build|explore|
-  pr-fix|pr-comment|security-feedback|issue-comment, reply-gate→explore. DEFERRED(TODO 6/7):
-  classifier-LLM wiring, decline-reply post, conversation→runId gate correlation, check_run routes.
+  pr-fix|pr-comment|security-feedback|issue-comment, reply-gate→explore. classifier-LLM ✅,
+  decline-reply ✅, gate correlation ✅ (above). Remaining DEFERRED: check_run re-review routes.
   `@flue/github 1.0.0-beta.1` (verified, NO drift — flue-ref §8). +41 tests. Last commit: P6 GitHub channel.
 - **Slack channel ✅ OFFLINE/MOCKED** (LIVE deferred — needs `SLACK_SIGNING_SECRET`):
   `src/channels/slack.ts` `createSlackChannel({ signingSecret, events, commands })` →
@@ -73,9 +85,9 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   `/approve /reject`→`resume(runId,decision)`. GRACEFUL-MISSING-SECRET: placeholder
   (`offline-placeholder-no-real-slack-verifies`) → constructs/boots w/o throw; NEVER
   persist trigger_id/response_url (asserted). DONE: chat-dispatch + workflow routes +
-  command→resume(by-text-runId). TODO(6/7): classifier-LLM wiring (chat fallback now);
-  conversation→runId gate correlation (BuildRunStore has no convKey col; `gateLookup`
-  seam ready). `@flue/slack 1.0.0-beta.1` verified (flue-ref §8; deps @slack/types+hono,
+  command→resume(by-text-runId). classifier-LLM ✅ (shared runner; chat default);
+  gate correlation ✅ (convKey col + `gateLookup` filled).
+  `@flue/slack 1.0.0-beta.1` verified (flue-ref §8; deps @slack/types+hono,
   NOT @slack/web-api). +41 tests. discovery channels{github,slack}. Last commit: P6 Slack channel.
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
