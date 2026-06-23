@@ -75,6 +75,13 @@ export type BuildInput = {
   /** User-provided issue text (UNTRUSTED) for the architect contextSnapshot. */
   issueContext?: ArchitectIssueContext;
   /**
+   * The CHANNEL conversation key (issue/PR thread) this run was triggered from — the
+   * SAME `conversationKey` the channel computes from an event. Recorded on the run
+   * record at a gate pause (Phase 6 gate correlation) so a channel approve/reject on
+   * that conversation resolves THIS run. Absent on a CLI run.
+   */
+  conversationKey?: string;
+  /**
    * Per-gate re-entry token set by resume(): the gate this re-invoke is approved
    * past (`post_architect` or `post_reviewer:<cycle>`). Absent on a fresh invoke.
    */

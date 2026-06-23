@@ -43,6 +43,7 @@ import { dispatch } from "@flue/runtime";
 import chatAgent from "../agents/chat.ts";
 import { getRuntimeConfig, loadConfig } from "../config.ts";
 import { defaultCronInvoker } from "../crons.ts";
+import { BuildRunStore } from "../build-run-store.ts";
 import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenEvent, SlackEventDedupe } from "../agent-lib/slack-screener.ts";
@@ -108,11 +109,35 @@ function defaultPendingReplyGate(storePath?: string) {
       storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db",
     );
     try {
-      const match = store.listPaused().find((r) => r.triggerId === ev.conversationKey);
-      return match ? { runId: match.id } : null;
+      // Resolve the paused explore reply-gate on this thread by the channel
+      // conversationKey (matches conversation_key OR the legacy trigger_id the
+      // channels passed as `triggerId: ev.conversationKey`) — Phase 6 correlation.
+      const runId = store.findPausedRunByConversation(ev.conversationKey);
+      return runId ? { runId } : null;
     } catch {
       // Fail-open: a missing store / read error must not block the channel.
       return null;
+    } finally {
+      store.close();
+    }
+  };
+}
+
+/**
+ * Resolve a paused BUILD run from a conversation key (Phase 6 gate correlation):
+ * the `/approve` `/reject` correlation seam `routeCommand` left ready. When the
+ * operator gives no runId text, the thread conversationKey resolves the paused gate
+ * — mirroring GitHub. Returns null (→ ignore) when no paused run is on the thread.
+ */
+function defaultGateLookup(storePath?: string) {
+  return async (conversationKey: string): Promise<string | null> => {
+    const store = new BuildRunStore(
+      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./data/build-run-store.db",
+    );
+    try {
+      return store.findPausedRunByConversation(conversationKey) ?? null;
+    } catch {
+      return null; // fail-open: a missing store must not error the command.
     } finally {
       store.close();
     }
@@ -192,7 +217,9 @@ export async function handleCommand(
 ): Promise<{ status: string; reason?: string }> {
   const decision = await routeCommand(command, text, {
     conversationKey,
-    gateLookup: opts.gateLookup,
+    // The conversation→runId index `routeCommand` left ready (Phase 6): resolve the
+    // paused build gate on this thread when no runId text is given. Mirrors GitHub.
+    gateLookup: opts.gateLookup ?? defaultGateLookup(),
   });
   if (decision.action === "ignore") return { status: "ignored", reason: decision.reason };
 

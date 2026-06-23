@@ -125,6 +125,9 @@ export async function runBuild(
   // the same pending marker.
   if (deps.gateEnabled('post_architect') && input.resumedGate !== 'post_architect') {
     if (run.pendingGate !== 'post_architect') {
+      // Record the channel conversation key so a channel approve/reject on this
+      // issue/PR resolves THIS run via findPausedRunByConversation (Phase 6).
+      store.setConversationKey(id, input.conversationKey);
       store.setPending(id, 'post_architect');
       const posted = await deps.postGateComment(ctx, run, 'post_architect');
       if (posted?.commentId !== undefined) {
@@ -175,6 +178,7 @@ export async function runBuild(
     if (deps.gateEnabled('post_reviewer') && input.resumedGate !== reviewerGate) {
       if (run.pendingGate !== reviewerGate) {
         store.setCycle(id, cycle);
+        store.setConversationKey(id, input.conversationKey);
         store.setPending(id, reviewerGate);
         const posted = await deps.postGateComment(ctx, run, reviewerGate);
         if (posted?.commentId !== undefined) {

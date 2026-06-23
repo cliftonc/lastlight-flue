@@ -38,6 +38,15 @@ export interface BuildRun {
   phasesDone: Record<string, true>;
   /** POINTERS only (file paths), never blobs — preserves spec/10's split rule. */
   scratch: Record<string, string>;
+  /**
+   * The CHANNEL conversation key (issue/PR thread) this run is gated on — the SAME
+   * `conversationKey` a channel computes from an event (Phase 6 gate correlation).
+   * Recorded at the gate-pause path so a channel approve/reject on that conversation
+   * resolves THIS run via `findPausedRunByConversation`. Null on a CLI/legacy run.
+   * (Optional in the interface so existing run-literal fixtures stay valid; the
+   * hydrate path always populates it.)
+   */
+  conversationKey?: string | null;
   /** The gate the run is parked at, or null. */
   pendingGate: GateName | null;
   /** Reviewer fix/recheck loop iteration cursor. */
@@ -59,6 +68,7 @@ interface BuildRunRow {
   task_id: string;
   phases_done: string;
   scratch: string;
+  conversation_key: string | null;
   pending_gate: string | null;
   reviewer_cycle: number;
   restart_count: number;
@@ -95,6 +105,7 @@ export class BuildRunStore {
         task_id        TEXT NOT NULL DEFAULT '',
         phases_done    TEXT NOT NULL DEFAULT '{}',
         scratch        TEXT NOT NULL DEFAULT '{}',
+        conversation_key TEXT,
         pending_gate   TEXT,
         reviewer_cycle INTEGER NOT NULL DEFAULT 0,
         restart_count  INTEGER NOT NULL DEFAULT 0,
@@ -102,6 +113,21 @@ export class BuildRunStore {
         fail_reason    TEXT
       );
     `);
+    // MIGRATION-SAFE additive column (spec/10 — never drop/narrow): an existing db
+    // created before the Phase-6 gate-correlation slice lacks `conversation_key`.
+    // Add it idempotently; existing rows default to NULL (a CLI/legacy run with no
+    // channel conversation). A duplicate-column error (column already present) is
+    // swallowed so a fresh db (where CREATE TABLE already added it) is a clean no-op.
+    this.ensureColumn('conversation_key', 'TEXT');
+  }
+
+  /** Add a column if it is missing — idempotent, migration-safe (additive only). */
+  private ensureColumn(name: string, decl: string): void {
+    const cols = this.db
+      .prepare('PRAGMA table_info(build_runs)')
+      .all() as unknown as Array<{ name: string }>;
+    if (cols.some((c) => c.name === name)) return;
+    this.db.exec(`ALTER TABLE build_runs ADD COLUMN ${name} ${decl};`);
   }
 
   private hydrate(row: BuildRunRow): BuildRun {
@@ -114,6 +140,7 @@ export class BuildRunStore {
       taskId: row.task_id,
       phasesDone: JSON.parse(row.phases_done) as Record<string, true>,
       scratch: JSON.parse(row.scratch) as Record<string, string>,
+      conversationKey: row.conversation_key ?? null,
       pendingGate: row.pending_gate as GateName | null,
       reviewerCycle: row.reviewer_cycle,
       restartCount: row.restart_count,
@@ -169,6 +196,41 @@ export class BuildRunStore {
     if (!cur) return;
     const merged = { ...cur.scratch, ...scratch };
     this.db.prepare('UPDATE build_runs SET scratch = ? WHERE id = ?').run(JSON.stringify(merged), id);
+  }
+
+  /**
+   * Record the CHANNEL conversation key this run is gated on (Phase 6 gate
+   * correlation). Idempotent; null/empty is ignored so a CLI run (no channel
+   * conversation) leaves the column NULL and is never matched by a channel lookup.
+   * The key is the SAME string a channel computes from an event, so a later
+   * approve/reject on that conversation resolves this run via
+   * `findPausedRunByConversation`.
+   */
+  setConversationKey(id: string, conversationKey: string | null | undefined): void {
+    if (!conversationKey) return;
+    this.db
+      .prepare('UPDATE build_runs SET conversation_key = ? WHERE id = ?')
+      .run(conversationKey, id);
+  }
+
+  /**
+   * Resolve the app runId of the run currently PAUSED awaiting a decision on this
+   * conversation (Phase 6 gate correlation — the channel approve/reject lookup).
+   * Returns undefined when no paused run is parked on the conversation (a clean
+   * no-op at the channel). Only `paused` runs with a non-null `pending_gate` match —
+   * a resolved/terminal run is never returned. If multiple are somehow parked on the
+   * same conversation, the most-recently-pending is returned (rowid DESC) so the
+   * CURRENT gate resolves.
+   */
+  findPausedRunByConversation(conversationKey: string): string | undefined {
+    if (!conversationKey) return undefined;
+    const row = this.db
+      .prepare(
+        "SELECT id FROM build_runs WHERE conversation_key = ? AND status = 'paused' " +
+          'AND pending_gate IS NOT NULL ORDER BY rowid DESC LIMIT 1',
+      )
+      .get(conversationKey) as { id: string } | undefined;
+    return row?.id;
   }
 
   /** Suspend at a gate: record the pending gate + mark paused. Idempotent. */

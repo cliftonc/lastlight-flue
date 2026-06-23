@@ -19,10 +19,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 6 IN PROGRESS — GitHub ✅ + Slack ✅ (OFFLINE/MOCKED).** Phases 0-5 ✅
-  (Phase 4 LIVE build DEFERRED). Suite **696 passed / 6 skipped**.
-- **NEXT = Phase 6 wrap** (router/maintainer-gate finalize, classifier-LLM + reply
-  posts) or **Phase 7**. Slack runtime-capable (SLACK_SIGNING_SECRET present); full live e2e needs a public endpoint (Phase 8).
+- **Phase 6 IN PROGRESS — GitHub ✅ + Slack ✅ + GATE CORRELATION ✅ (OFFLINE/MOCKED).**
+  Phases 0-5 ✅ (Phase 4 LIVE build DEFERRED). Suite **712 passed / 6 skipped**.
+- **Gate correlation wired:** `conversation_key` col on BUILD+EXPLORE run-records
+  (migration-safe `ALTER`-if-missing; existing rows null) + `setConversationKey` +
+  `findPausedRunByConversation(convKey)→runId` (only paused+pending, terminal never
+  returned; explore also matches legacy `trigger_id`). Build/explore gate-pause path
+  records the convKey (input carries `conversationKey`; GitHub build payload now passes
+  `ev.conversationKey`). GitHub @approve/reject + Slack /approve-reject resolve
+  convKey→runId→resume (both channels' `gateLookup` seam FILLED; no paused run = clean
+  no-op). **"/approve resolves a gate" acceptance now met offline.** `flue build` green.
+- **NEXT = Phase 6 polish** (classifier-LLM + decline-reply) or **Phase 7**. Slack
+  runtime-capable; full live e2e needs a public endpoint (Phase 8).
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker

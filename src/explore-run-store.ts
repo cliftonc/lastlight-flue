@@ -57,6 +57,17 @@ export interface ExploreRun {
   phasesDone: Record<string, true>;
   /** POINTERS only (file paths) PLUS the bounded socratic blob (see module note). */
   scratch: Record<string, string>;
+  /**
+   * The CHANNEL conversation key (issue/thread) this reply gate is parked on — the
+   * SAME `conversationKey` a channel computes from an event (Phase 6 gate
+   * correlation). Recorded at the reply-gate pause so a channel reply on that
+   * conversation resolves THIS run via `findPausedRunByConversation`. Distinct from
+   * `triggerId` (the legacy `owner/repo#issue` key the channels also pass): both are
+   * indexed so either correlation path resolves the same paused run. Null on a run
+   * with no channel conversation. (Optional in the interface so existing run-literal
+   * fixtures stay valid; the hydrate path always populates it.)
+   */
+  conversationKey?: string | null;
   /** The accumulated Socratic Q&A + ready flag (folded into the prompt context). */
   socratic: SocraticScratch;
   /** The Socratic loop cursor — which question round the loop is on. */
@@ -79,6 +90,7 @@ interface ExploreRunRow {
   trigger_id: string;
   phases_done: string;
   scratch: string;
+  conversation_key: string | null;
   socratic: string;
   socratic_iter: number;
   pending_gate: string | null;
@@ -115,6 +127,7 @@ export class ExploreRunStore {
         trigger_id    TEXT NOT NULL DEFAULT '',
         phases_done   TEXT NOT NULL DEFAULT '{}',
         scratch       TEXT NOT NULL DEFAULT '{}',
+        conversation_key TEXT,
         socratic      TEXT NOT NULL DEFAULT '{"qa":"","ready":false}',
         socratic_iter INTEGER NOT NULL DEFAULT 0,
         pending_gate  TEXT,
@@ -123,6 +136,20 @@ export class ExploreRunStore {
         fail_reason   TEXT
       );
     `);
+    // MIGRATION-SAFE additive column (spec/10 — never drop/narrow): an existing db
+    // created before the Phase-6 gate-correlation slice lacks `conversation_key`.
+    // Add it idempotently; existing rows default to NULL. A fresh db (CREATE TABLE
+    // already added it) is a clean no-op.
+    this.ensureColumn('conversation_key', 'TEXT');
+  }
+
+  /** Add a column if it is missing — idempotent, migration-safe (additive only). */
+  private ensureColumn(name: string, decl: string): void {
+    const cols = this.db
+      .prepare('PRAGMA table_info(explore_runs)')
+      .all() as unknown as Array<{ name: string }>;
+    if (cols.some((c) => c.name === name)) return;
+    this.db.exec(`ALTER TABLE explore_runs ADD COLUMN ${name} ${decl};`);
   }
 
   private hydrate(row: ExploreRunRow): ExploreRun {
@@ -134,6 +161,7 @@ export class ExploreRunStore {
       triggerId: row.trigger_id,
       phasesDone: JSON.parse(row.phases_done) as Record<string, true>,
       scratch: JSON.parse(row.scratch) as Record<string, string>,
+      conversationKey: row.conversation_key ?? null,
       socratic: { ...EMPTY_SOCRATIC, ...(JSON.parse(row.socratic) as Partial<SocraticScratch>) },
       socraticIter: row.socratic_iter,
       pendingGate: row.pending_gate as ReplyGate | null,
@@ -212,6 +240,39 @@ export class ExploreRunStore {
   /** Advance (or set) the Socratic loop cursor. */
   setSocraticIter(id: string, iter: number): void {
     this.db.prepare('UPDATE explore_runs SET socratic_iter = ? WHERE id = ?').run(iter, id);
+  }
+
+  /**
+   * Record the CHANNEL conversation key this reply gate is parked on (Phase 6 gate
+   * correlation). Idempotent; null/empty is ignored. The key is the SAME string a
+   * channel computes from an event, so a later reply on that conversation resolves
+   * this run via `findPausedRunByConversation`.
+   */
+  setConversationKey(id: string, conversationKey: string | null | undefined): void {
+    if (!conversationKey) return;
+    this.db
+      .prepare('UPDATE explore_runs SET conversation_key = ? WHERE id = ?')
+      .run(conversationKey, id);
+  }
+
+  /**
+   * Resolve the app runId of the explore run currently PAUSED awaiting a reply on
+   * this conversation (Phase 6 gate correlation — the channel reply-gate lookup).
+   * Matches EITHER the channel `conversation_key` OR the legacy `trigger_id` (the
+   * channels historically passed `triggerId: ev.conversationKey`), so both
+   * correlation paths resolve the same paused run. Returns undefined when none is
+   * parked (a clean no-op). Only `paused` runs with a non-null `pending_gate` match —
+   * a resolved/terminal run is never returned.
+   */
+  findPausedRunByConversation(conversationKey: string): string | undefined {
+    if (!conversationKey) return undefined;
+    const row = this.db
+      .prepare(
+        "SELECT id FROM explore_runs WHERE status = 'paused' AND pending_gate IS NOT NULL " +
+          'AND (conversation_key = ? OR trigger_id = ?) ORDER BY rowid DESC LIMIT 1',
+      )
+      .get(conversationKey, conversationKey) as { id: string } | undefined;
+    return row?.id;
   }
 
   /** Suspend at a reply gate: record the pending gate + mark paused. Idempotent. */

@@ -31,6 +31,7 @@
 import { createGitHubChannel, type GitHubChannel, type GitHubWebhookDelivery, type GitHubIssueRef } from "@flue/github";
 import { getRuntimeConfig, loadConfig } from "../config.ts";
 import { defaultCronInvoker } from "../crons.ts";
+import { BuildRunStore } from "../build-run-store.ts";
 import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenDelivery, DeliveryDedupe } from "../agent-lib/github-screener.ts";
@@ -85,13 +86,19 @@ const dedupe = new DeliveryDedupe();
 function defaultPendingReplyGate(storePath?: string) {
   return async (ev: LastLightEvent): Promise<PendingReplyGate | null> => {
     if (!ev.owner || !ev.repoName || !ev.issueNumber) return null;
-    const triggerId = `${ev.owner}/${ev.repoName}#${ev.issueNumber}`;
     const store = new ExploreRunStore(
       storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db",
     );
     try {
-      const match = store.listPaused().find((r) => r.triggerId === triggerId);
-      return match ? { runId: match.id } : null;
+      // Resolve the paused explore reply-gate on this conversation. The store matches
+      // the channel conversationKey OR the legacy `owner/repo#issue` triggerId, so a
+      // run parked under either correlation path is found (Phase 6 gate correlation).
+      const byConvKey = store.findPausedRunByConversation(ev.conversationKey);
+      if (byConvKey) return { runId: byConvKey };
+      const byTriggerId = store.findPausedRunByConversation(
+        `${ev.owner}/${ev.repoName}#${ev.issueNumber}`,
+      );
+      return byTriggerId ? { runId: byTriggerId } : null;
     } catch {
       // Fail-open: a missing store / read error must not block the webhook.
       return null;
@@ -101,14 +108,38 @@ function defaultPendingReplyGate(storePath?: string) {
   };
 }
 
+/**
+ * Resolve a paused BUILD run from a conversation key (Phase 6 gate correlation).
+ * The GitHub router passes `ev.conversationKey` as the `resume` decision's `runId`;
+ * this maps it to the actual app runId of the run parked at a gate on that issue/PR.
+ * Returns null (→ a clean no-op) when no paused run is on the conversation.
+ */
+function defaultGateLookup(storePath?: string) {
+  return (conversationKey: string): string | undefined => {
+    const store = new BuildRunStore(
+      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./data/build-run-store.db",
+    );
+    try {
+      return store.findPausedRunByConversation(conversationKey);
+    } catch {
+      return undefined; // fail-open: a missing store must not error the webhook.
+    } finally {
+      store.close();
+    }
+  };
+}
+
 /** Production dispatch seams: spawn `flue run` (crons/resume path), resume gates. */
-function defaultDispatchDeps(): DispatchDeps {
+function defaultDispatchDeps(gateLookup = defaultGateLookup()): DispatchDeps {
   return {
     invokeWorkflow: defaultCronInvoker,
-    resumeGate: async (runId, decision) => {
-      // The build durable gate (Phase 4) — approve re-invokes, reject terminalizes.
-      // The conversation→runId correlation is the Phase-7 follow-up (TODO below);
-      // here `runId` is the conversationKey and resume() is a no-op for an unknown id.
+    resumeGate: async (conversationKey, decision) => {
+      // The build durable gate (Phase 4 + Phase 6 correlation): the router passes the
+      // CONVERSATION key; resolve it to the paused run's app runId, then approve
+      // (re-invoke) / reject (terminalize). No paused run on the conversation → a
+      // clean no-op (a stray @approve with nothing to resolve does nothing).
+      const runId = gateLookup(conversationKey);
+      if (!runId) return;
       await resumeBuild(runId, decision);
     },
     reply: async (_ev, _message) => {

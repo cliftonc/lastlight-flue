@@ -53,6 +53,14 @@ export type ExploreInput = {
   issue?: number;
   /** A stable trigger id for non-GitHub origins (e.g. `slack:team:chan:thread`). */
   triggerId?: string;
+  /**
+   * The CHANNEL conversation key this reply gate is parked on — the SAME
+   * `conversationKey` a channel computes from an event (Phase 6 gate correlation).
+   * Recorded on the run record at a reply-gate pause so a channel reply on that
+   * conversation resolves THIS run. When triggered from a channel this equals
+   * `triggerId` (the channels pass `triggerId: ev.conversationKey`).
+   */
+  conversationKey?: string;
   /** The issue title (untrusted). */
   issueTitle?: string;
   /** The issue body (untrusted). */

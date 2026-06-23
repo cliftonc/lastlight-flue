@@ -234,6 +234,10 @@ export async function routeEvent(
             issue: ev.issueNumber,
             sender: ev.sender,
             commentBody,
+            // The conversation key threads through to the run record at the gate
+            // pause, so a later @last-light approve/reject on this issue resolves
+            // THIS run (Phase 6 gate correlation).
+            conversationKey: ev.conversationKey,
             triggerType: "comment",
           },
         };

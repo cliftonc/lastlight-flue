@@ -105,6 +105,17 @@ describe('build — durable control flow + post_architect gate', () => {
     expect(rec.phasesDone.executor).toBeUndefined();
   });
 
+  it('Phase 6: the gate pause records the channel conversationKey → findPausedRunByConversation resolves it', async () => {
+    const t = recordingDeps();
+    const convKey = 'github:v1:owner:cliftonc:repo:repo:issue:42';
+    await runBuild(ctx({ ...INPUT, conversationKey: convKey }), store, t.deps);
+
+    const rec = store.get(INPUT.runId)!;
+    expect(rec.conversationKey).toBe(convKey);
+    // The channel approve/reject lookup resolves the paused run from the convKey.
+    expect(store.findPausedRunByConversation(convKey)).toBe(INPUT.runId);
+  });
+
   it('re-invoke without approval re-pauses idempotently — does NOT re-run done phases or re-post the ask', async () => {
     const t = recordingDeps();
     await runBuild(ctx({ ...INPUT }), store, t.deps); // pause

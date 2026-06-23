@@ -143,7 +143,28 @@ describe("slack channel — handleCommand (/approve /reject → resume)", () => 
   it("an un-correlatable command is ignored (no resume, no crash)", async () => {
     const { handleCommand } = await import("../slack.ts");
     const resumeGate = vi.fn(async () => {});
-    const res = await handleCommand("/approve", "", "slack:T1:C9:C9", { resumeGate });
+    // No runId text + no paused run on the thread → ignored (gateLookup → null).
+    const res = await handleCommand("/approve", "", "slack:T1:C9:C9", { resumeGate, gateLookup: async () => null });
+    expect(res.status).toBe("ignored");
+    expect(resumeGate).not.toHaveBeenCalled();
+  });
+
+  // Phase 6 — CONVERSATION→runId correlation: with no runId text, the thread
+  // conversationKey resolves the paused build gate (mirrors GitHub).
+  it("/approve with NO runId text resolves the paused gate via the conversationKey gateLookup", async () => {
+    const { handleCommand } = await import("../slack.ts");
+    const resumeGate = vi.fn(async () => {});
+    const gateLookup = vi.fn(async (k: string) => (k === "slack:T1:C9:C9" ? "build-run-9" : null));
+    const res = await handleCommand("/approve", "", "slack:T1:C9:C9", { resumeGate, gateLookup });
+    expect(res).toEqual({ status: "resumed", reason: "approve" });
+    expect(gateLookup).toHaveBeenCalledWith("slack:T1:C9:C9");
+    expect(resumeGate).toHaveBeenCalledWith("build-run-9", "approve", undefined);
+  });
+
+  it("/reject with no paused run on the thread → ignored (clean no-op)", async () => {
+    const { handleCommand } = await import("../slack.ts");
+    const resumeGate = vi.fn(async () => {});
+    const res = await handleCommand("/reject", "", "slack:T1:C9:C9", { resumeGate, gateLookup: async () => null });
     expect(res.status).toBe("ignored");
     expect(resumeGate).not.toHaveBeenCalled();
   });

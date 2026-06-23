@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { GitHubWebhookDelivery } from "@flue/github";
 import { handleDelivery } from "../github.ts";
+import { BuildRunStore } from "../../build-run-store.ts";
 import { DeliveryDedupe } from "../../agent-lib/github-screener.ts";
 import type { RouterDeps, DispatchDeps } from "../../agent-lib/github-router.ts";
 
@@ -102,5 +106,90 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
     const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
     expect(res.status).toBe("filtered");
     expect(h.invokeWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+// Phase 6 — CONVERSATION→runId GATE CORRELATION: an @last-light approve/reject on a
+// conversation with a paused build run resolves the runId and resumes; no paused run
+// is a clean no-op. The convKey here is the test `key()` serializer (the channel's
+// conversationKey(ref)) — the SAME string the gate-pause path recorded on the run.
+describe("github channel — @approve/@reject gate correlation (offline, no resume side effect)", () => {
+  let dir: string;
+  let store: BuildRunStore;
+  const convKey = key({ owner: "cliftonc", repo: "lastlight", issueNumber: 7 });
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ghc-"));
+    store = new BuildRunStore(join(dir, "b.db"));
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Production-shaped resumeGate: convKey → findPausedRunByConversation → fake resume. */
+  function dispatchWithGateLookup(resumeFake: (runId: string, d: "approve" | "reject") => void): DispatchDeps {
+    return {
+      invokeWorkflow: vi.fn(async () => {}),
+      resumeGate: async (conversationKey, decision) => {
+        const runId = store.findPausedRunByConversation(conversationKey);
+        if (!runId) return; // clean no-op
+        resumeFake(runId, decision);
+      },
+    };
+  }
+
+  function comment(body: string): GitHubWebhookDelivery {
+    return delivery("issue_comment", {
+      action: "created",
+      sender: { login: "maintainer" },
+      repository: { full_name: "cliftonc/lastlight" },
+      issue: { number: 7, title: "t", pull_request: undefined },
+      comment: { body, author_association: "OWNER" },
+    }, `cmt-${Math.random()}`);
+  }
+
+  it("@last-light approve on a conversation with a paused run → resumes that runId (approve)", async () => {
+    store.getOrCreate("build-run-7", { owner: "cliftonc", repo: "lastlight", issue: 7, branch: "b", taskId: "t" });
+    store.setConversationKey("build-run-7", convKey);
+    store.setPending("build-run-7", "post_architect");
+
+    const resumeFake = vi.fn();
+    const res = await handleDelivery(comment("@last-light approve"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: dispatchWithGateLookup(resumeFake),
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("resume");
+    expect(resumeFake).toHaveBeenCalledWith("build-run-7", "approve");
+  });
+
+  it("@last-light reject on a conversation with a paused run → resumes that runId (reject)", async () => {
+    store.getOrCreate("build-run-7", { owner: "cliftonc", repo: "lastlight", issue: 7, branch: "b", taskId: "t" });
+    store.setConversationKey("build-run-7", convKey);
+    store.setPending("build-run-7", "post_architect");
+
+    const resumeFake = vi.fn();
+    await handleDelivery(comment("@last-light reject not yet"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: dispatchWithGateLookup(resumeFake),
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(resumeFake).toHaveBeenCalledWith("build-run-7", "reject");
+  });
+
+  it("@last-light approve with NO paused run on the conversation → clean no-op (no resume)", async () => {
+    // A run exists but is NOT paused on this conversation.
+    const resumeFake = vi.fn();
+    const res = await handleDelivery(comment("@last-light approve"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); } },
+      dispatch: dispatchWithGateLookup(resumeFake),
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+    });
+    expect(res.status).toBe("resume"); // the route decision is resume…
+    expect(resumeFake).not.toHaveBeenCalled(); // …but nothing to resolve → no-op
   });
 });

@@ -153,6 +153,11 @@ export async function runExplore(
     if (input.resumedGate !== gate) {
       if (run.pendingGate !== gate) {
         store.setSocraticIter(id, round);
+        // Record the channel conversation key so a channel reply on this thread
+        // resolves THIS run via findPausedRunByConversation (Phase 6). When the run
+        // was triggered from a channel, `triggerId` IS the conversation key (the
+        // channels pass `triggerId: ev.conversationKey`); fall back to it.
+        store.setConversationKey(id, input.conversationKey ?? run.triggerId);
         store.setPending(id, gate);
         const posted = await deps.postQuestion(ctx, run, round, questionText);
         if (posted?.commentId !== undefined) {
