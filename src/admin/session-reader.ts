@@ -314,6 +314,140 @@ export function toTranscriptMessages(events: RawStreamEvent[]): TranscriptMessag
   return out;
 }
 
+// ── Full-stream drain + operation filtering ───────────────────────────────────
+//
+// `EventStreamStore.readEvents` caps each read at `DEFAULT_READ_LIMIT` (100)
+// events (`MAX_READ_LIMIT` = 1000). A single `readTranscript` call therefore
+// returns only the FIRST page — for a multi-thousand-event run that's a handful
+// of transcript rows, which is why the dashboard appeared to show an almost-empty
+// log. `readFullTranscript` pages through to the end so the transcript is
+// complete. The largest page size (1000) is requested to minimise round-trips.
+
+/** Max events per `readEvents` page (Flue's `MAX_READ_LIMIT`). */
+export const STREAM_PAGE_LIMIT = 1000;
+
+/** A reader surface exposing just the paged transcript read (the drain needs). */
+export type TranscriptReader = Pick<SessionReader, 'readTranscript'>;
+
+/**
+ * Drain a session's transcript to the end, concatenating every page. Loops
+ * `readTranscript` from `offset` (default the stream start) until the read
+ * reports `upToDate` (or stops making progress / yields an empty page). The
+ * per-page safety cap bounds a pathological stream; in practice a run is a few
+ * pages. Returns the merged events plus the final resume cursor.
+ */
+export async function readFullTranscript(
+  reader: TranscriptReader,
+  id: string,
+  opts?: { kind?: 'run' | 'agent'; agentName?: string },
+): Promise<{ events: RawStreamEvent[]; nextOffset: string }> {
+  const events: RawStreamEvent[] = [];
+  let offset = '-1';
+  let nextOffset = offset;
+  // 10_000 pages × 1000 events = 10M-event ceiling — far past any real run.
+  for (let page = 0; page < 10_000; page++) {
+    const res = await reader.readTranscript(id, {
+      offset,
+      limit: STREAM_PAGE_LIMIT,
+      kind: opts?.kind,
+      agentName: opts?.agentName,
+    });
+    events.push(...res.events);
+    nextOffset = res.nextOffset;
+    // Stop on: caught up, no progress (cursor unmoved), or an empty page.
+    if (res.upToDate || res.events.length === 0 || res.nextOffset === offset) break;
+    offset = res.nextOffset;
+  }
+  return { events, nextOffset };
+}
+
+/** The operationId a decorated event belongs to (`undefined` for run-level events). */
+export function operationIdOf(ev: RawStreamEvent): string | undefined {
+  const op = (ev.data as { operationId?: unknown } | null)?.operationId;
+  return typeof op === 'string' ? op : undefined;
+}
+
+/** Keep only the events belonging to one operation (a derived phase). */
+export function filterEventsByOperation(
+  events: RawStreamEvent[],
+  operationId: string,
+): RawStreamEvent[] {
+  return events.filter((ev) => operationIdOf(ev) === operationId);
+}
+
+// ── Phase derivation (run history → pipeline) ─────────────────────────────────
+//
+// Flue carries NO declarative phases (workflows are plain `run()` modules). But a
+// run's durable event stream IS segmented: each phase that runs an agent opens a
+// NAMED harness session (`harness.session('architect')`) which surfaces as one
+// `operation` (a stable `operationId`) whose `agent_start.session` is the phase
+// name. Single-agent workflows (pr-review, …) run as a single `"default"`
+// operation. So we reconstruct the pipeline by grouping the run stream's events
+// by `operationId`, in first-seen order — no per-phase instrumentation needed.
+
+/** One derived phase: an operation's slice of a run's event stream. */
+export interface RunPhase {
+  /** The Flue operationId — the stable key to filter this phase's transcript. */
+  operationId: string;
+  /** Phase name = the harness session name (`architect`/…); `default` when unnamed. */
+  name: string;
+  /** Position in the run (0-based, declaration/execution order). */
+  index: number;
+  /** Conversation messages produced in this phase. */
+  messageCount: number;
+  /** Tool calls executed in this phase. */
+  toolCount: number;
+  /** True if this phase's agent ended in error. */
+  isError: boolean;
+  /** Phase start (first event timestamp), ISO. */
+  startedAt?: string;
+  /** Phase end (`agent_end`/last event timestamp), ISO. */
+  endedAt?: string;
+}
+
+/**
+ * Derive the ordered phase list for a run from its full event stream. PURE:
+ * events in, `RunPhase[]` out. Events with no `operationId` (run_start/run_end)
+ * are run-level and don't form phases.
+ */
+export function derivePhases(events: RawStreamEvent[]): RunPhase[] {
+  const order: string[] = [];
+  const acc = new Map<string, RunPhase>();
+  for (const ev of events) {
+    const opId = operationIdOf(ev);
+    if (!opId) continue;
+    const data = (ev.data ?? {}) as FlueStreamEvent;
+    const type = typeof data.type === 'string' ? data.type : '';
+    const ts = typeof data.timestamp === 'string' ? data.timestamp : undefined;
+    let phase = acc.get(opId);
+    if (!phase) {
+      phase = {
+        operationId: opId,
+        name: 'default',
+        index: order.length,
+        messageCount: 0,
+        toolCount: 0,
+        isError: false,
+        startedAt: ts,
+      };
+      acc.set(opId, phase);
+      order.push(opId);
+    }
+    if (ts) phase.endedAt = ts;
+    // The session name (phase label) is authoritative on agent_start.
+    if (type === 'agent_start') {
+      const sess = (data as { session?: unknown }).session;
+      if (typeof sess === 'string' && sess) phase.name = sess;
+    }
+    if (type === 'agent_end' && (data as { isError?: unknown }).isError) {
+      phase.isError = true;
+    }
+    if (type === 'message_end') phase.messageCount += 1;
+    if (type === 'tool') phase.toolCount += 1;
+  }
+  return order.map((opId) => acc.get(opId)!);
+}
+
 function serializeError(error: unknown): string {
   if (error == null) return 'run errored';
   if (typeof error === 'string') return error;

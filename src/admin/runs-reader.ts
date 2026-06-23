@@ -156,3 +156,132 @@ export function toAgentSummary(a: AgentManifestEntry): AgentSummary {
     created: a.created,
   };
 }
+
+// ── Run executions + cancel seam (per-phase ledger + app-record cancel) ───────
+//
+// Two MORE app-owned admin concerns hang off a workflow run, kept on a SEPARATE
+// injectable seam (`RunActionsReader`) so the existing `RunsReader` pass-through
+// (the inline `{ listRuns, getRun, listAgents }` in app.ts) stays a clean mirror
+// of the three Flue free functions and doesn't gain required methods:
+//
+//   1. `listRunExecutions(runId)` → the per-phase cost/token ledger for a run,
+//      backed by the app-owned `executions` table (src/stats-store.ts; Flue's
+//      RunRecord carries NO per-phase breakdown). Mapped to the dashboard's
+//      `WorkflowRunExecution[]` (dashboard/src/api.ts) for the pipeline-detail
+//      view. Empty / unknown run → `[]`.
+//   2. `cancelRun(runId)` → mark the APP build-run record cancelled. Flue does
+//      NOT expose a force-cancel of an in-flight Node workflow (flue-reference §0),
+//      and there is NO sandbox/container layer on the flue node target to kill,
+//      so this is an HONEST app-record cancel: it flips the build-run-store row to
+//      a terminal state so the resume/boot-recovery path won't re-invoke it. An
+//      in-flight phase already prompting an agent runs to its natural end — see
+//      the NOTES in the wiring delta. Returns whether a record was flipped.
+//
+// Both are PURE-mappable and behind a seam → unit-testable offline with fakes
+// (no stats-store on disk, no build-run-store, no live runtime).
+
+import { StatsStore, type ExecutionRow } from '../stats-store.ts';
+import { BuildRunStore } from '../build-run-store.ts';
+
+/**
+ * A per-phase execution row in the dashboard's `WorkflowRunExecution` shape
+ * (dashboard/src/api.ts). `id`/`skill`/`phase`/`startedAt` plus the cost/token
+ * metrics are REAL (from the app `executions` table); the fields the flue table
+ * does not carry (`sessionId`/`success`/`error`/`finishedAt`/`durationMs`/
+ * `turns`/cache tokens/`apiDurationMs`/`stopReason`/`extensions`/`skills`) are
+ * omitted (honest undefined), never fabricated.
+ */
+export interface RunExecution {
+  id: string;
+  skill: string;
+  phase: string;
+  startedAt: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
+/**
+ * Map one app `ExecutionRow` → the dashboard `WorkflowRunExecution`-compatible
+ * row. `skill` mirrors the reference's `<workflowName>:<phaseName>` key; `phase`
+ * is the bare phase name. `id` is synthesised from runId + phase + index because
+ * the blob-free `ExecutionRow` carries no stable per-row id of its own. Pure.
+ */
+export function toRunExecution(row: ExecutionRow, index: number): RunExecution {
+  const workflow = row.workflow || '';
+  const phase = row.phase || '';
+  return {
+    id: `${row.runId}:${phase || workflow}:${index}`,
+    skill: workflow ? `${workflow}:${phase}` : phase,
+    phase,
+    startedAt: row.createdAt ?? '',
+    costUsd: row.costTotal,
+    inputTokens: row.inputTokens,
+    outputTokens: row.outputTokens,
+  };
+}
+
+/**
+ * The injectable seam for the run-scoped executions list + cancel action.
+ * Modeled on `StatsReader`: the default opens the on-disk stores per call; tests
+ * inject a fake and run fully offline.
+ */
+export interface RunActionsReader {
+  /** Per-phase execution ledger for an app run, oldest-first. Empty → []. */
+  listRunExecutions(runId: string): RunExecution[];
+  /**
+   * Mark the app build-run record cancelled (honest app-record cancel — see the
+   * seam doc above). Returns true when a record was flipped, false when no such
+   * run exists in the app store.
+   */
+  cancelRun(runId: string): boolean;
+}
+
+const defaultStatsStorePath = () =>
+  process.env.LASTLIGHT_STATS_STORE ?? './.data/stats-store.db';
+const defaultBuildRunStorePath = () =>
+  process.env.LASTLIGHT_BUILD_RUNSTORE ?? './.data/build-run-store.db';
+
+/**
+ * The production run-actions reader. `listRunExecutions` opens the on-disk
+ * stats-store (cheap sqlite; CREATE IF NOT EXISTS → an empty/missing store yields
+ * `[]`, never fabricated rows) and maps its rows to the dashboard shape.
+ * `cancelRun` opens the build-run-store and flips the run's record to a terminal
+ * 'failed' state with a cancellation reason (the store has no separate
+ * 'cancelled' status — see NOTES in the wiring delta); it is a no-op returning
+ * false when the id is unknown. Each call opens + closes its own handle.
+ */
+export function createDefaultRunActionsReader(
+  opts: { statsStorePath?: string; buildRunStorePath?: string } = {},
+): RunActionsReader {
+  const statsPath = opts.statsStorePath ?? defaultStatsStorePath();
+  const buildPath = opts.buildRunStorePath ?? defaultBuildRunStorePath();
+  return {
+    listRunExecutions(runId) {
+      // Lazy import keeps the seam module free of a hard sqlite dep at import.
+      const { StatsStore } = require('../stats-store.ts') as typeof import('../stats-store.ts');
+      const store = new StatsStore(statsPath);
+      try {
+        return store.executionsForRun(runId).map(toRunExecution);
+      } finally {
+        store.close();
+      }
+    },
+    cancelRun(runId) {
+      const { BuildRunStore } = require('../build-run-store.ts') as typeof import('../build-run-store.ts');
+      const store = new BuildRunStore(buildPath);
+      try {
+        const run = store.get(runId);
+        if (!run) return false;
+        // No 'cancelled' status in the build-run-store vocabulary; the terminal
+        // 'failed' + a cancellation reason is the honest stop that the resume /
+        // boot-recovery path will not re-invoke. Idempotent on an already-terminal run.
+        store.fail(runId, 'cancelled via admin dashboard');
+        return true;
+      } finally {
+        store.close();
+      }
+    },
+  };
+}
+

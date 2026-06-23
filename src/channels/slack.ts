@@ -108,7 +108,7 @@ const dedupe = new SlackEventDedupe();
 function defaultPendingReplyGate(storePath?: string) {
   return async (ev: LastLightEvent): Promise<PendingReplyGate | null> => {
     const store = new ExploreRunStore(
-      storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db",
+      storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./.data/explore-run-store.db",
     );
     try {
       // Resolve the paused explore reply-gate on this thread by the channel
@@ -134,7 +134,7 @@ function defaultPendingReplyGate(storePath?: string) {
 function defaultGateLookup(storePath?: string) {
   return async (conversationKey: string): Promise<string | null> => {
     const store = new BuildRunStore(
-      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./data/build-run-store.db",
+      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./.data/build-run-store.db",
     );
     try {
       return store.findPausedRunByConversation(conversationKey) ?? null;

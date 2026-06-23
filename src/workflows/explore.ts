@@ -51,7 +51,7 @@ export type { ExploreInput, ExploreResult } from "../agent-lib/explore-phases.ts
 
 /** Read the run-store path lazily so each process (+ test) can point at its own db. */
 const storePath = () =>
-  process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db";
+  process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./.data/explore-run-store.db";
 
 /** Derive the seed identity from the workflow input. */
 function seedFrom(input: ExploreInput) {

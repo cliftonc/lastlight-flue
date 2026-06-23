@@ -38,7 +38,7 @@ export interface ThreadRecorder {
 }
 
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_THREADS_STORE ?? './data/threads-store.db';
+  process.env.LASTLIGHT_THREADS_STORE ?? './.data/threads-store.db';
 
 // The active recorder. `undefined` = not yet resolved; `null` = explicitly off
 // (test-inert). A test injects a fake via setThreadRecorder; production resolves

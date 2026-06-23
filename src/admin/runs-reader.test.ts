@@ -9,7 +9,10 @@ import {
   toRunSummary,
   toRunDetail,
   toAgentSummary,
+  toRunExecution,
+  type RunActionsReader,
 } from './runs-reader.ts';
+import type { ExecutionRow } from '../stats-store.ts';
 
 // Phase 2 · slice 2 — pure unit tests for the Flue-shape → dashboard-shape
 // adapter. No runtime, no HTTP: just sample Flue records in, dashboard shapes
@@ -134,5 +137,89 @@ describe('toAgentSummary (AgentManifestEntry)', () => {
       http: false,
       created: true,
     });
+  });
+});
+
+describe('toRunExecution (ExecutionRow → WorkflowRunExecution row)', () => {
+  const row: ExecutionRow = {
+    runId: 'run_01H',
+    workflow: 'build',
+    phase: 'architect',
+    model: 'openai/gpt-5.1',
+    inputTokens: 1200,
+    outputTokens: 340,
+    totalTokens: 1540,
+    costTotal: 0.042,
+    createdAt: '2026-06-21T10:00:00.000Z',
+  };
+
+  it('maps skill to <workflow>:<phase> and exposes the bare phase', () => {
+    const e = toRunExecution(row, 0);
+    expect(e.skill).toBe('build:architect');
+    expect(e.phase).toBe('architect');
+  });
+
+  it('synthesises a stable id from runId + phase + index', () => {
+    expect(toRunExecution(row, 0).id).toBe('run_01H:architect:0');
+    expect(toRunExecution(row, 2).id).toBe('run_01H:architect:2');
+  });
+
+  it('carries the real cost/token metrics and startedAt', () => {
+    const e = toRunExecution(row, 0);
+    expect(e.costUsd).toBe(0.042);
+    expect(e.inputTokens).toBe(1200);
+    expect(e.outputTokens).toBe(340);
+    expect(e.startedAt).toBe('2026-06-21T10:00:00.000Z');
+  });
+
+  it('does NOT fabricate fields the flue table lacks (no success/error/sessionId)', () => {
+    const e = toRunExecution(row, 0) as unknown as Record<string, unknown>;
+    expect('success' in e).toBe(false);
+    expect('error' in e).toBe(false);
+    expect('sessionId' in e).toBe(false);
+    expect('durationMs' in e).toBe(false);
+  });
+
+  it('falls back to the bare phase as skill when workflow is empty', () => {
+    const e = toRunExecution({ ...row, workflow: '' }, 0);
+    expect(e.skill).toBe('architect');
+  });
+});
+
+describe('RunActionsReader (seam contract — fake)', () => {
+  it('lists executions and cancels via the injected fake', () => {
+    const cancelled: string[] = [];
+    const fake: RunActionsReader = {
+      listRunExecutions: (id) =>
+        id === 'run_01H'
+          ? [
+              toRunExecution(
+                {
+                  runId: 'run_01H',
+                  workflow: 'build',
+                  phase: 'architect',
+                  model: '',
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  totalTokens: 0,
+                  costTotal: 0,
+                  createdAt: '2026-06-21T10:00:00.000Z',
+                },
+                0,
+              ),
+            ]
+          : [],
+      cancelRun: (id) => {
+        if (id !== 'run_01H') return false;
+        cancelled.push(id);
+        return true;
+      },
+    };
+
+    expect(fake.listRunExecutions('run_01H')).toHaveLength(1);
+    expect(fake.listRunExecutions('missing')).toEqual([]);
+    expect(fake.cancelRun('run_01H')).toBe(true);
+    expect(fake.cancelRun('missing')).toBe(false);
+    expect(cancelled).toEqual(['run_01H']);
   });
 });

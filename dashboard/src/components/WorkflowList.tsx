@@ -1,0 +1,592 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import clsx from "clsx";
+import { DocumentMagnifyingGlassIcon } from "@heroicons/react/24/outline";
+import {
+  api,
+  type WorkflowRun,
+  type WorkflowApproval,
+  type RunPhase,
+} from "../api";
+import { WorkflowPipeline } from "./WorkflowPipeline";
+import { ApprovalBanner } from "./ApprovalBanner";
+import { RunPhaseDetail } from "./PhaseDetailPanel";
+import { MessageFeed, type MessageOrder } from "./MessageFeed";
+import {
+  useUrlState,
+  nullableStringParser,
+  nullableStringSerializer,
+} from "../hooks/useUrlState";
+
+function timeAgo(iso: string): string {
+  const secs = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
+}
+
+function elapsed(run: WorkflowRun): string {
+  const end = run.finishedAt ?? run.updatedAt;
+  const secs = Math.floor((new Date(end).getTime() - new Date(run.startedAt).getTime()) / 1000);
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m${s}s`;
+}
+
+function StatusBadge({ status }: { status: WorkflowRun["status"] }) {
+  const cls = clsx("badge badge-xs font-mono", {
+    "badge-info": status === "running",
+    "badge-warning": status === "paused",
+    "badge-success": status === "succeeded",
+    "badge-error": status === "failed",
+    "badge-ghost": status === "cancelled",
+  });
+  return <span className={cls}>{status}</span>;
+}
+
+interface DetailPanelProps {
+  run: WorkflowRun;
+  approvals: WorkflowApproval[];
+  onCancel: (id: string) => void;
+  onApprovalResponded: () => void;
+  onOpenDefinition?: (name: string) => void;
+}
+
+// ── Resizable pipeline + detail panels ──────────────────────────────────
+
+interface ResizablePipelineProps {
+  run: WorkflowRun;
+  phases: RunPhase[];
+  phasesError: string | null;
+  /** Selected phase operationId (URL-persisted). */
+  selectedPhase: string | null;
+  onPhaseClick: (operationId: string | null) => void;
+  selectedRunPhase: RunPhase | null;
+  feedOrder: MessageOrder;
+  onFeedOrderChange: (o: MessageOrder) => void;
+}
+
+/**
+ * Renders the pipeline visualization and the detail panels below it with a
+ * draggable divider. The pipeline section is capped at 50% of the available
+ * height and can be resized down further by dragging the divider bar.
+ */
+function ResizablePipeline({
+  run,
+  phases,
+  phasesError,
+  selectedPhase,
+  onPhaseClick,
+  selectedRunPhase,
+  feedOrder,
+  onFeedOrderChange,
+}: ResizablePipelineProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [pipelineHeight, setPipelineHeight] = useState<number | null>(null);
+  const dragging = useRef(false);
+  const startY = useRef(0);
+  const startH = useRef(0);
+
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragging.current = true;
+    startY.current = e.clientY;
+    startH.current = pipelineHeight ?? containerRef.current?.querySelector("[data-pipeline]")?.clientHeight ?? 180;
+
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging.current || !containerRef.current) return;
+      const containerH = containerRef.current.clientHeight;
+      const maxH = Math.floor(containerH * 0.7);
+      const minH = 80;
+      const delta = ev.clientY - startY.current;
+      setPipelineHeight(Math.max(minH, Math.min(maxH, startH.current + delta)));
+    };
+    const onUp = () => {
+      dragging.current = false;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [pipelineHeight]);
+
+  return (
+    <div ref={containerRef} className="flex flex-col flex-1 min-h-0">
+      {/* Pipeline section — capped at 50% by default */}
+      <div
+        data-pipeline
+        className="shrink-0 overflow-auto"
+        style={{ maxHeight: pipelineHeight ?? "50%", height: pipelineHeight ?? undefined }}
+      >
+        <div className="text-2xs font-semibold uppercase tracking-wider text-base-content/40 mb-2">
+          Pipeline
+        </div>
+        {phasesError ? (
+          <div className="p-4 text-sm text-error border border-error/40 bg-error/5 rounded">
+            {phasesError}
+          </div>
+        ) : (
+          <WorkflowPipeline
+            run={run}
+            phases={phases}
+            height={180}
+            selectedPhase={selectedPhase}
+            onPhaseClick={onPhaseClick}
+          />
+        )}
+      </div>
+
+      {/* Draggable divider */}
+      <div
+        className="shrink-0 flex items-center justify-center cursor-row-resize group py-0.5"
+        onMouseDown={onDragStart}
+      >
+        <div className="w-12 h-1 rounded-full bg-base-300 group-hover:bg-primary/50 transition-colors" />
+      </div>
+
+      {/* Detail panels */}
+      {selectedPhase && selectedRunPhase ? (
+        <div className="flex flex-1 gap-4 min-h-0 border-t border-base-300 pt-3">
+          <div className="w-80 shrink-0 overflow-y-auto border border-base-300/60 rounded bg-base-200/30">
+            <RunPhaseDetail phase={selectedRunPhase} run={run} />
+          </div>
+          <div className="flex-1 overflow-hidden flex flex-col border border-base-300/60 rounded bg-base-100">
+            {/* One stream per run in Flue — the phase's logs are the run stream
+                filtered to this operationId. */}
+            <MessageFeed
+              key={selectedRunPhase.operationId}
+              sessionId={run.id}
+              operation={selectedRunPhase.operationId}
+              order={feedOrder}
+              onOrderChange={onFeedOrderChange}
+              searchQuery=""
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 flex items-center justify-center text-base-content/30 text-xs border-t border-base-300 pt-3">
+          click a phase above to inspect it
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Detail panel ────────────────────────────────────────────────────────
+
+function DetailPanel({ run, approvals, onCancel, onApprovalResponded, onOpenDefinition }: DetailPanelProps) {
+  const runApprovals = approvals.filter((a) => a.workflowRunId === run.id);
+  const canCancel = run.status === "running" || run.status === "paused";
+
+  const [phases, setPhases] = useState<RunPhase[]>([]);
+  const [phasesError, setPhasesError] = useState<string | null>(null);
+  // Persisted in the URL so a deep link to ?run=…&phase=… reopens the same
+  // split-view the user shared. The value is the phase's operationId. Cleared
+  // when switching workflow runs (a previous run's operationId is meaningless).
+  const [selectedPhase, setSelectedPhase] = useUrlState<string | null>(
+    "phase",
+    null,
+    nullableStringParser,
+    nullableStringSerializer,
+  );
+
+  // Local state for the embedded MessageFeed (each phase view is its own
+  // little session viewer — order/search persist across phase clicks but
+  // reset when the workflow run changes).
+  const [feedOrder, setFeedOrder] = useState<MessageOrder>("newest");
+
+  // Derive the run's phases from its event stream, then poll while the run is
+  // still active so a live run's phases appear as each operation begins. Stops
+  // polling once the run reaches a terminal state to avoid wasted requests.
+  useEffect(() => {
+    let cancelled = false;
+    const fetchOnce = () => {
+      api
+        .runPhases(run.id)
+        .then((res) => {
+          if (!cancelled) {
+            setPhases(res.phases);
+            setPhasesError(null);
+          }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) {
+            const msg = err instanceof Error ? err.message : String(err);
+            setPhasesError(`Failed to load phases: ${msg}`);
+          }
+        });
+    };
+    fetchOnce();
+    const isTerminal =
+      run.status === "succeeded" || run.status === "failed" || run.status === "cancelled";
+    const timer = isTerminal ? null : setInterval(fetchOnce, 3000);
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [run.id, run.status]);
+
+  // Reset selected phase when actually switching between two different
+  // workflow runs — but NOT on the very first mount, so a deep link like
+  // ?run=…&phase=… is honored on initial load.
+  const prevRunIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevRunIdRef.current && prevRunIdRef.current !== run.id) {
+      setSelectedPhase(null);
+    }
+    prevRunIdRef.current = run.id;
+  }, [run.id, setSelectedPhase]);
+
+  const selectedRunPhase = useMemo<RunPhase | null>(
+    () => (selectedPhase ? phases.find((p) => p.operationId === selectedPhase) ?? null : null),
+    [phases, selectedPhase],
+  );
+
+  return (
+    <div className="flex-1 overflow-hidden flex flex-col p-4 gap-4 min-h-0">
+      <div className="flex items-center gap-3 flex-wrap shrink-0">
+        <span className="font-semibold text-base-content">{run.workflowName}</span>
+        {onOpenDefinition && (
+          <button
+            className="btn btn-xs btn-ghost btn-square"
+            title="View workflow definition"
+            onClick={() => onOpenDefinition(run.workflowName)}
+          >
+            <DocumentMagnifyingGlassIcon className="w-4 h-4" />
+          </button>
+        )}
+        <StatusBadge status={run.status} />
+        {run.repo && (
+          <span className="text-xs text-base-content/50 font-mono">{run.repo}</span>
+        )}
+        {run.issueNumber && (
+          <span className="text-xs text-base-content/50 font-mono">#{run.issueNumber}</span>
+        )}
+        {canCancel && (
+          <button
+            className="btn btn-xs btn-error btn-outline ml-auto"
+            onClick={() => onCancel(run.id)}
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+
+      <div className="text-2xs text-base-content/40 font-mono flex gap-4 shrink-0">
+        <span>started {timeAgo(run.startedAt)} ago</span>
+        <span>elapsed {elapsed(run)}</span>
+        {run.finishedAt && <span>finished {timeAgo(run.finishedAt)} ago</span>}
+      </div>
+
+      <ApprovalBanner approvals={runApprovals} onResponded={onApprovalResponded} />
+
+      <ResizablePipeline
+        run={run}
+        phases={phases}
+        phasesError={phasesError}
+        selectedPhase={selectedPhase}
+        onPhaseClick={setSelectedPhase}
+        selectedRunPhase={selectedRunPhase}
+        feedOrder={feedOrder}
+        onFeedOrderChange={setFeedOrder}
+      />
+    </div>
+  );
+}
+
+const WORKFLOW_PAGE_SIZE = 20;
+
+/**
+ * Map a header time-range key (`hour`, `day`, `week`, `all`, `live`) to an
+ * ISO `since` value the API can filter on. `all` and `live` return undefined
+ * — `live` is handled separately as a status filter, not a date filter.
+ */
+function timeRangeToSince(timeRange: string): string | undefined {
+  if (timeRange === "all" || timeRange === "live") return undefined;
+  const cutoffs: Record<string, number> = {
+    hour: 3600 * 1000,
+    day: 86400 * 1000,
+    week: 604800 * 1000,
+  };
+  const ms = cutoffs[timeRange];
+  if (!ms) return undefined;
+  return new Date(Date.now() - ms).toISOString();
+}
+
+interface WorkflowListProps {
+  /** Header date filter. */
+  timeRange: string;
+  /** Header free-text search — matches workflow name, repo, issue number. */
+  query: string;
+  /** Optional handler for the "View workflow definition" icon next to the title. */
+  onOpenDefinition?: (name: string) => void;
+}
+
+export function WorkflowList({ timeRange, query, onOpenDefinition }: WorkflowListProps) {
+  const [runs, setRuns] = useState<WorkflowRun[]>([]);
+  const [total, setTotal] = useState(0);
+  const [approvals, setApprovals] = useState<WorkflowApproval[]>([]);
+  const [selectedId, setSelectedId] = useUrlState<string | null>(
+    "run",
+    null,
+    nullableStringParser,
+    nullableStringSerializer,
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [limit, setLimit] = useState(WORKFLOW_PAGE_SIZE);
+  const [workflowFilter, setWorkflowFilter] = useUrlState<string | null>(
+    "workflow",
+    null,
+    nullableStringParser,
+    nullableStringSerializer,
+  );
+  const [availableWorkflows, setAvailableWorkflows] = useState<string[]>([]);
+
+  // Reset pagination whenever a filter changes — otherwise an inflated `limit`
+  // from a previous, larger result set would silently keep showing too many
+  // rows after the user narrows.
+  useEffect(() => {
+    setLimit(WORKFLOW_PAGE_SIZE);
+  }, [timeRange, workflowFilter]);
+
+  const load = useCallback(async () => {
+    try {
+      const since = timeRangeToSince(timeRange);
+      // "live" range maps to status=active (running+paused), no date filter.
+      const status = timeRange === "live" ? "active" : undefined;
+      const [runsData, approvalsData] = await Promise.all([
+        api.workflowRuns({
+          limit,
+          since,
+          status,
+          workflow: workflowFilter ?? undefined,
+        }),
+        api.approvals().catch(() => ({ approvals: [] as WorkflowApproval[] })),
+      ]);
+      setRuns(runsData.workflowRuns);
+      setTotal(runsData.total);
+      setApprovals(approvalsData.approvals);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load");
+    }
+  }, [limit, timeRange, workflowFilter]);
+
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 5000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  // Fetch the distinct workflow-name list once for the filter row.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .workflowNames()
+      .then((res) => {
+        if (!cancelled) setAvailableWorkflows(res.names);
+      })
+      .catch(() => {
+        if (!cancelled) setAvailableWorkflows([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Apply the header free-text search client-side. Backend pagination is by
+  // date and workflow name; the search box is just a quick local filter so
+  // the user doesn't have to wait for a server roundtrip on every keystroke.
+  const visibleRuns = useMemo(() => {
+    if (!query) return runs;
+    const q = query.toLowerCase();
+    return runs.filter((r) => {
+      return (
+        r.workflowName.toLowerCase().includes(q) ||
+        (r.repo ?? "").toLowerCase().includes(q) ||
+        String(r.issueNumber ?? "").includes(q) ||
+        r.triggerId.toLowerCase().includes(q)
+      );
+    });
+  }, [runs, query]);
+
+  // Auto-select the first run only when nothing is currently selected. We
+  // intentionally do NOT clear an existing selectedId just because it's not
+  // in the visible set — the user may have arrived via a shareable URL that
+  // points to a run outside the current pagination/filters.
+  useEffect(() => {
+    if (!selectedId && visibleRuns.length > 0) {
+      setSelectedId(visibleRuns[0]!.id);
+    }
+  }, [visibleRuns, selectedId, setSelectedId]);
+
+  // If selectedId points to a run that isn't in the loaded list (e.g. linked
+  // from outside or hidden behind pagination), fetch it directly so the
+  // detail panel still works.
+  const [standaloneRun, setStandaloneRun] = useState<WorkflowRun | null>(null);
+  useEffect(() => {
+    if (!selectedId) {
+      setStandaloneRun(null);
+      return;
+    }
+    if (visibleRuns.some((r) => r.id === selectedId)) {
+      setStandaloneRun(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .workflowRun(selectedId)
+      .then((res) => {
+        if (!cancelled) setStandaloneRun(res.workflowRun);
+      })
+      .catch(() => {
+        if (!cancelled) setStandaloneRun(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, visibleRuns]);
+
+  const handleCancel = async (id: string) => {
+    try {
+      await api.cancelWorkflowRun(id);
+      await load();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const selectedRun =
+    visibleRuns.find((r) => r.id === selectedId) ?? standaloneRun ?? null;
+  const hasMore = runs.length < total;
+
+  return (
+    <div className="flex flex-col flex-1 overflow-hidden">
+      {/* Filter row — workflow type chips, mirrors the session-type strip on
+          the sessions tab. */}
+      <div className="flex items-center gap-1 px-4 py-2 border-b border-base-300 bg-base-200/40 shrink-0 overflow-x-auto flex-nowrap">
+        <button
+          onClick={() => setWorkflowFilter(null)}
+          className={clsx(
+            "btn btn-xs h-7 min-h-0 font-medium shrink-0",
+            workflowFilter === null ? "btn-primary" : "btn-ghost text-base-content/60",
+          )}
+        >
+          all <span className="text-2xs opacity-60 ml-0.5">{total}</span>
+        </button>
+        {availableWorkflows.map((name) => (
+          <button
+            key={name}
+            onClick={() => setWorkflowFilter(name)}
+            className={clsx(
+              "btn btn-xs h-7 min-h-0 font-medium shrink-0 font-mono",
+              workflowFilter === name ? "btn-primary" : "btn-ghost text-base-content/60",
+            )}
+          >
+            <span className="text-2xs">{name}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* List panel */}
+        <aside className="w-80 shrink-0 border-r border-base-300 bg-base-200/40 overflow-y-auto flex flex-col">
+          {error && (
+            <div className="px-3 py-2 text-2xs text-error border-b border-base-300">{error}</div>
+          )}
+          <ul className="flex-1">
+            {visibleRuns.map((run) => {
+              const active = run.id === selectedId;
+              const canCancel = run.status === "running" || run.status === "paused";
+              const hasApprovals = approvals.some((a) => a.workflowRunId === run.id);
+              return (
+                <li key={run.id} className="border-b border-base-300/40">
+                  {/* Row uses role="button" instead of <button> so the
+                      embedded "cancel" action can be a real <button> without
+                      tripping React's no-nested-button DOM warning. */}
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSelectedId(run.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setSelectedId(run.id);
+                      }
+                    }}
+                    className={clsx(
+                      "w-full flex flex-col items-start gap-0.5 py-2 px-3 text-left transition-colors cursor-pointer",
+                      active
+                        ? "bg-primary/15 border-l-2 border-l-primary -ml-px pl-[10px]"
+                        : "hover:bg-base-300/40 border-l-2 border-l-transparent -ml-px pl-[10px]",
+                    )}
+                  >
+                    <div className="flex items-center gap-2 w-full text-2xs">
+                      <StatusBadge status={run.status} />
+                      {hasApprovals && (
+                        <span className="badge badge-warning badge-xs">approval</span>
+                      )}
+                      <span className="ml-auto text-base-content/40 font-mono">
+                        {timeAgo(run.startedAt)} ago
+                      </span>
+                    </div>
+                    <div className="text-sm truncate w-full text-base-content/90">
+                      {run.workflowName}
+                    </div>
+                    <div className="flex gap-2 text-2xs text-base-content/40 w-full font-mono">
+                      {run.repo && <span className="truncate">{run.repo}</span>}
+                      {run.issueNumber && <span>#{run.issueNumber}</span>}
+                      <span className="ml-auto">{run.currentPhase}</span>
+                    </div>
+                    {canCancel && (
+                      <button
+                        className="btn btn-2xs btn-error btn-outline mt-1 h-5 min-h-0 text-2xs"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleCancel(run.id);
+                        }}
+                      >
+                        cancel
+                      </button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+            {visibleRuns.length === 0 && !error && (
+              <li className="p-6 text-center text-base-content/40 text-xs">no workflow runs</li>
+            )}
+          </ul>
+          <div className="sticky bottom-0 border-t border-base-300 bg-base-200 p-2 flex items-center justify-between text-2xs">
+            <span className="text-base-content/50 font-mono">
+              {visibleRuns.length} / {total}
+            </span>
+            <button
+              className="btn btn-xs btn-ghost h-6 min-h-0"
+              onClick={() => setLimit((l) => l + WORKFLOW_PAGE_SIZE)}
+              disabled={!hasMore}
+            >
+              load more
+            </button>
+          </div>
+        </aside>
+
+        {/* Detail panel */}
+        {selectedRun ? (
+          <DetailPanel
+            run={selectedRun}
+            approvals={approvals}
+            onCancel={handleCancel}
+            onApprovalResponded={load}
+            onOpenDefinition={onOpenDefinition}
+          />
+        ) : (
+          <div className="flex-1 flex items-center justify-center text-base-content/30 text-sm">
+            select a workflow run
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

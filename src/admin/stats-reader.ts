@@ -1,4 +1,10 @@
-import { StatsStore, type RollupRow, type StatsTotals } from '../stats-store.ts';
+import {
+  StatsStore,
+  type RollupRow,
+  type StatsTotals,
+  type StatBucket,
+  type ExecutionListRow,
+} from '../stats-store.ts';
 
 // ── Last Light on Flue · admin stats seam (Phase 7 · slice 2) ─────────────────
 //
@@ -18,6 +24,12 @@ export interface StatsReader {
   totals(): StatsTotals;
   /** Count of executions recorded today (since UTC midnight). */
   todayCount(): number;
+  /** Per-day execution buckets for the last `days` days (UTC, inclusive). */
+  dailyStats(days: number): StatBucket[];
+  /** Per-hour execution buckets for the rolling last `hours` hours (UTC). */
+  hourlyStats(hours: number): StatBucket[];
+  /** A page of raw execution rows (most-recent first) in the list shape. */
+  listExecutions(opts: { limit: number; offset: number }): ExecutionListRow[];
 }
 
 /** The `/admin/api/stats` response (dashboard + CLI shape). */
@@ -68,8 +80,62 @@ export function buildStatsResponse(reader: StatsReader): StatsResponse {
   };
 }
 
+/** The `/admin/api/stats/daily` response (`{ daily }`, dashboard shape). */
+export interface DailyStatsResponse {
+  daily: StatBucket[];
+}
+
+/** The `/admin/api/stats/hourly` response (`{ hourly }`, dashboard shape). */
+export interface HourlyStatsResponse {
+  hourly: StatBucket[];
+}
+
+/** The `/admin/api/executions` response (`{ executions }`, dashboard shape). */
+export interface ExecutionsResponse {
+  executions: ExecutionListRow[];
+}
+
+/**
+ * Clamp the `days` query param to the reference's [1, 90] window (default 30).
+ * Mirrors `routes.ts`: `Math.min(Math.max(1, parseInt(days) || 30), 90)`.
+ */
+export function clampDays(daysParam: string | undefined): number {
+  return Math.min(Math.max(1, parseInt(daysParam ?? '30', 10) || 30), 90);
+}
+
+/**
+ * Clamp the `hours` query param to the reference's [1, 168] window (default 24).
+ * Mirrors `routes.ts`: `Math.min(Math.max(1, parseInt(hours) || 24), 168)`.
+ */
+export function clampHours(hoursParam: string | undefined): number {
+  return Math.min(Math.max(1, parseInt(hoursParam ?? '24', 10) || 24), 168);
+}
+
+/** Build the `{ daily }` response for the last `days` days (pure). */
+export function buildDailyStatsResponse(reader: StatsReader, days: number): DailyStatsResponse {
+  return { daily: reader.dailyStats(days) };
+}
+
+/** Build the `{ hourly }` response for the rolling last `hours` hours (pure). */
+export function buildHourlyStatsResponse(reader: StatsReader, hours: number): HourlyStatsResponse {
+  return { hourly: reader.hourlyStats(hours) };
+}
+
+/**
+ * Build the `{ executions }` page response (pure). Mirrors the reference route's
+ * param handling: `limit` defaults to 100, `offset` to 0 (`Number(q ?? d)`).
+ */
+export function buildExecutionsResponse(
+  reader: StatsReader,
+  opts: { limit?: string; offset?: string } = {},
+): ExecutionsResponse {
+  const limit = Number(opts.limit ?? 100);
+  const offset = Number(opts.offset ?? 0);
+  return { executions: reader.listExecutions({ limit, offset }) };
+}
+
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_STATS_STORE ?? './data/stats-store.db';
+  process.env.LASTLIGHT_STATS_STORE ?? './.data/stats-store.db';
 
 /**
  * The production stats reader: opens the on-disk stats-store per call (cheap
@@ -95,5 +161,9 @@ export function createDefaultStatsReader(
     byRun: () => withStore((s) => s.statsByRun()),
     totals: () => withStore((s) => s.totals()),
     todayCount: () => withStore((s) => s.countSince(todayMidnightIso())),
+    dailyStats: (days) => withStore((s) => s.dailyStats(days)),
+    hourlyStats: (hours) => withStore((s) => s.hourlyStats(hours)),
+    listExecutions: ({ limit, offset }) =>
+      withStore((s) => s.listExecutions(limit, offset)),
   };
 }

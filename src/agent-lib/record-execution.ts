@@ -46,7 +46,7 @@ export interface PromptUsageResponse {
 }
 
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_STATS_STORE ?? './data/stats-store.db';
+  process.env.LASTLIGHT_STATS_STORE ?? './.data/stats-store.db';
 
 // The active recorder. `undefined` = not yet resolved; `null` = explicitly off
 // (test-inert). A test injects a fake via setExecutionRecorder; production

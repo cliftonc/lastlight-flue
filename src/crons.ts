@@ -302,3 +302,14 @@ export function stopCrons(): void {
     console.error('[cron] failed to stop crons (non-fatal):', err);
   }
 }
+
+/**
+ * The live process-wide cron registry `startCrons()` owns, or `undefined` before
+ * it has run (or when skipped under VITEST / LASTLIGHT_SKIP_CRONS). The admin
+ * crons-reader consults this for `registered`/`nextRun` instead of constructing
+ * its own registry — a second registry would collide on croner's global job
+ * names and make the real scheduler fail to start.
+ */
+export function getCronRegistry(): CronRegistry | undefined {
+  return registry;
+}

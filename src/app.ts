@@ -6,6 +6,8 @@ import {
   toAgentSummary,
   toRunDetail,
   toRunSummary,
+  createDefaultRunActionsReader,
+  type RunActionsReader,
   type RunsReader,
 } from './admin/runs-reader.ts';
 import {
@@ -14,7 +16,7 @@ import {
   requireOperator,
   type OperatorAuthConfig,
 } from './admin/auth.ts';
-import { mountDashboard } from './admin/dashboard.ts';
+import { mountDashboard, DASHBOARD_MOUNT } from './admin/dashboard.ts';
 import {
   createDefaultApprovalsBackend,
   type ApprovalsBackend,
@@ -22,13 +24,53 @@ import {
 import {
   createDefaultSessionReader,
   toTranscriptMessages,
+  readFullTranscript,
+  filterEventsByOperation,
+  derivePhases,
   type SessionReader,
 } from './admin/session-reader.ts';
 import {
   buildStatsResponse,
+  buildDailyStatsResponse,
+  buildHourlyStatsResponse,
+  buildExecutionsResponse,
+  clampDays,
+  clampHours,
   createDefaultStatsReader,
   type StatsReader,
 } from './admin/stats-reader.ts';
+import {
+  createDefaultChatSessionReader,
+  type ChatSessionReader,
+} from './admin/chat-session-reader.ts';
+import {
+  mountSessionStreamRoutes,
+  mountChatSessionJsonRoutes,
+} from './admin/session-stream.ts';
+import {
+  buildWorkflowsList,
+  createDefaultWorkflowsReader,
+  toWorkflowDefinition,
+  toWorkflowFullDefinition,
+  type WorkflowsReader,
+} from './admin/workflows-reader.ts';
+import {
+  createDefaultCronsReader,
+  CronNotFoundError,
+  InvalidCronScheduleError,
+  type CronsReader,
+} from './admin/crons-reader.ts';
+import {
+  createDefaultConfigReader,
+  type ConfigReader,
+} from './admin/config-reader.ts';
+import {
+  mountOAuthRoutes,
+  oauthConfigFromEnv,
+  slackOAuthEnabled,
+  githubOAuthEnabled,
+  type OAuthConfig,
+} from './admin/oauth.ts';
 import { ThreadsStore } from './threads-store.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
@@ -100,13 +142,14 @@ export function healthBody(now: number = Date.now()): HealthBody {
  *  when an operator password is configured (auth is enforced); `slackOAuth` /
  *  `githubOAuth` reflect configured OAuth providers. OAuth is not ported until
  *  Phase 6, so they are `false` (TODO below), never fabricated. */
-export function authRequiredBody(auth: OperatorAuthConfig) {
+export function authRequiredBody(auth: OperatorAuthConfig, oauth?: OAuthConfig) {
   return {
     required: Boolean(auth.password),
-    // TODO(phase-6/admin-oauth): source from configured Slack/GitHub OAuth
-    // providers once OAuth login is ported. Config does not model these yet.
-    slackOAuth: false,
-    githubOAuth: false,
+    // REAL now: a provider is reported enabled only when its full credential set
+    // is present (see oauth.ts). The dashboard shows the matching "Connect …"
+    // button only for enabled providers.
+    slackOAuth: oauth ? slackOAuthEnabled(oauth) : false,
+    githubOAuth: oauth ? githubOAuthEnabled(oauth) : false,
   };
 }
 
@@ -167,6 +210,48 @@ export interface CreateAppOptions {
    * (honest) — the default export wires the on-disk stats-store reader.
    */
   statsReader?: StatsReader;
+  /**
+   * The CHAT-session data layer backing `/admin/api/chat-sessions*` (Phase 7 · SSE).
+   * Lists chat threads (app-owned `messaging_threads`) blob-free and reads each
+   * transcript from the chat-agent event stream. Injected so the routes test
+   * OFFLINE with a fake. When omitted, the chat-session routes are not mounted —
+   * the default export wires the real ThreadsStore-backed reader.
+   */
+  chatSessionReader?: ChatSessionReader;
+  /**
+   * The workflows-browser data layer backing `/admin/api/workflows*` +
+   * `/admin/api/skills/:name`. Discovers workflows from `src/workflows/`, derives
+   * triggers from config routes + crons, and persists the per-workflow kill
+   * switch. Injected so the routes test OFFLINE with a fake. When omitted the
+   * routes 501 (honest) — the default export wires the real Flue-backed reader.
+   */
+  workflowsReader?: WorkflowsReader;
+  /**
+   * The crons data layer backing `/admin/api/crons*`. Joins the static cron defs
+   * + the live registry + an app-owned override store. Injected for offline
+   * tests; when omitted the routes 501 (honest) — the default export wires the
+   * real reader.
+   */
+  cronsReader?: CronsReader;
+  /**
+   * The config bundle data layer backing `GET /admin/api/config`. Returns flue's
+   * resolved, secret-redacted `{ default, overlay, merged, sources }` bundle. When
+   * omitted the route returns an empty honest bundle. Injected for offline tests.
+   */
+  configReader?: ConfigReader;
+  /**
+   * The run-actions seam backing `/admin/api/workflow-runs/:id/executions` (the
+   * per-phase ledger) and `/admin/api/workflow-runs/:id/cancel` (app-record
+   * cancel). Injected for offline tests; when omitted both routes 501 (honest).
+   */
+  runActionsReader?: RunActionsReader;
+  /**
+   * Slack/GitHub OAuth login config (the `/admin/api/oauth/*` flow + the
+   * `auth-required` provider flags). Defaults to `oauthConfigFromEnv()`. Each
+   * provider is enabled only when its full credential set is present; tests
+   * inject an explicit config to exercise enabled vs disabled without env.
+   */
+  oauthConfig?: OAuthConfig;
 }
 
 /**
@@ -179,9 +264,35 @@ export interface CreateAppOptions {
 export function createApp(opts: CreateAppOptions = {}): Hono {
   const app = new Hono();
   const authConfig = opts.authConfig ?? operatorAuthConfigFromEnv();
+  const oauthConfig = opts.oauthConfig ?? oauthConfigFromEnv();
+
+  // ── No browser caching of the admin API ──────────────────────────────────
+  // The dashboard polls LIVE data; a browser that caches an endpoint body shows
+  // stale results that survive a hard-refresh (during dev a cached 404/HTML from
+  // before a route existed is impossible to clear from the page). `no-store` on
+  // every `/admin/api/*` response forbids storing it. Registered FIRST so it
+  // wraps every admin route — the early health alias + oauth, the reader routes,
+  // and the SSE streams (which also carry their own `no-cache`). Set after
+  // `next()` so it lands on the handler's response.
+  app.use('/admin/api/*', async (c, next) => {
+    await next();
+    c.header('Cache-Control', 'no-store, must-revalidate');
+    c.header('Pragma', 'no-cache');
+  });
+
+  // ── Bare root → the admin dashboard ──────────────────────────────────────
+  // The SPA lives under `/admin/` (its Vite `base`); Flue claims no `/` route, so
+  // a visitor hitting the bare origin would otherwise 404. Redirect to the
+  // dashboard. Registered BEFORE `app.route('/', flue())` (added by the default
+  // export), so Hono's first-match-wins keeps this from being shadowed.
+  app.get('/', (c) => c.redirect(`${DASHBOARD_MOUNT}/`));
 
   // ── /health — app-owned, UNAUTHENTICATED (CLI `status` + dashboard poll) ──
   app.get('/health', (c) => c.json(healthBody()));
+  // `/admin/api/health` ALIAS — the dashboard's `api.health()` calls this. Mounted
+  // HERE (before the `/admin/api/*` operator-auth middleware at line ~223) so it
+  // stays UNAUTHENTICATED like `/health`: the dashboard polls it pre-login.
+  app.get('/admin/api/health', (c) => c.json(healthBody()));
 
   // ── /api/* — Last-Light-owned trigger surface (distinct from Flue's
   //    /agents, /workflows). Real handlers in the trigger-routes slice. ──────
@@ -225,11 +336,38 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
   // `auth-required` is unauthenticated by contract — reports REAL config now
   // (required = password set; OAuth flags false until Phase 6). Exempted by the
   // middleware above.
-  app.get('/admin/api/auth-required', (c) => c.json(authRequiredBody(authConfig)));
+  app.get('/admin/api/auth-required', (c) => c.json(authRequiredBody(authConfig, oauthConfig)));
 
   // `login` (password → signed token). Also exempted by the middleware so the
   // dashboard/CLI can obtain a token. Part of the same coherent auth unit.
   app.post('/admin/api/login', loginHandler(authConfig));
+
+  // ── OAuth login — Slack / GitHub "Sign in with…" (Phase 6 · admin OAuth) ──
+  // The authorize/callback routes ARE the login mechanism, so they're public
+  // (exempted in auth.ts `isPublicAuthPath`). Each provider's routes 404 with
+  // honest JSON when its credentials aren't configured. Issues the SAME signed
+  // bearer token as password login (createToken) on success.
+  mountOAuthRoutes(app, { secret: authConfig.secret, oauth: oauthConfig });
+
+  // ── Containers — honest EMPTY (no Docker/sandbox layer on the flue node) ──
+  // The dashboard's Containers tab calls these; the flue node target runs no
+  // containers, so they resolve to empty arrays rather than 404 (URLs match,
+  // never fabricated).
+  app.get('/admin/api/containers', (c) => c.json({ containers: [] }));
+  app.get('/admin/api/containers/stats', (c) => c.json({ stats: [] }));
+
+  // ── Config bundle — default / overlay / merged / sources (real provenance) ─
+  // Backed by the injected ConfigReader seam (flue's resolved, secret-redacted
+  // `{ default, overlay, merged, sources }` from src/config-resolve.ts). Without
+  // a reader the route returns an empty honest bundle (never fabricated).
+  const configReader = opts.configReader;
+  app.get('/admin/api/config', (c) =>
+    c.json(
+      configReader
+        ? configReader.bundle()
+        : { default: {}, overlay: null, merged: {}, sources: {} },
+    ),
+  );
 
   // ── Admin DATA reads — backed by the injected RunsReader seam ─────────────
   // Only mounted when a reader is provided (default export wires the real Flue
@@ -291,6 +429,31 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
     });
   }
 
+  // ── Run executions (per-phase ledger) + cancel (app-record) ───────────────
+  // Backed by the injected RunActionsReader seam: `executions` lists the
+  // per-phase cost/token ledger (app-owned `executions` table) for a run; `cancel`
+  // flips the app run-record to a terminal state (flue has no force-cancel — an
+  // in-flight phase runs to its natural end; this stops resume/boot-recovery).
+  // Without a reader both 501 (honest) — the default export wires the real one.
+  const runActionsReader = opts.runActionsReader;
+  if (runActionsReader) {
+    app.get('/admin/api/workflow-runs/:id/executions', (c) =>
+      c.json({ executions: runActionsReader.listRunExecutions(c.req.param('id') ?? '') }),
+    );
+    app.post('/admin/api/workflow-runs/:id/cancel', (c) => {
+      const id = c.req.param('id') ?? '';
+      runActionsReader.cancelRun(id); // honest app-record cancel; idempotent
+      return c.json({ cancelled: id });
+    });
+  } else {
+    app.get('/admin/api/workflow-runs/:id/executions', (c) =>
+      c.json({ error: 'not_implemented', route: '/admin/api/workflow-runs/:id/executions', slice: 'phase-7 (no runActionsReader wired)' }, 501),
+    );
+    app.post('/admin/api/workflow-runs/:id/cancel', (c) =>
+      c.json({ error: 'not_implemented', route: '/admin/api/workflow-runs/:id/cancel', slice: 'phase-7 (no runActionsReader wired)' }, 501),
+    );
+  }
+
   // ── Approvals — the durable build gate (Phase 4 · resume wiring) ──────────
   // Backed by the injected ApprovalsBackend seam (build run-store + resume).
   // Operator-auth gated by the `/admin/api/*` middleware above. Matches the CLI
@@ -338,6 +501,10 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
   // the default export wires the real Flue-backed reader.
   const sessionReader = opts.sessionReader;
   if (sessionReader) {
+    // SSE streams for the run/session surface. Registered FIRST so the literal
+    // `/admin/api/sessions/stream` is not shadowed by the `/sessions/:id` route
+    // below (Hono matches in registration order; `:id` would capture `stream`).
+    mountSessionStreamRoutes(app, sessionReader, '/admin/api/sessions', 'run');
     // Session list — blob-free (listRuns pointers; NO transcript read). Mirrors
     // the reference `{ sessions, liveCount }` shape; `liveCount` is 0 here
     // (container-liveness is a sandbox concern not modelled this slice).
@@ -363,7 +530,7 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
       }
       // Derive live counts from the transcript (the list path stays blob-free).
       const kind = c.req.query('kind') === 'agent' ? 'agent' : 'run';
-      const t = await sessionReader.readTranscript(id, { kind });
+      const t = await readFullTranscript(sessionReader, id, { kind });
       const messages = toTranscriptMessages(t.events);
       const toolCount = messages.reduce(
         (n, m) => n + (m.tool_calls?.length ?? 0),
@@ -398,11 +565,39 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
         return c.json({ source: 'none', messages: [], last_id: null });
       }
       const kind = c.req.query('kind') === 'agent' ? 'agent' : 'run';
-      const since = c.req.query('since') || undefined;
-      const t = await sessionReader.readTranscript(id, { kind, offset: since });
-      const messages = toTranscriptMessages(t.events).map((m, i) => ({ id: i, ...m }));
+      const operation = c.req.query('operation') || undefined;
+      // Drain the whole stream (a single read caps at 100 events) so the
+      // catch-up transcript is complete, then optionally scope to one phase.
+      const t = await readFullTranscript(sessionReader, id, { kind });
+      const events = operation ? filterEventsByOperation(t.events, operation) : t.events;
+      const messages = toTranscriptMessages(events).map((m, i) => ({ id: i, ...m }));
       return c.json({ source: 'flue', messages, last_id: t.nextOffset });
     });
+
+    // Derived phase list for a workflow run — the run's single event stream
+    // segmented by operationId (one operation per agent-running phase; see
+    // session-reader `derivePhases`). Backs the run-detail pipeline + the
+    // Workflows-tab diagram (which derives from the latest run). 404 when the id
+    // is not a known run stream.
+    app.get('/admin/api/workflow-runs/:id/phases', async (c) => {
+      const id = c.req.param('id') ?? '';
+      if (!(await sessionReader.exists(id))) {
+        return c.json({ error: 'run not found' }, 404);
+      }
+      const t = await readFullTranscript(sessionReader, id, { kind: 'run' });
+      return c.json({ phases: derivePhases(t.events) });
+    });
+  }
+
+  // ── Chat sessions — the in-process chat skill's threads (Phase 7 · SSE) ────
+  // Same five-endpoint surface as /sessions, but the LIST comes from the
+  // app-owned messaging_threads (ThreadsStore) and every transcript reads the
+  // chat-agent stream. Operator-auth gated by the /admin/api/* middleware above.
+  // Stream routes mount FIRST so `/chat-sessions/stream` is not shadowed.
+  const chatSessionReader = opts.chatSessionReader;
+  if (chatSessionReader) {
+    mountSessionStreamRoutes(app, chatSessionReader, '/admin/api/chat-sessions', 'agent');
+    mountChatSessionJsonRoutes(app, chatSessionReader, '/admin/api/chat-sessions', 'agent');
   }
 
   // ── Stats — per-phase cost/token rollups (Phase 7 · slice 2) ──────────────
@@ -416,6 +611,20 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
   const statsReader = opts.statsReader;
   if (statsReader) {
     app.get('/admin/api/stats', (c) => c.json(buildStatsResponse(statsReader)));
+    app.get('/admin/api/stats/daily', (c) =>
+      c.json(buildDailyStatsResponse(statsReader, clampDays(c.req.query('days')))),
+    );
+    app.get('/admin/api/stats/hourly', (c) =>
+      c.json(buildHourlyStatsResponse(statsReader, clampHours(c.req.query('hours')))),
+    );
+    app.get('/admin/api/executions', (c) =>
+      c.json(
+        buildExecutionsResponse(statsReader, {
+          limit: c.req.query('limit'),
+          offset: c.req.query('offset'),
+        }),
+      ),
+    );
   } else {
     app.get('/admin/api/stats', (c) =>
       c.json(
@@ -423,6 +632,125 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
         501,
       ),
     );
+  }
+
+  // ── Workflows browser — Flue-discovered workflow definitions ──────────────
+  // Backed by the injected WorkflowsReader seam: discovers `src/workflows/*.ts`,
+  // derives triggers from config routes + crons, persists the kill switch, reads
+  // prompt/skill files. Operator-auth gated. Without a reader the routes 501.
+  const workflowsReader = opts.workflowsReader;
+  if (workflowsReader) {
+    app.get('/admin/api/workflows', (c) =>
+      c.json({ workflows: buildWorkflowsList(workflowsReader) }),
+    );
+    app.get('/admin/api/workflow-names', (c) =>
+      c.json({ names: workflowsReader.list().map((w) => w.name).sort() }),
+    );
+    app.get('/admin/api/workflows/:name', (c) => {
+      const rec = workflowsReader.get(c.req.param('name'));
+      if (!rec) return c.json({ error: `workflow definition not found: ${c.req.param('name')}` }, 404);
+      return c.json({ workflow: toWorkflowDefinition(rec) });
+    });
+    app.get('/admin/api/workflows/:name/full', (c) => {
+      const name = c.req.param('name');
+      const rec = workflowsReader.get(name);
+      if (!rec) return c.json({ error: `workflow definition not found: ${name}` }, 404);
+      return c.json({
+        workflow: toWorkflowFullDefinition(rec),
+        triggers: workflowsReader.triggers(name),
+        enabled: workflowsReader.isEnabled(name),
+      });
+    });
+    app.post('/admin/api/workflows/:name/toggle', (c) => {
+      const name = c.req.param('name');
+      if (!workflowsReader.get(name)) return c.json({ error: `unknown workflow: ${name}` }, 404);
+      const next = !workflowsReader.isEnabled(name);
+      workflowsReader.setEnabled(name, next);
+      return c.json({ name, enabled: next });
+    });
+    app.get('/admin/api/workflows/:name/yaml', (c) => {
+      const name = c.req.param('name');
+      if (!/^[a-zA-Z0-9_-]+$/.test(name)) return c.json({ error: 'invalid workflow name' }, 400);
+      try {
+        return c.text(workflowsReader.rawSource(name), 200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      } catch (err) {
+        return c.json({ error: `workflow source not found: ${name}`, detail: err instanceof Error ? err.message : String(err) }, 404);
+      }
+    });
+    app.get('/admin/api/workflows/:name/prompt', (c) => {
+      const name = c.req.param('name');
+      const promptPath = c.req.query('path');
+      if (!promptPath) return c.json({ error: 'missing ?path query' }, 400);
+      if (!/^[a-zA-Z0-9_-]+$/.test(name)) return c.json({ error: 'invalid workflow name' }, 400);
+      if (!promptPath.startsWith('prompts/') || promptPath.includes('..')) {
+        return c.json({ error: 'prompt path must be under prompts/' }, 400);
+      }
+      try {
+        return c.text(workflowsReader.loadPrompt(promptPath), 200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      } catch (err) {
+        return c.json({ error: 'prompt not found', detail: err instanceof Error ? err.message : String(err) }, 404);
+      }
+    });
+    app.get('/admin/api/skills/:name', (c) => {
+      const name = c.req.param('name');
+      try {
+        return c.text(workflowsReader.loadSkill(name), 200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      } catch (err) {
+        return c.json({ error: `skill not found: ${name}`, detail: err instanceof Error ? err.message : String(err) }, 404);
+      }
+    });
+  } else {
+    for (const path of ['/admin/api/workflows', '/admin/api/workflow-names'] as const) {
+      app.get(path, (c) =>
+        c.json({ error: 'not_implemented', route: path, slice: 'workflows-browser (no workflows reader wired)' }, 501),
+      );
+    }
+  }
+
+  // ── Crons — operator schedule/toggle controls ─────────────────────────────
+  // Backed by the injected CronsReader seam (static cron defs + app-owned
+  // override store + live registry). Operator-auth gated. Without a reader the
+  // routes 501 (honest) — the default export wires the real reader.
+  const cronsReader = opts.cronsReader;
+  if (cronsReader) {
+    app.get('/admin/api/crons', (c) => c.json({ crons: cronsReader.listCrons() }));
+    app.post('/admin/api/crons/:name/toggle', (c) => {
+      try {
+        return c.json(cronsReader.toggle(c.req.param('name')));
+      } catch (err) {
+        if (err instanceof CronNotFoundError) return c.json({ error: err.message }, 404);
+        throw err;
+      }
+    });
+    app.post('/admin/api/crons/:name/schedule', async (c) => {
+      const body = await c.req.json<{ schedule: string }>().catch(() => ({ schedule: '' }));
+      try {
+        return c.json(cronsReader.setSchedule(c.req.param('name'), body.schedule));
+      } catch (err) {
+        if (err instanceof CronNotFoundError) return c.json({ error: err.message }, 404);
+        if (err instanceof InvalidCronScheduleError) return c.json({ error: err.message }, 400);
+        throw err;
+      }
+    });
+    app.delete('/admin/api/crons/:name/override', (c) => {
+      try {
+        return c.json(cronsReader.resetOverride(c.req.param('name')));
+      } catch (err) {
+        if (err instanceof CronNotFoundError) return c.json({ error: err.message }, 404);
+        throw err;
+      }
+    });
+  } else {
+    for (const [method, path] of [
+      ['get', '/admin/api/crons'],
+      ['post', '/admin/api/crons/:name/toggle'],
+      ['post', '/admin/api/crons/:name/schedule'],
+      ['delete', '/admin/api/crons/:name/override'],
+    ] as const) {
+      app[method](path, (c) =>
+        c.json({ error: 'not_implemented', route: path, slice: 'admin-crons (no crons reader wired)' }, 501),
+      );
+    }
   }
   // No session reader wired (e.g. createApp() with no opts in a unit test) →
   // 501 the session routes so the surface is complete and honest.
@@ -483,10 +811,20 @@ const app = createApp({
     // (kind:'chat') with workflow runs — filling the old `agentIds:[]` stub.
     threadLister: () =>
       new ThreadsStore(
-        process.env.LASTLIGHT_THREADS_STORE ?? './data/threads-store.db',
+        process.env.LASTLIGHT_THREADS_STORE ?? './.data/threads-store.db',
       ),
   }),
   statsReader: createDefaultStatsReader(),
+  chatSessionReader: createDefaultChatSessionReader({
+    threadLister: () =>
+      new ThreadsStore(
+        process.env.LASTLIGHT_THREADS_STORE ?? './.data/threads-store.db',
+      ),
+  }),
+  workflowsReader: createDefaultWorkflowsReader(),
+  cronsReader: createDefaultCronsReader(),
+  configReader: createDefaultConfigReader(),
+  runActionsReader: createDefaultRunActionsReader(),
 });
 app.route('/', flue());
 

@@ -45,7 +45,7 @@ export interface ResumeOptions {
 
 /** Read the build run-store path lazily (matches build.ts). */
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_BUILD_RUNSTORE ?? './data/build-run-store.db';
+  process.env.LASTLIGHT_BUILD_RUNSTORE ?? './.data/build-run-store.db';
 
 /**
  * Default production re-invoker: spawn a fresh `flue run build` process with the

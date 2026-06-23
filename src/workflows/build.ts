@@ -47,7 +47,7 @@ import { architectPlanPath } from '../agent-lib/architect-prompt.ts';
 export type { BuildInput, BuildResult } from '../agent-lib/build-phases.ts';
 
 /** Read the run-store path lazily so each process (+ test) can point at its own db. */
-const storePath = () => process.env.LASTLIGHT_BUILD_RUNSTORE ?? './data/build-run-store.db';
+const storePath = () => process.env.LASTLIGHT_BUILD_RUNSTORE ?? './.data/build-run-store.db';
 
 /** Default branch/taskId derivation when the caller doesn't supply them. */
 function seedFrom(input: BuildInput) {

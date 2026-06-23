@@ -93,7 +93,7 @@ export interface DefaultApprovalsBackendOptions {
 }
 
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_BUILD_RUNSTORE ?? './data/build-run-store.db';
+  process.env.LASTLIGHT_BUILD_RUNSTORE ?? './.data/build-run-store.db';
 
 /**
  * The production approvals backend: lists paused runs off the on-disk build

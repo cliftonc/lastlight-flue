@@ -97,13 +97,17 @@ export function verifyToken(token: string, secret: string): boolean {
 
 /**
  * Paths that must stay reachable WITHOUT a token even when auth is enabled — the
- * CLI/dashboard read `auth-required` to learn HOW to authenticate, and POST
- * `login` to obtain a token. (The reference also exempts `health` and the OAuth
- * authorize/callback routes; OAuth is not ported in this slice — Phase 6 — so
- * those are omitted here. When OAuth lands, add its paths to this set.)
+ * CLI/dashboard read `auth-required` to learn HOW to authenticate, POST `login`
+ * to obtain a token, and run the OAuth authorize/callback flow (which is itself
+ * the login mechanism — it ISSUES the token). Everything else under
+ * `/admin/api/*` requires a valid bearer token.
  */
 function isPublicAuthPath(path: string): boolean {
-  return path.endsWith('/auth-required') || path.endsWith('/login');
+  return (
+    path.endsWith('/auth-required') ||
+    path.endsWith('/login') ||
+    path.includes('/oauth/')
+  );
 }
 
 /**

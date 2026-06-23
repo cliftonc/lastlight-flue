@@ -14,12 +14,17 @@ node_modules/
 /dist/
 *.tsbuildinfo
 .flue/
+.flue-vite/
 coverage/
 
 # --- Local state / runtime ---
 *.db
 *.db-journal
 *.sqlite
+# Runtime SQLite stores live in a dot-directory so `flue dev`'s file watcher
+# ignores them — the app writes these DBs while running, and watching them
+# caused a rebuild→restart→write loop. Dot-dirs are ignored by the watcher.
+.data/
 logs/
 .DS_Store
 

@@ -7,6 +7,9 @@ import {
   streamPathForRun,
   streamPathForAgent,
   createDefaultSessionReader,
+  readFullTranscript,
+  filterEventsByOperation,
+  derivePhases,
   type RawStreamEvent,
   type ThreadLister,
 } from './session-reader.ts';
@@ -246,5 +249,94 @@ describe('toTranscriptMessages (FlueEvent[] → transcript)', () => {
     // to render), but no throw.
     expect(() => toTranscriptMessages(events)).not.toThrow();
     expect(toTranscriptMessages(events)).toHaveLength(0);
+  });
+});
+
+describe('readFullTranscript (drains every page)', () => {
+  it('concatenates pages until upToDate (no first-page truncation)', async () => {
+    // A fake whose readEvents returns 2 events per page across 3 pages — exactly
+    // the truncation bug's shape (a single read would stop at page 1).
+    const pages = [
+      { events: [ev({ type: 'a' }, '0_1'), ev({ type: 'b' }, '0_2')], nextOffset: '0_2', upToDate: false },
+      { events: [ev({ type: 'c' }, '0_3'), ev({ type: 'd' }, '0_4')], nextOffset: '0_4', upToDate: false },
+      { events: [ev({ type: 'e' }, '0_5')], nextOffset: '0_5', upToDate: true },
+    ];
+    let call = 0;
+    const reader = {
+      async readTranscript() {
+        return pages[call++]!;
+      },
+    };
+    const res = await readFullTranscript(reader, 'run_x');
+    expect(res.events).toHaveLength(5);
+    expect(res.nextOffset).toBe('0_5');
+    expect(call).toBe(3);
+  });
+
+  it('stops on an empty page (no infinite loop)', async () => {
+    const reader = {
+      async readTranscript() {
+        return { events: [] as RawStreamEvent[], nextOffset: '-1', upToDate: false };
+      },
+    };
+    const res = await readFullTranscript(reader, 'run_x');
+    expect(res.events).toHaveLength(0);
+  });
+});
+
+describe('filterEventsByOperation + derivePhases (run-history pipeline)', () => {
+  const stream = [
+    ev({ type: 'run_start' }, '0_0'),
+    ev({ type: 'agent_start', operationId: 'op1', session: 'guardrails', timestamp: 't1' }, '0_1'),
+    ev({ type: 'message_end', operationId: 'op1', message: { role: 'user', content: 'go' }, timestamp: 't2' }, '0_2'),
+    ev({ type: 'tool', operationId: 'op1', toolName: 'x', result: 'ok', timestamp: 't3' }, '0_3'),
+    ev({ type: 'agent_end', operationId: 'op1', timestamp: 't4' }, '0_4'),
+    ev({ type: 'agent_start', operationId: 'op2', session: 'architect', timestamp: 't5' }, '0_5'),
+    ev({ type: 'message_end', operationId: 'op2', message: { role: 'assistant', content: 'done' }, timestamp: 't6' }, '0_6'),
+    ev({ type: 'agent_end', operationId: 'op2', isError: true, timestamp: 't7' }, '0_7'),
+    ev({ type: 'run_end' }, '0_8'),
+  ];
+
+  it('filters events to one operation', () => {
+    expect(filterEventsByOperation(stream, 'op1')).toHaveLength(4);
+    expect(filterEventsByOperation(stream, 'op2')).toHaveLength(3);
+    expect(filterEventsByOperation(stream, 'nope')).toHaveLength(0);
+  });
+
+  it('derives ordered phases keyed by operation, named by session', () => {
+    const phases = derivePhases(stream);
+    expect(phases).toHaveLength(2);
+    expect(phases[0]).toMatchObject({
+      operationId: 'op1',
+      name: 'guardrails',
+      index: 0,
+      messageCount: 1,
+      toolCount: 1,
+      isError: false,
+      startedAt: 't1',
+      endedAt: 't4',
+    });
+    expect(phases[1]).toMatchObject({
+      operationId: 'op2',
+      name: 'architect',
+      index: 1,
+      messageCount: 1,
+      toolCount: 0,
+      isError: true,
+    });
+  });
+
+  it('falls back to a `default` phase name when no agent_start session is present', () => {
+    const single = [
+      ev({ type: 'operation_start', operationId: 'opX' }, '0_1'),
+      ev({ type: 'message_end', operationId: 'opX', message: { role: 'user', content: 'hi' } }, '0_2'),
+    ];
+    const phases = derivePhases(single);
+    expect(phases).toHaveLength(1);
+    expect(phases[0]!.name).toBe('default');
+  });
+
+  it('returns no phases for a run with only run-level events', () => {
+    expect(derivePhases([ev({ type: 'run_start' }, '0_0'), ev({ type: 'run_end' }, '0_1')])).toHaveLength(0);
   });
 });

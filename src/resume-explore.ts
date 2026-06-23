@@ -38,7 +38,7 @@ export interface ResumeExploreOptions {
 }
 
 const defaultStorePath = () =>
-  process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db";
+  process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./.data/explore-run-store.db";
 
 /** Default production re-invoker: spawn a fresh `flue run explore` with the gate token. */
 function defaultReinvoke(input: ExploreInput): ExploreReinvoker {

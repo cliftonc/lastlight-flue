@@ -105,6 +105,53 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   platform=channel) with workflow runs (kind:'run'), newest-first; chat transcript still via
   `agentStreamPath('chat',instanceId)`. +24 tests. flue build green, discovery unchanged, dist
   vitest=1, `messaging_threads` in bundle. Suite **810 passed / 6 skipped**.
+- **Phase 7 admin-parity slice — FULL DASHBOARD BACKEND ✅.** Moved the dashboard
+  SOURCE in from `~/work/lastlight/dashboard` (was a prebuilt `dist/` bundle only;
+  now buildable in-repo) and ported the ~20 endpoints the committed bundle calls
+  but the flue backend never served (the Sessions tab was 404ing on
+  `/admin/api/sessions/stream`). NO frontend rebuild — the existing bundle already
+  calls these URLs; only the backend was missing. Built by 5 parallel subagents,
+  each a reader module + offline tests; integrated into `app.ts` in one pass.
+  Surfaces (all operator-auth gated, injectable reader seams like RunsReader):
+  • **SSE** `sessions/stream` + `sessions/:id/stream` (events `sessions`/`message`+
+    `ready`) + full `chat-sessions/*` — `session-stream.ts` + `chat-session-reader.ts`,
+    poll-tail over the existing SessionReader, leak-safe on abort. List-stream
+    mounts BEFORE `/:id` or Hono shadows it.
+  • **stats** `/daily` `/hourly` `/executions` — extended `stats-store.ts`/`stats-reader.ts`
+    (honest zeros/nulls where the flue `executions` table has no source column).
+  • **workflows browser** `workflows`(+`:name`/`/full`/`/yaml`/`/prompt`/`/toggle`),
+    `workflow-names`, `skills/:name` — new `workflows-reader.ts`: discovers
+    `src/workflows/*.ts` (flue has NO declarative phases → `phases:[]`/`phaseCount:0`),
+    triggers from config routes + CRON_DEFS, kill switch in a new sqlite override store.
+  • **crons** `crons`(+`/toggle`/`/schedule`/`/override`) — new `crons-reader.ts` +
+    `cron-override-store.ts`; reads the LIVE registry (added `getCronRegistry()`),
+    overrides persist (no live re-arm yet).
+  • **config** (real `{default,overlay,merged,sources}` provenance via config-resolve),
+    workflow-run `/executions`+`/cancel` (app-record terminal, no flue force-cancel),
+    `/admin/api/health` alias (unauthenticated, pre-middleware), `containers`(+`/stats`)
+    honest empty (Docker N/A on node).
+  TWO live-only bugs caught by running the built server (unit tests used fixtures):
+  (1) workflows discovery used `import.meta.url` → resolved to `dist/` when bundled →
+  0 workflows; fixed to prefer `<cwd>/src`. (2) crons-reader built its OWN named
+  CronRegistry at module-eval → collided with `startCrons()` ("name already taken")
+  → real scheduler failed to start; fixed to reuse the live registry lazily.
+  VERIFIED live: `sessions/stream` returns `text/event-stream` with the real run id
+  from the original 404; 12 workflows; 4 crons scheduled with accurate nextRun.
+  +~68 tests. typecheck + flue build green. Suite **878 passed / 6 skipped**.
+  - **+ OAuth login (Phase 6) ✅.** Ported `oauth/{slack,github}/{authorize,callback}`
+    (`src/admin/oauth.ts`, `arctic@^3.7.0`): env-config (`SLACK_OAUTH_*`/`GITHUB_OAUTH_*`
+    + `SLACK_ALLOWED_WORKSPACE`/`GITHUB_ALLOWED_ORG`), CSRF state cookie, workspace/org
+    allowlist, issues the SAME `createToken` HMAC bearer as password login →
+    `/admin/?token=`. Public (added `/oauth/` to `isPublicAuthPath`); `auth-required`
+    now reports real `slackOAuth`/`githubOAuth` flags (each enabled only with full
+    creds) so the dashboard shows the right Connect buttons. Unconfigured ⇒ honest
+    `404 JSON` (NOT SPA html). +9 tests. VERIFIED: unconfigured→404 JSON; configured→
+    302 to github.com/slack.com.
+  - **+ `Cache-Control: no-store` on all `/admin/api/*` ✅.** A `/admin/api/*` middleware
+    (registered FIRST) sets `no-store, must-revalidate` + `Pragma: no-cache` on every
+    admin response. The SPA catch-all serves `index.html` (200) for any UNMOUNTED
+    route, so browsers were caching stale 404/HTML bodies that survived hard-refresh;
+    `no-store` stops that. Suite **887 passed / 6 skipped**.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker

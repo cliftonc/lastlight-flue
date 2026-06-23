@@ -26,8 +26,8 @@ interface GatedInput {
 }
 
 // Read lazily so each process (and each test) can point at its own paths.
-const storePath = () => process.env.LASTLIGHT_RUNSTORE ?? './data/run-store.db';
-const artifactDir = () => process.env.LASTLIGHT_ARTIFACTS ?? './data/artifacts';
+const storePath = () => process.env.LASTLIGHT_RUNSTORE ?? './.data/run-store.db';
+const artifactDir = () => process.env.LASTLIGHT_ARTIFACTS ?? './.data/artifacts';
 
 /** A stand-in external side effect (e.g. a commit/PR/comment) — must happen once. */
 function sideEffect(runId: string, marker: string): void {

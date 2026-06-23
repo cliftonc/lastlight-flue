@@ -8,4 +8,4 @@ import { sqlite } from '@flue/runtime/node';
 // drives the workflow-level approval gate (Flue workflows are NOT resumable).
 //
 // Verified: `sqlite(path?)` from `@flue/runtime/node` (spec/flue-reference §0).
-export default sqlite('./data/flue.db');
+export default sqlite('./.data/flue.db');

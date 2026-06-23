@@ -38,6 +38,12 @@ describe('app-owned surface (createApp, in-process)', () => {
     expect(body.uptime as number).toBeGreaterThanOrEqual(0);
   });
 
+  it('GET / → 302 redirect to the admin dashboard', async () => {
+    const res = await app.request('/');
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/admin/');
+  });
+
   it('GET /api/status → 200 readiness view', async () => {
     const res = await app.request('/api/status');
     expect(res.status).toBe(200);
@@ -678,6 +684,79 @@ describe('admin sessions with injected SessionReader (offline)', () => {
     ]);
   });
 
+  it('GET /admin/api/workflow-runs/:id/phases → derived phases from the run stream', async () => {
+    const phaseStream = {
+      events: [
+        { data: { type: 'run_start' }, offset: '0_0' },
+        { data: { type: 'agent_start', operationId: 'op1', session: 'guardrails', timestamp: 't1' }, offset: '0_1' },
+        { data: { type: 'message_end', operationId: 'op1', message: { role: 'user', content: 'go' }, timestamp: 't2' }, offset: '0_2' },
+        { data: { type: 'agent_start', operationId: 'op2', session: 'architect', timestamp: 't3' }, offset: '0_3' },
+        { data: { type: 'tool', operationId: 'op2', result: 'ok', timestamp: 't4' }, offset: '0_4' },
+      ],
+      nextOffset: '0_4',
+      upToDate: true,
+    };
+    const app = makeApp(
+      fakeReader({
+        async exists() {
+          return true;
+        },
+        async readTranscript() {
+          return phaseStream;
+        },
+      }),
+    );
+    const res = await app.request('/admin/api/workflow-runs/run_a/phases');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { phases: Array<{ operationId: string; name: string; messageCount: number; toolCount: number }> };
+    expect(body.phases.map((p) => p.name)).toEqual(['guardrails', 'architect']);
+    expect(body.phases[0]!.messageCount).toBe(1);
+    expect(body.phases[1]!.toolCount).toBe(1);
+  });
+
+  it('GET /admin/api/workflow-runs/:id/phases unknown → 404', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/workflow-runs/nope/phases');
+    expect(res.status).toBe(404);
+  });
+
+  it('messages route drains all pages (no first-page truncation) + operation filter', async () => {
+    // Two pages: page 1 not up-to-date, page 2 finishes. Each page carries one
+    // op1 + one op2 event so we can assert both the drain and the filter.
+    const page1 = {
+      events: [
+        { data: { type: 'message_end', operationId: 'op1', message: { role: 'user', content: 'a' } }, offset: '0_1' },
+        { data: { type: 'message_end', operationId: 'op2', message: { role: 'assistant', content: 'b' } }, offset: '0_2' },
+      ],
+      nextOffset: '0_2',
+      upToDate: false,
+    };
+    const page2 = {
+      events: [
+        { data: { type: 'message_end', operationId: 'op1', message: { role: 'user', content: 'c' } }, offset: '0_3' },
+      ],
+      nextOffset: '0_3',
+      upToDate: true,
+    };
+    const makeFake = () => {
+      let call = 0;
+      return makeApp(
+        fakeReader({
+          async exists() {
+            return true;
+          },
+          async readTranscript() {
+            return call++ === 0 ? page1 : page2;
+          },
+        }),
+      );
+    };
+    const all = (await (await makeFake().request('/admin/api/sessions/run_a/messages')).json()) as { messages: unknown[] };
+    expect(all.messages).toHaveLength(3); // drained both pages
+    const filtered = (await (await makeFake().request('/admin/api/sessions/run_a/messages?operation=op1')).json()) as { messages: unknown[] };
+    expect(filtered.messages).toHaveLength(2); // only op1
+  });
+
   it('sessions list surfaces chat threads + runs together with kind tags', async () => {
     const chatRow: SessionMeta = {
       id: 'slack:v1:T1:C2:100.1',
@@ -780,6 +859,9 @@ describe('stats endpoint with injected StatsReader (offline)', () => {
     byRun: () => [],
     totals: () => totals,
     todayCount: () => 2,
+    dailyStats: () => [],
+    hourlyStats: () => [],
+    listExecutions: () => [],
     ...over,
   });
 

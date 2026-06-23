@@ -89,7 +89,7 @@ function defaultPendingReplyGate(storePath?: string) {
   return async (ev: LastLightEvent): Promise<PendingReplyGate | null> => {
     if (!ev.owner || !ev.repoName || !ev.issueNumber) return null;
     const store = new ExploreRunStore(
-      storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./data/explore-run-store.db",
+      storePath ?? process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./.data/explore-run-store.db",
     );
     try {
       // Resolve the paused explore reply-gate on this conversation. The store matches
@@ -119,7 +119,7 @@ function defaultPendingReplyGate(storePath?: string) {
 function defaultGateLookup(storePath?: string) {
   return (conversationKey: string): string | undefined => {
     const store = new BuildRunStore(
-      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./data/build-run-store.db",
+      storePath ?? process.env.LASTLIGHT_BUILD_RUNSTORE ?? "./.data/build-run-store.db",
     );
     try {
       return store.findPausedRunByConversation(conversationKey);
