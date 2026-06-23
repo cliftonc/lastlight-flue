@@ -3,7 +3,7 @@
 > Durable detailed record of COMPLETED slices, moved out of `PROGRESS.md` to keep
 > the per-slice re-read cost low. The lean live doc is `PROGRESS.md`; this is the
 > long-form write-up for everything already DONE (git history also has it).
-> Chronological order: Phase 0 → 1 → 2 → 3.
+> Chronological order: Phase 0 → 1 → 2 → 3 → 4 → 5.
 
 ---
 
@@ -675,3 +675,362 @@ surface (server, auth, CLI, admin reads, dashboard) is in place.
   (verified `docker ps -a` clean post-run). **NO live PR post / NO live GitHub write.**
 - **Next slice:** Phase 4 — `build` workflow + durable approval gate.
 - **Last commit:** see `git log` (Phase 3 slice 2: Docker sandbox into reviewer).
+
+---
+
+## Phase 4 — build workflow + durable approval gate ✅ (structurally; LIVE build acceptance DEFERRED, user-gated)
+
+> Detailed per-slice notes, trimmed out of PROGRESS.md on 2026-06-23. Phase 4 built
+> the `build` workflow's control flow + all phase bodies + the durable approval gate
+> + resume + boot recovery, all behind the `BuildDeps` seam with every external side
+> effect (push / gate-comment / open-PR / `flue run` reinvoke) MOCKED. The LIVE
+> `flue run build` end-to-end acceptance (real code, real branch, real PR, human
+> gate) remains user-gated and is NOT to be run autonomously — see PROGRESS.md
+> "Carried unknowns / blockers".
+
+### Phase 4 slice 2 — ARCHITECT phase body
+- `src/agent-lib/architect.ts` — `createArchitectAgent(ref,octokit,sandbox)`:
+  model=resolveModel('architect'), thinkingLevel=resolveThinking('architect'),
+  instructions=loadPersona() (carries security.md), read-only github tools (closed
+  over ref/octokit), `building` skill, sandbox + cwd=/workspace. Top-level NAMED
+  session `architect` (NOT a subagent — resume can re-open it).
+- `src/agent-lib/build-sandbox.ts` — `withBuildSandbox` (mirrors reviewer-sandbox;
+  caller-owns-lifetime): creates a node+git container w/ repo-write token baked as
+  env, FULL-clones the repo + `checkout -B <branch>`, ALWAYS `remove()`s in finally.
+  NO tool-only fallback (architect needs the workspace → clone/checkout failure
+  THROWS, token-redacted). EGRESS still deferred.
+- `src/agent-lib/architect-prompt.ts` — renders `src/prompts/architect.md`
+  (build-time markdown import, inlined) w/ repo/branch/issueDir/issueNumber +
+  a contextSnapshot. `src/engine/untrusted.ts` — ported `wrapUntrusted` markers:
+  issue title/body/comment wrapped UNTRUSTED (spec/07); trigger metadata stays
+  outside; injected markers stripped so hostile text can't escape the wrapper.
+- Plan PERSISTENCE: agent writes+commits `.lastlight/issue-<N>/architect-plan.md`
+  on the branch (durable handoff); run-record scratch stores the POINTER only
+  (spec/10 split rule), so the gate can surface it + the executor can consume it.
+- Architect's own seams (mintToken/makeOctokit/sandboxOps/runArchitectSession)
+  injectable → default impl tested OFFLINE.
+
+### Phase 4 slice 3 — EXECUTOR phase body
+- Wired into `defaultBuildDeps().runPhase('executor')` behind the `BuildDeps` seam
+  (runs AFTER the post_architect gate). Mirrors the architect:
+- `src/agent-lib/executor.ts` — `createExecutorAgent(ref,octokit,sandbox)`:
+  model=resolveModel('executor') (falls back to default), thinking='executor',
+  persona instructions, READ-ONLY github tools, `building` skill, sandbox+cwd
+  /workspace. Top-level NAMED session `executor` (NOT a subagent).
+- `src/agent-lib/executor-prompt.ts` — renders `src/prompts/executor.md`; NAMES
+  `.lastlight/issue-<N>/architect-plan.md` (the plan is the handoff — read from
+  the checkout, NOT inlined); optional untrusted-wrapped issue snapshot.
+- `runExecutorPhase` (build-phases.ts): mint repo-write token → octokit →
+  `withBuildSandbox` (pre-clone+`checkout -B`, plan on branch) → session (agent
+  implements + COMMITS in-sandbox via git CLI, NOT a tool) → `readHeadSha` →
+  **`pushBranch` SEAM** (the controlled repo-write side effect). Scratch records
+  executor-summary POINTER + commit sha (spec/10); `PhaseResult.scratch` carries
+  them up to the workflow's `markPhaseDone`.
+- **PUSH = mockable seam:** `withBuildSandbox` now also hands the `BuildContainer`
+  to the body so the workflow runs `git push origin <bound-branch>` in-sandbox
+  after the session. MOCKED in all default tests (asserts it WOULD push the bound
+  ref) — NO real push. Executor prompt no longer instructs the model to push.
+
+### Phase 4 slice 4 — REVIEWER-LOOP phase bodies
+- The real reviewer-loop phase bodies (reviewer:N → [post_reviewer gate] → fix:N →
+  recheck:N), wired into `defaultBuildDeps().runPhase` behind the `BuildDeps` seam —
+  the existing build.ts loop control flow drives them.
+- `src/agent-lib/build-reviewer.ts` — `createBuildReviewerAgent` (review task key,
+  persona, pr-review+building+code-review skills, sandbox REQUIRED, cwd /workspace;
+  reviews the executor's COMMITTED diff in the checkout, NO GitHub post — internal
+  build review) + `createFixAgent` (fix task key→default fallback, persona, building
+  skill, READ-ONLY github tools, sandbox+cwd). Recheck = the SAME reviewer agent
+  re-prompted with re-reviewer.md.
+- `src/agent-lib/reviewer-prompt.ts` — pure renderers for reviewer.md / re-reviewer.md
+  / fix.md (`fixCycle` for the latter two). Reviewer NOTES are the handoff: committed
+  `reviewer-verdict.md`, named in the fix prompt (read from checkout, NOT inlined).
+- `runReviewerPhase(cycle,isRecheck)` + `runFixPhase(cycle)` (build-phases.ts): mint
+  repo-write → octokit → `withBuildSandbox` (pre-clone+checkout) → per-cycle named
+  session (`reviewer:N`/`recheck:N`/`fix:N`) → verdict text returned to the loop →
+  `parseReviewerVerdict` drives break/continue. Reviewer records the verdict POINTER;
+  fix reads HEAD sha + PUSHES via the SAME mocked `pushBranch` seam as the executor.
+- `cycleFromPhaseName` parses the `:N` suffix; `runPhase` routes `reviewer:`/`recheck:`/
+  `fix:` per-cycle. build.ts merges each phase's scratch pointer into `markPhaseDone`.
+- Prompts edited: reviewer/re-reviewer/fix no longer instruct the model to
+  `git push` (the workflow pushes deterministically — mirrors executor.md).
+
+### Phase 4 slice 5 — guardrails + gate-ask + open-PR (PHASES COMPLETE)
+- The three remaining phase bodies — guardrails + the deterministic gate-ask + the
+  deterministic open-PR — behind the `BuildDeps` seam.
+- **guardrails** — `src/agent-lib/guardrails.ts` (`createGuardrailsAgent`: guardrails
+  task key, persona, `building` skill, READ-ONLY github tools, sandbox REQUIRED, cwd
+  /workspace — mirrors architect) + `guardrails-prompt.ts` (renders `guardrails.md`,
+  issue text UNTRUSTED-wrapped via the architect snapshot builder). `runGuardrailsPhase`
+  (mint→clone→session→READY/BLOCKED text + report pointer). **BLOCKED parity:**
+  `bootstrapBypass(issueContext)` — `lastlight:bootstrap` label OR `guardrails:`/
+  `[guardrails]` title prefix bypasses the BLOCK (build.yaml `unless_*`); build.ts
+  fails the run on `^\s*BLOCKED` UNLESS bypassed. Added `labels?` to issue context.
+- **gate-ask** — `src/build-github-post.ts` `renderGateComment` (pure) +
+  `postGateCommentDeterministically` (bound ref+issue, `issues.createComment`, NOT a
+  model tool — mirrors github-post.ts). `runPostGateComment` wires mint→render→post;
+  surfaces the plan (post_architect) / verdict+cycle (post_reviewer) + approve/reject
+  cmds. build.ts records the comment id under `gateComment:<gate>` via new
+  `store.recordScratch`; idempotent (build.ts guards on `pendingGate` → posts once).
+- **open-PR** — `renderPrBody`/`renderPrTitle` (pure; pr.md contract: Closes #N,
+  only-present doc links, not-approved note) + `openPullRequestDeterministically`
+  (bound ref, `pulls.list` head-filter → reuse OPEN PR else `pulls.create`
+  head=branch base=default-branch). `runOpenPullRequest` reads the last `verdict:N`
+  for approved-ness, records `prNumber`/`prUrl`. **Idempotent at TWO layers:**
+  `shouldRunPhase('pr')` + the list-then-create reuse.
+- `gateEnabled` now POSITIVE-ENABLE from config (`approval[gate]===true`, build.yaml
+  parity) instead of the `() => true` stub. defaultBuildDeps no longer stubs anything.
+
+### Phase 4 slice 6 — durable gate RESUMABLE end-to-end + boot recovery (PHASES COMPLETE)
+- The RESUME path wired to real triggers + boot recovery.
+- **Approvals server surface** (`src/admin/approvals.ts` + `createApp` routes) —
+  replaced the `/admin/api/approvals` 501 stub. `GET /admin/api/approvals` lists
+  PAUSED build runs (id=runId, gate, kind, workflowRunId, summary[repo#issue+plan/
+  verdict pointer], restartCount, createdAt:null[Phase-7]); `POST /admin/api/
+  approvals/:id/respond {decision:'approved'|'rejected'}` maps to
+  `resume(runId,'approve'|'reject')`. Matches `src/cli.ts` cmdApprovals exactly.
+  Operator-auth gated (mounted under the existing `/admin/api/*` requireOperator
+  middleware — 401 without token). Thin `ApprovalsBackend` SEAM over the build
+  run-store (+ injected `resume`/`reinvoke`) so routes test offline; default export
+  wires `createDefaultApprovalsBackend()`. Added `BuildRunStore.listPaused()`.
+- **IDEMPOTENCY:** unchanged from slice 1 — `resume()` no-ops on an already-resolved
+  run (double-approve = no second re-invoke; reject-after-complete = no-op). Backend
+  404s an unknown runId; 400s an invalid decision. reinvoke seam stays injectable
+  (default spawns `flue run build`, Spike-3 path). NO GitHub post in resume.
+- **BOOT recovery hook** (`src/app.ts` module scope) — `runBootRecovery()` calls
+  `recoverOrphanRuns()`: re-invokes `active` orphans (crashed mid-phase, idempotent
+  via phasesDone), LEAVES `paused` runs for a human (slice-1 + flue-ref §0
+  Node-no-workflow-recovery). WHERE: app.ts module-eval (dist/server.mjs inlines it,
+  owns serve()/listen) — run-ONCE (`bootRecoveryStarted` guard), NON-BLOCKING
+  (detached `void` promise, listen not awaited), NON-FATAL (errors logged). Skipped
+  under `VITEST`/`LASTLIGHT_SKIP_BOOT_RECOVERY=1` so unit imports don't trigger it.
+  Restart-count BREAKER (≤3 in build.ts) caps a wedged run — boot re-invoke bumps it.
+- Suite at end of Phase 4 slice 6: **384 passed / 5 skipped** (+10). `flue build`
+  green; discovery = agents{hello} + workflows{build,gated,pr-review};
+  `grep -c vitest dist/server.mjs` = 1 (inlined guardrails prompt text, NOT a module
+  import). NO LIVE SIDE EFFECTS — approvals endpoints + boot recovery exercised ONLY
+  against fakes/temp sqlite; resume's default reinvoke NEVER invoked live.
+
+---
+
+## Phase 5 — Remaining workflows + crons + chat ✅ COMPLETE
+
+> Detailed per-slice notes, trimmed out of PROGRESS.md on 2026-06-23. All 12
+> workflows + the chat agent + web tools + crons + shutdown finalize. Every slice:
+> NO LIVE SIDE EFFECT (GitHub/model/web/sandbox MOCKED or injected); helpers in
+> `src/agent-lib/` + top-level posters at `src/`, tests in nested `__tests__/`; no
+> phantom discovery entries; `grep -c vitest dist/server.mjs` = 1 (inlined prompt
+> text, not a module import). DI seam per workflow (`run` → `run<Name>(ctx, deps)`).
+
+### Phase 5 slice 1 — issue-triage (single-phase, TOOL-ONLY)
+- `src/workflows/issue-triage.ts` (`run`→`runIssueTriage(ctx,deps)`). Reads issue +
+  dup-search via bound read tools (NO sandbox). Mints `issues-write` (downscoped).
+- agent `src/agent-lib/triage.ts` (`createTriageAgent`: triage key, persona,
+  `issue-triage` skill, READ-ONLY github tools bound to ref+token) + `triage-prompt.ts`
+  (issue title/body/comments UNTRUSTED-wrapped; trigger metadata outside).
+- **classification→deterministic action:** agent emits a `CLASSIFICATION: category=…
+  [state=…] [duplicate] [close]` marker; `triage-classification.ts` parses it
+  (golden-tested, mirrors parseReviewerVerdict) + maps to canonical SKILL.md labels;
+  `src/triage-post.ts` (`applyTriageDeterministically`, bound ref+token, NOT a model
+  tool) ensures labels exist (createLabel idempotent; 403→existing-only fallback),
+  addLabels (idempotent → Q5.4 re-invoke safe), posts the pre-marker comment, closes
+  on duplicate/already-implemented.
+- Tests +28 (17 classification/mapping golden + 11 run-level/poster security). Last
+  commit: Phase 5 slice 1 (issue-triage).
+
+### Phase 5 slice 2 — issue-comment (single-phase, TOOL-ONLY)
+- `src/workflows/issue-comment.ts` (`run`→`runIssueComment(ctx,deps)`). Reads issue/PR
+  thread via bound read tools (NO sandbox; skill caps ≤2 reads). Mints `issues-write`
+  (model key `comment`).
+- agent `src/agent-lib/issue-comment.ts` (`createIssueCommentAgent`) +
+  `issue-comment-prompt.ts` (issue title/body + prior comments + the TRIGGERING comment
+  UNTRUSTED-wrapped). Agent composes free-form markdown reply (no marker).
+- **reply→deterministic post** `src/issue-comment-post.ts`
+  (`postIssueReplyDeterministically`, bound ref+token, NOT a model tool):
+  `issues.createComment`. **BOT-LOOP floor** (`isBotSender`): skip if triggering sender
+  is bot/`[bot]`. **DEDUP** (Q5.4): invisible `<!-- lastlight:reply-to:<commentId> -->`
+  marker; `alreadyReplied` scans bot-authored comments → re-invoke/duplicate never
+  double-replies (human-pasted marker ignored — author-checked).
+- Tests +15 (run-level + prompt golden + poster security). Last commit: Phase 5 slice 2.
+
+### Phase 5 slice 3 — pr-fix (standalone executor-on-a-PR, SANDBOXED)
+- `src/workflows/pr-fix.ts` (`run`→`runPrFix(ctx,deps)`). Mints **`repo-write`** (PEM
+  wall, downscoped); resolves the PR HEAD ref deterministically (`pulls.get().head.ref`,
+  workflow code); `withPrFixSandbox` (new in build-sandbox.ts) pre-clones + checks out
+  the EXISTING PR head BRANCH (`git clone --branch <headRef>`, NOT `checkout -B` → fix
+  lands on the PR's branch); REUSES `createFixAgent`; renders `pr-fix.md` via
+  `renderPrFixPrompt` (fix request + CI text + PR title UNTRUSTED-wrapped). Agent fixes
+  + COMMITS in-sandbox; workflow reads HEAD sha + PUSHES the BOUND head branch via the
+  mocked `pushBranch` seam; then a deterministic ack comment (`src/pr-fix-post.ts`,
+  bound ref). Container ALWAYS torn down in `finally` (incl. clone-fail); token redacted.
+- Tests +17 (prompt golden + sandbox variant + run-level + ack-poster). Last commit:
+  Phase 5 slice 3 (pr-fix).
+
+### Phase 5 slice 4 — answer (single-phase, TOOL-ONLY)
+- `src/workflows/answer.ts` (`run`→`runAnswer(ctx,deps)`). Mints `issues-write` (model
+  key `answer`). vs issue-comment: a THOROUGH SOURCED reply — reads more repo context,
+  applies the `question` label, leaves the issue OPEN.
+- agent `src/agent-lib/answer.ts` (`createAnswerAgent`, `issue-answer` skill) +
+  `answer-prompt.ts` (issue title/body/comments + routed question UNTRUSTED-wrapped).
+- **answer→deterministic post+label** `src/answer-post.ts`
+  (`postAnswerDeterministically`, bound ref+token): `issues.createComment` + applies
+  `question` label (idempotent; 403/422 best-effort, never fails the run). **DEDUP keyed
+  by ISSUE number** (no triggering comment) — `<!-- lastlight:answer:N -->` marker,
+  author-checked.
+- **WEB-RESEARCH DEFERRED:** reference answer phase used web_search + unrestricted_egress
+  + checkout. This slice scopes the agent to the repo/GitHub-context path (flags
+  unverified facts); web-research = **TODO(phase-5/web-tools)** seam in createAnswerAgent
+  + answer-prompt. (NOTE: web tools later built in slice 5 + consumed by explore in slice
+  6; answer was left as-is — the web-research seam in answer remains an open TODO.)
+- Tests +13 (run-level + prompt golden + poster security). Last commit: Phase 5 slice 4.
+
+### Phase 5 slice 5 — web tools built (gated-not-global)
+- `src/tools/web.ts` — FACTORIES returning Flue `defineTool`s, GATED, not global.
+  Resolves the design phase-5 §DRIFT (Flue has NO built-in web_search/web_fetch).
+- **`web_search(opts?)`** — provider precedence **Tavily › Exa › Brave** by KEY PRESENCE
+  (`TAVILY_API_KEY` primary; `EXA_API_KEY`/`BRAVE_API_KEY` aliases). Provider + key
+  CLOSED OVER, NEVER model-selectable (model supplies only `query` + optional `count`≤10).
+  No provider key → graceful "unavailable" string, never a throw. Clients implemented
+  host-side (Tavily POST /search, Exa POST /search, Brave GET web/search). Key never
+  logged/returned.
+- **`web_fetch(opts?)`** — fetches a model URL host-side, HTML→text, truncated (20k).
+  🚨 **SERVER-SIDE SSRF GUARD** (`guardFetchUrl`, non-stub): runs on the NODE server (NOT
+  the sandbox → deferred egress floor does NOT cover it). REFUSES non-http(s) schemes +
+  any host that IS or **RESOLVES TO** private/loopback/link-local/unique-local/metadata
+  (127/8, 10/8, 172.16/12, 192.168/16, **169.254.0.0/16 incl. 169.254.169.254**, ::1,
+  fc00::/7, fe80::/10) + `localhost`/`metadata.google.internal` by name. **Resolves the
+  host first** (injectable `resolveHost`) → defeats DNS-rebinding; `redirect:'error'`.
+  Reuses `isPrivateOrInternalIp`/`INTERNAL_HOSTNAMES` from `engine/egress-allowlist.ts`.
+  Blocked URL → refusal string, NO request issued.
+- **GATED-not-global:** `webTools(opts?)` returns `[web_search, web_fetch]` for opt-in via
+  `tools:[...]`; bound onto the explorer agent + opt-in phases LATER, NOT every agent.
+  `hasWebSearchProvider()` helper. `answer` left as-is.
+- Tests +24 (+1 skipped live Tavily smoke, `skipIf(!WEB_TOOLS_LIVE=1)`). NO LIVE WEB CALL
+  by default — provider HTTP + DNS resolver MOCKED/injected. Last commit: Phase 5 slice 5.
+
+### Phase 5 slice 6 — explore (Socratic reply-gate loop)
+- **Path taken: VERIFIED-THE-WIP** (not a rewrite). A stashed WIP (10 files, 31 tests)
+  was clean, correct, typecheck/test/build green out of the box; `git stash@{0}` popped +
+  dropped. The one addition: wired `recoverOrphanExploreRuns()` into `src/app.ts`'s
+  boot-recovery hook (parallel to build's, same run-once/non-blocking/non-fatal guards).
+- **Loop shape** (`src/workflows/explore.ts` → `runExplore(ctx,store,deps)`): read/research
+  → socratic ask-loop( ask → **REPLY GATE** pause → human reply folds into
+  `scratch.socratic.qa` → re-invoke → next round; break on `READY`, cap
+  MAX_SOCRATIC_ROUNDS=8 ) → synthesize → **deterministic publish**. Durability =
+  app-owned `ExploreRunStore` (raw sqlite, `src/explore-run-store.ts`): phasesDone cursor
+  + socraticIter + pendingGate + restart breaker (≤3). PARALLEL to build's run-store by
+  design (the reply gate resolves with ANSWER TEXT, not approve/reject) — kept separate.
+- **Reply gate** (`src/resume-explore.ts` `resumeExplore(runId,reply)`): folds the answer
+  into the transcript BEFORE the idempotent re-invoke; breaker does NOT bump on a normal
+  reply, only on a crash/boot re-entry. Idempotent: duplicate/terminal replies no-ops;
+  unknown runId → failed (no throw).
+- **Web tools GATED to research phases** (`src/agent-lib/explore.ts` `createExploreAgent`):
+  read/ask/synthesize opt into `webTools()`; publish does NOT (app code). Provider key
+  closed over, never model-selectable.
+- **Deterministic publish** (`src/explore-publish.ts`): bound ref + token, NOT a model
+  tool. GitHub-origin → comment on bound issue; Slack-origin → new issue in
+  EXPLORE_DEFAULT_REPO. DEDUP marker keyed by runId (author-checked). Reply-gate question
+  post (`src/explore-github-post.ts`) likewise deterministic + bound.
+- **UNTRUSTED-wrapping** (`src/agent-lib/explore-prompts.ts`): issue title/body, triggering
+  comment, AND every accumulated human reply UNTRUSTED-wrapped; hostile close-marker
+  injection neutralized (golden-tested).
+- Tests +31 (suite 481→512). Stash final: popped + dropped. Commit `95bf683`. Resumed
+  2026-06-22 — explore VERIFIED + committed (stash popped & dropped).
+
+### Phase 5 slice 7 — repo-health (repo-scoped cron/CLI scan)
+- `src/workflows/repo-health.ts` (`run`→`runRepoHealth(ctx,deps)`). Input `{owner,repo,
+  triggerType?}` — REPO-SCOPED (no issue/PR). Single-phase TOOL-ONLY agent (NO sandbox;
+  gathers metrics via bound `github_*` read tools). Mints `issues-write` (see profile note).
+- agent `src/agent-lib/repo-health.ts` (`createHealthAgent`: `health` key, persona,
+  `repo-health` skill, READ-ONLY github tools) + `repo-health-prompt.ts` (repo slug +
+  trigger metadata; DESCRIPTION/topics UNTRUSTED-wrapped; contract = ONLY report markdown).
+- **report→deterministic delivery + IDEMPOTENCY** `src/repo-health-post.ts`
+  (`deliverHealthReport`, bound ref+token): delivers to an idempotent per-repo TRACKING
+  ISSUE — find existing OPEN bot-authored marker-carrying
+  (`<!-- lastlight:repo-health:owner/repo -->`) issue → UPDATE title+body; else CREATE.
+  Weekly cron / crash re-invoke never piles up duplicates. Marker author-checked; PRs
+  skipped; `repo-health` label best-effort (403 skip / 422 ok). Empty report → no-op.
+- **PROFILE DEVIATION (documented):** reference repo-health is READ-only + surfaces via
+  Slack/CLI (no GitHub write). Channel sink is Phase 6 (not built), so this delivers via
+  the one durable idempotent surface now — a tracking issue — hence `issues-write`.
+  Slack/channel delivery lands behind the same `deliver` seam with Phase 6
+  (TODO(phase-6/channels)).
+- Tests +15 (suite 512→527). Commit `3d52fba`.
+
+### Phase 5 slice 8 — read-only CHAT agent
+- `src/agents/chat.ts` — DISCOVERED agent (default `createAgent(({id})=>…)` + `route` open
+  [TODO(phase-6) channel auth] + `description`). `id`=per-THREAD key → durable per-thread
+  session (db.ts sqlite); agent instance==thread, replaces reference messaging_sessions/
+  rehydrate. Thin shell; logic in `src/agent-lib/chat.ts` (CHAT_SUFFIX, parseChatThread
+  id→repo, buildChatAgentConfig) + `chat-token.ts` (mintReadOctokitFor — **read**-profile
+  token, DI seam).
+- **READ-ONLY HARD INVARIANT (spec/11):** ONLY githubReadTools (GET-only, bound per-thread
+  repo), NO web tools (web gated to explorer only), NO write/mutating tools, NO sandbox/cwd.
+  persona+chat-suffix instructions (one persona source). Risk #5 latency=sandbox-less+
+  GET-only; risk #6 serialization=Flue per-instance ordered submission queue (documented,
+  not implemented).
+- Tests +19 (suite 527→546). discovery agents={chat,hello}. Commit `03c7e4c`.
+
+### Phase 5 slice 9 — security-review (kind:health, repo-scoped, SANDBOXED)
+- `src/workflows/security-review.ts` (`run`→`runSecurityReview(ctx,deps,scanDate)`).
+  SIBLING of repo-health but SANDBOXED — mints `issues-write` (contents:read clone + issues:
+  write file), REUSES `withBuildSandbox` (by IMPORT) to CLONE; agent
+  `src/agent-lib/security-review.ts` (`security-review` skill, persona, model/thinking key
+  `security`, read tools, sandbox+cwd /workspace) reviews checkout → REPORT; prompt wraps
+  repo desc/topics UNTRUSTED.
+- **DETERMINISTIC dated-issue post** `src/security-review-post.ts` (`fileSecurityScanIssue`,
+  bound ref+token): inverts the ref agent-files-issue → workflow files a NEW dated snapshot
+  (title `Security scan — <date>`, labels `[security,security-scan]`, issue-format for
+  security-feedback); CREATE each run (never update-in-place); NO_FINDINGS/empty → files
+  nothing.
+- **gitleaks/semgrep DEFERRED** (image lacks them + egress deferred) → LLM SDLC review only,
+  `TODO(phase-9/egress + scanner-image)` (no apt-install).
+- Tests +18 (suite 546→564), incl. REAL sandbox clone + ALWAYS-teardown(incl. throw).
+  discovery+=security-review (workflows=10). Commit `1530ab1`.
+
+### Phase 5 slice 10 — security-feedback (kind:health, single-phase, TOOL-ONLY)
+- `src/workflows/security-feedback.ts` (`run`→`runSecurityFeedback(ctx,deps,today)`).
+  CONSUMER of the `Security scan — <date>` issue files. Mints `issues-write`; FETCHES +
+  PARSES the parent body DETERMINISTICALLY (`agent-lib/security-feedback-parse.ts`: version
+  check + finding-row/severity regex from issue-format.md). Agent
+  (`agent-lib/security-feedback.ts`, `security-feedback` skill, persona, model key
+  `security`, read tools, NO sandbox) CLASSIFIES intent+selection → `FEEDBACK:` marker;
+  workflow ACTS.
+- **PRIMARY create-issues flow** (`src/security-feedback-post.ts`, bound ref+token): files
+  sub-issues (labels `[security,<severity>]`), rewrites parent rows pending/ticked→broken-
+  out (`~~…~~ → #N`), posts summary. discuss/reopen→reply; version-mismatch/empty-selection
+  →canned reply; ignore→noop. UNTRUSTED-wrap parent body + triggering comment.
+  **accept-risk/false-positive SECURITY.md-PR DEFERRED** TODO(phase-9/security-md-pr)
+  (needs clone+push).
+- Tests +23 (suite 564→587). discovery+=security-feedback (workflows=11). Commit `70d5536`.
+
+### Phase 5 slice 11 — pr-comment (kind:comment, single-phase, TOOL-ONLY)
+- `src/workflows/pr-comment.ts` (`run`→`runPrComment(ctx,deps)`). PR-side analogue of
+  issue-comment (Q on a PR → agent reads PR+thread → evidence-cited reply → DETERMINISTIC
+  createComment on bound PR). Distinct b/c PR Qs need the DIFF + 8-read cap: workflow
+  fetches PR+unified DIFF deterministically and seeds the prompt; agent
+  `agent-lib/pr-comment.ts` = `pr-comment` skill, persona, model key `comment`, read tools
+  (incl. diff), NO sandbox.
+- **REUSES (by import, no shared edits)** `issue-comment-post.ts` poster + `isBotSender`/
+  dedup-marker guards (PR accepts issue comments, same endpoint) + `IssueCommentRef`.
+  Profile `issues-write`. Prompt `agent-lib/pr-comment-prompt.ts` UNTRUSTED-wraps title/
+  body/DIFF/comments + triggering Q.
+- Tests +10 (suite 587→597). discovery+=pr-comment (workflows=12). Commit `76a9e25`.
+
+### Phase 5 slice 12 — CRONS + graceful-shutdown FINALIZE → PHASE 5 COMPLETE
+- **`src/crons.ts`** (top-level, NOT discovered): `CronRegistry` of the 4 reference crons —
+  cron-health(`0 9 * * 1`→repo-health), cron-security(`0 10 * * 1`→security-review),
+  cron-triage(`*/15`→issue-triage, webhook-gated), cron-review(`*/30`→pr-review,
+  webhook-gated). Each tick FANS OUT over `config.managedRepos` (split owner/repo) →
+  INVOKES per repo via the `resume.ts` mechanism (spawn `flue run <wf> --payload`,
+  INJECTABLE seam). POSITIVE-ENABLE = not in `disabled.crons` AND (webhook-gated ⇒ webhooks
+  off). Crons built `{paused:true}` → no timer until `start()`; per-repo failure isolated;
+  overlap-skip.
+- **VITEST-INERT:** `startCrons()` run-once + skipped under VITEST/LASTLIGHT_SKIP_CRONS →
+  tests/imports NEVER schedule a real timer or spawn `flue run`. Wired at app.ts module
+  scope beside boot-recovery.
+- **SHUTDOWN FINALIZED** (twice-deferred): additive `process.on('SIGTERM'|'SIGINT')→
+  stopCrons()` in app.ts (runs alongside Flue's generated-entry handler; NOT a forked
+  server entry; non-fatal, no exit).
+- Tests +17 (597→614 passed/6 skipped). croner@9 added. flue build green; discovery
+  UNCHANGED (agents{chat,hello}+12 wf, no phantom); grep -c vitest dist=1. Phase 5 ✅
+  COMPLETE. Commit `7718f71`.
