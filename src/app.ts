@@ -24,6 +24,11 @@ import {
   toTranscriptMessages,
   type SessionReader,
 } from './admin/session-reader.ts';
+import {
+  buildStatsResponse,
+  createDefaultStatsReader,
+  type StatsReader,
+} from './admin/stats-reader.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
 import { startCrons, stopCrons } from './crons.ts';
@@ -152,6 +157,14 @@ export interface CreateAppOptions {
    * routes 501 (honest) — the default export wires the real Flue-backed reader.
    */
   sessionReader?: SessionReader;
+  /**
+   * The per-phase STATS data layer backing `/admin/api/stats` (Phase 7 · slice 2).
+   * Rolls up the app-owned `executions` table (cost/tokens per phase/workflow,
+   * totals) into the dashboard + `lastlight stats` CLI shape. Injected so the
+   * route tests OFFLINE with a fake. When omitted, `/admin/api/stats` 501s
+   * (honest) — the default export wires the on-disk stats-store reader.
+   */
+  statsReader?: StatsReader;
 }
 
 /**
@@ -390,10 +403,23 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
     });
   }
 
-  // Genuinely-Phase-7 routes (not backable yet): per-phase stats rollups. 501.
-  for (const path of ['/admin/api/stats'] as const) {
-    app.get(path, (c) =>
-      c.json({ error: 'not_implemented', route: path, slice: 'phase-7' }, 501),
+  // ── Stats — per-phase cost/token rollups (Phase 7 · slice 2) ──────────────
+  // Backed by the injected StatsReader seam (the app-owned `executions` table,
+  // src/stats-store.ts). Operator-auth gated by the `/admin/api/*` middleware
+  // above. Returns the CLI's `{ total_executions, today_count, running,
+  // by_skill }` surface PLUS the richer `{ byPhase, byWorkflow, byRun, totals }`
+  // rollups the dashboard shows. An EMPTY store returns honest ZEROS (never
+  // fabricated). Without a reader the route 501s (honest) — the default export
+  // wires the real on-disk-stats-store reader.
+  const statsReader = opts.statsReader;
+  if (statsReader) {
+    app.get('/admin/api/stats', (c) => c.json(buildStatsResponse(statsReader)));
+  } else {
+    app.get('/admin/api/stats', (c) =>
+      c.json(
+        { error: 'not_implemented', route: '/admin/api/stats', slice: 'phase-7 (no stats reader wired)' },
+        501,
+      ),
     );
   }
   // No session reader wired (e.g. createApp() with no opts in a unit test) →
@@ -450,6 +476,7 @@ const app = createApp({
   runsReader: liveRunsReader,
   approvals: createDefaultApprovalsBackend(),
   sessionReader: createDefaultSessionReader(),
+  statsReader: createDefaultStatsReader(),
 });
 app.route('/', flue());
 

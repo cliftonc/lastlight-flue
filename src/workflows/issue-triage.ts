@@ -35,6 +35,7 @@
  */
 import type { FlueContext } from "@flue/runtime";
 import { Octokit } from "octokit";
+import { runPhasePrompt } from "../agent-lib/record-execution.ts";
 import {
   parseTriageClassification,
   classificationToLabels,
@@ -182,7 +183,13 @@ async function runTriageSession(
     comments: issue.comments,
     triggerType: ctx.payload.triggerType,
   };
-  const res = await session.prompt(renderTriagePrompt(promptCtx));
+  // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
+  // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
+  const res = await runPhasePrompt(session, renderTriagePrompt(promptCtx), {
+    runId: ctx.id,
+    workflow: 'issue-triage',
+    phase: 'triage',
+  });
   return res.text;
 }
 

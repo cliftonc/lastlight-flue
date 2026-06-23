@@ -34,6 +34,7 @@
  */
 import type { FlueContext } from "@flue/runtime";
 import { Octokit } from "octokit";
+import { runPhasePrompt } from "../agent-lib/record-execution.ts";
 import { parseReviewerVerdict, type ReviewerVerdict } from "../engine/verdict.ts";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -170,13 +171,17 @@ async function runReviewerSession(
   const agent = createReviewerAgent(ref, octokit, sandbox);
   const harness = await ctx.init(agent);
   const session = await harness.session();
-  const res = await session.prompt(
+  // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
+  // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
+  const res = await runPhasePrompt(
+    session,
     renderReviewPrompt({
       owner: ref.owner,
       repo: ref.repo,
       prNumber: ref.pull_number,
       triggerType: ctx.payload.triggerType,
     }),
+    { runId: ctx.id, workflow: 'pr-review', phase: 'review' },
   );
   return res.text;
 }

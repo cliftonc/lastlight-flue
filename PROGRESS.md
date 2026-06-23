@@ -52,7 +52,19 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   matched (`{sessions,liveCount}`/`{session}`/`{source,messages,last_id}`). +19
   tests (10 adapter, 9 route incl. blob-free/404/auth-401). flue build green,
   discovery unchanged, dist vitest=1. Suite **749 passed / 6 skipped**.
-- **NEXT = Phase 7 slice 2** — stats rollups (app-owned `executions` table) OR OTel.
+- **Phase 7 slice 2 — STATS ROLLUPS ✅.** App-owned `executions` table
+  (`src/stats-store.ts`, raw sqlite like run-store: run_id/workflow/phase/model/
+  tokens/cost_total/created_at, additive CREATE-IF-NOT-EXISTS + indexes, blob-free)
+  + `record()` + rollups (statsByPhase/Workflow/Run, totals, countSince). Recording
+  via shared `runPhasePrompt(session,text,{runId,workflow,phase})` seam
+  (`record-execution.ts`) — NON-FATAL + TEST-INERT (no-op under VITEST unless
+  `setExecutionRecorder` injects a fake). Wired into ALL build phases (guardrails/
+  architect/executor/reviewer/fix) + pr-review + issue-triage; rest TODO-adopt
+  (same 1-liner). `/admin/api/stats` [replaced 501] behind injectable `StatsReader`,
+  operator-auth gated, CLI shape `{total_executions,today_count,running,by_skill}`
+  + rich `{byPhase,byWorkflow,byRun,totals}`, empty→zeros. +21 tests. flue build
+  green, discovery unchanged, dist vitest=1. Suite **770 passed / 6 skipped**.
+- **NEXT = Phase 7 slice 3** — OTel (final Phase-7 slice), then thread-grouping if needed.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker

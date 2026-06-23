@@ -6,6 +6,11 @@ import type {
 } from '@flue/runtime';
 import { createApp, healthBody, authRequiredBody } from '../src/app.ts';
 import type { RunsReader } from '../src/admin/runs-reader.ts';
+import {
+  buildStatsResponse,
+  type StatsReader,
+} from '../src/admin/stats-reader.ts';
+import type { RollupRow, StatsTotals } from '../src/stats-store.ts';
 import { createToken } from '../src/admin/auth.ts';
 
 // Phase 2 · slice 1 — contract tests for the APPLICATION-OWNED server surface.
@@ -74,12 +79,12 @@ describe('app-owned surface (createApp, in-process)', () => {
     }
   });
 
-  it('genuinely-Phase-7 stats route stays 501', async () => {
+  it('stats 501 with NO stats reader wired (honest, not fake)', async () => {
     const res = await app.request('/admin/api/stats');
     expect(res.status).toBe(501);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.error).toBe('not_implemented');
-    expect(body.slice).toBe('phase-7');
+    expect(body.slice).toContain('no stats reader');
   });
 
   it('sessions 501 with NO session reader wired (honest, not fake)', async () => {
@@ -720,5 +725,94 @@ describe('admin sessions with injected SessionReader (offline)', () => {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(ok.status).toBe(200);
+  });
+});
+
+// ── Stats — /admin/api/stats backed by an INJECTED fake StatsReader (Phase 7 s2) ─
+// The route aggregates the app-owned `executions` rollups into the dashboard +
+// CLI shape. All offline: a fake StatsReader backs the route, no on-disk store.
+describe('stats endpoint with injected StatsReader (offline)', () => {
+  const phaseRows: RollupRow[] = [
+    { key: 'executor', count: 3, totalCost: 4.5, inputTokens: 600, outputTokens: 120, totalTokens: 720 },
+    { key: 'architect', count: 1, totalCost: 0.5, inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+  ];
+  const workflowRows: RollupRow[] = [
+    { key: 'build', count: 3, totalCost: 4.0, inputTokens: 500, outputTokens: 100, totalTokens: 600 },
+    { key: 'pr-review', count: 1, totalCost: 1.0, inputTokens: 200, outputTokens: 40, totalTokens: 240 },
+  ];
+  const totals: StatsTotals = { count: 4, totalCost: 5.0, inputTokens: 700, outputTokens: 140, totalTokens: 840 };
+
+  const fakeStats = (over: Partial<StatsReader> = {}): StatsReader => ({
+    byPhase: () => phaseRows,
+    byWorkflow: () => workflowRows,
+    byRun: () => [],
+    totals: () => totals,
+    todayCount: () => 2,
+    ...over,
+  });
+
+  function statsApp(reader: StatsReader) {
+    return createApp({
+      statsReader: reader,
+      authConfig: { password: '', secret: 'x' },
+      serveDashboard: false,
+    });
+  }
+
+  it('aggregates rollups + the CLI surface', async () => {
+    const app = statsApp(fakeStats());
+    const res = await app.request('/admin/api/stats');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.total_executions).toBe(4);
+    expect(body.today_count).toBe(2);
+    expect(body.running).toBe(0);
+    // by_skill (CLI shape) keyed by workflow; count real, success/fail run-level → 0.
+    expect(body.by_skill.build).toEqual({ count: 3, success: 0, fail: 0 });
+    expect(body.byPhase[0].key).toBe('executor');
+    expect(body.byWorkflow[1].key).toBe('pr-review');
+    expect(body.totals.totalCost).toBeCloseTo(5.0);
+  });
+
+  it('empty store → honest zeros (not fabricated)', async () => {
+    const app = statsApp(
+      fakeStats({
+        byPhase: () => [],
+        byWorkflow: () => [],
+        byRun: () => [],
+        totals: () => ({ count: 0, totalCost: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 }),
+        todayCount: () => 0,
+      }),
+    );
+    const res = await app.request('/admin/api/stats');
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.total_executions).toBe(0);
+    expect(body.today_count).toBe(0);
+    expect(body.by_skill).toEqual({});
+    expect(body.byPhase).toEqual([]);
+  });
+
+  it('operator auth gates the stats route → 401 without a token', async () => {
+    const SECRET = 'sek';
+    const app = createApp({
+      statsReader: fakeStats(),
+      authConfig: { password: 'pw', secret: SECRET },
+      serveDashboard: false,
+    });
+    const res = await app.request('/admin/api/stats');
+    expect(res.status).toBe(401);
+
+    const token = createToken(SECRET, 'password');
+    const ok = await app.request('/admin/api/stats', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(ok.status).toBe(200);
+  });
+
+  it('buildStatsResponse is a pure aggregator', () => {
+    const body = buildStatsResponse(fakeStats());
+    expect(body.total_executions).toBe(4);
+    expect(body.by_skill['pr-review']).toEqual({ count: 1, success: 0, fail: 0 });
+    expect(body.byPhase).toBe(phaseRows);
   });
 });

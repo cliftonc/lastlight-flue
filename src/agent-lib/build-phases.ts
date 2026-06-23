@@ -48,6 +48,7 @@ import {
   type BuildContainer,
 } from './build-sandbox.ts';
 import type { RepoRef } from '../tools/github-read.ts';
+import { runPhasePrompt } from './record-execution.ts';
 
 // Phase 4 — the BuildDeps DI seam (mirrors pr-review's `deps` pattern).
 //
@@ -264,7 +265,13 @@ async function runGuardrailsSession(
   const agent = createGuardrailsAgent(ref, octokit, sandbox);
   const harness = await ctx.init(agent);
   const session = await harness.session('guardrails');
-  const res = await session.prompt(prompt);
+  // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
+  // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
+  const res = await runPhasePrompt(session, prompt, {
+    runId: ctx.payload.runId,
+    workflow: 'build',
+    phase: 'guardrails',
+  });
   return res.text;
 }
 
@@ -382,7 +389,11 @@ async function runArchitectSession(
   // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
   // re-open exactly the architect conversation.
   const session = await harness.session('architect');
-  const res = await session.prompt(prompt);
+  const res = await runPhasePrompt(session, prompt, {
+    runId: ctx.payload.runId,
+    workflow: 'build',
+    phase: 'architect',
+  });
   return res.text;
 }
 
@@ -496,7 +507,11 @@ async function runExecutorSession(
   // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
   // re-open exactly the executor conversation.
   const session = await harness.session('executor');
-  const res = await session.prompt(prompt);
+  const res = await runPhasePrompt(session, prompt, {
+    runId: ctx.payload.runId,
+    workflow: 'build',
+    phase: 'executor',
+  });
   return res.text;
 }
 
@@ -645,7 +660,11 @@ async function runReviewerSession(
   // Top-level NAMED per-cycle session (`reviewer:0` / `recheck:0` — NOT a subagent)
   // so a post-gate resume re-opens exactly the right cycle's conversation.
   const session = await harness.session(sessionName);
-  const res = await session.prompt(prompt);
+  const res = await runPhasePrompt(session, prompt, {
+    runId: ctx.payload.runId,
+    workflow: 'build',
+    phase: sessionName,
+  });
   return res.text;
 }
 
@@ -761,7 +780,11 @@ async function runFixSession(
   const agent = createFixAgent(ref, octokit, sandbox);
   const harness = await ctx.init(agent);
   const session = await harness.session(sessionName);
-  const res = await session.prompt(prompt);
+  const res = await runPhasePrompt(session, prompt, {
+    runId: ctx.payload.runId,
+    workflow: 'build',
+    phase: sessionName,
+  });
   return res.text;
 }
 
