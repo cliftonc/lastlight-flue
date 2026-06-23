@@ -19,6 +19,11 @@ import {
   createDefaultApprovalsBackend,
   type ApprovalsBackend,
 } from './admin/approvals.ts';
+import {
+  createDefaultSessionReader,
+  toTranscriptMessages,
+  type SessionReader,
+} from './admin/session-reader.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
 import { startCrons, stopCrons } from './crons.ts';
@@ -137,6 +142,16 @@ export interface CreateAppOptions {
    * real build-run-store-backed backend.
    */
   approvals?: ApprovalsBackend;
+  /**
+   * The session/transcript data layer backing `/admin/api/sessions` (Phase 7).
+   * Lists workflow-run sessions blob-free (via `RunStore.listRuns`) and reads a
+   * session's transcript from Flue's durable `EventStreamStore`
+   * (`runStreamPath`/`agentStreamPath`), mapping its events → the dashboard's
+   * transcript shape. Injected so the routes test OFFLINE with a fake (the real
+   * Flue stores throw outside a configured runtime). When omitted, the session
+   * routes 501 (honest) — the default export wires the real Flue-backed reader.
+   */
+  sessionReader?: SessionReader;
 }
 
 /**
@@ -298,11 +313,94 @@ export function createApp(opts: CreateAppOptions = {}): Hono {
     );
   }
 
-  // Genuinely-Phase-7 routes (not backable by listRuns/getRun/listAgents):
-  // per-phase stats rollups + session transcripts (EventStreamStore). Stay 501.
-  for (const path of ['/admin/api/stats', '/admin/api/sessions'] as const) {
+  // ── Sessions / transcripts — Flue durable store (Phase 7 · slice 1) ───────
+  // Backed by the injected SessionReader seam (RunStore.listRuns for the
+  // blob-free session LIST + EventStreamStore.readEvents for a session's
+  // TRANSCRIPT, mapped to the dashboard's message shape). Operator-auth gated by
+  // the `/admin/api/*` middleware above. Matches the reference dashboard's
+  // response envelopes (`{ sessions, liveCount }` / `{ session }` /
+  // `{ source, messages, last_id }`). Without a reader the routes 501 (honest) —
+  // the default export wires the real Flue-backed reader.
+  const sessionReader = opts.sessionReader;
+  if (sessionReader) {
+    // Session list — blob-free (listRuns pointers; NO transcript read). Mirrors
+    // the reference `{ sessions, liveCount }` shape; `liveCount` is 0 here
+    // (container-liveness is a sandbox concern not modelled this slice).
+    app.get('/admin/api/sessions', async (c) => {
+      const limitRaw = c.req.query('limit');
+      const limit = limitRaw
+        ? Math.min(Math.max(parseInt(limitRaw, 10) || 200, 1), 1000)
+        : undefined;
+      const cursor = c.req.query('cursor') || undefined;
+      const res = await sessionReader.listSessions({ limit, cursor });
+      return c.json({
+        sessions: res.sessions,
+        liveCount: 0,
+        nextCursor: res.nextCursor,
+      });
+    });
+
+    // Single session meta. 404 when the id resolves to no run/agent stream.
+    app.get('/admin/api/sessions/:id', async (c) => {
+      const id = c.req.param('id') ?? '';
+      if (!(await sessionReader.exists(id))) {
+        return c.json({ error: 'session not found' }, 404);
+      }
+      // Derive live counts from the transcript (the list path stays blob-free).
+      const kind = c.req.query('kind') === 'agent' ? 'agent' : 'run';
+      const t = await sessionReader.readTranscript(id, { kind });
+      const messages = toTranscriptMessages(t.events);
+      const toolCount = messages.reduce(
+        (n, m) => n + (m.tool_calls?.length ?? 0),
+        0,
+      );
+      const lastAssistant = [...messages]
+        .reverse()
+        .find((m) => m.role === 'assistant' && typeof m.content === 'string');
+      const model = messages.find((m) => m.model)?.model ?? null;
+      return c.json({
+        session: {
+          id,
+          source: kind === 'agent' ? 'chat' : 'run',
+          sessionType: kind === 'agent' ? 'chat' : 'run',
+          model,
+          message_count: messages.length,
+          tool_call_count: toolCount,
+          conversation_message_count: messages.length,
+          last_assistant_content:
+            typeof lastAssistant?.content === 'string' ? lastAssistant.content : null,
+          agentIds: [],
+        },
+      });
+    });
+
+    // Transcript — the durable event stream mapped to the dashboard's messages.
+    // Mirrors the reference `{ source, messages, last_id }`; `last_id` here is
+    // the stream's resume offset (catch-up read; SSE-follow reuses GET /runs/:id).
+    app.get('/admin/api/sessions/:id/messages', async (c) => {
+      const id = c.req.param('id') ?? '';
+      if (!(await sessionReader.exists(id))) {
+        return c.json({ source: 'none', messages: [], last_id: null });
+      }
+      const kind = c.req.query('kind') === 'agent' ? 'agent' : 'run';
+      const since = c.req.query('since') || undefined;
+      const t = await sessionReader.readTranscript(id, { kind, offset: since });
+      const messages = toTranscriptMessages(t.events).map((m, i) => ({ id: i, ...m }));
+      return c.json({ source: 'flue', messages, last_id: t.nextOffset });
+    });
+  }
+
+  // Genuinely-Phase-7 routes (not backable yet): per-phase stats rollups. 501.
+  for (const path of ['/admin/api/stats'] as const) {
     app.get(path, (c) =>
       c.json({ error: 'not_implemented', route: path, slice: 'phase-7' }, 501),
+    );
+  }
+  // No session reader wired (e.g. createApp() with no opts in a unit test) →
+  // 501 the session routes so the surface is complete and honest.
+  if (!sessionReader) {
+    app.get('/admin/api/sessions', (c) =>
+      c.json({ error: 'not_implemented', route: '/admin/api/sessions', slice: 'phase-7 (no session reader wired)' }, 501),
     );
   }
   // When no reader is injected (e.g. createApp() with no opts in a unit test),
@@ -351,6 +449,7 @@ const liveRunsReader: RunsReader = { listRuns, getRun, listAgents };
 const app = createApp({
   runsReader: liveRunsReader,
   approvals: createDefaultApprovalsBackend(),
+  sessionReader: createDefaultSessionReader(),
 });
 app.route('/', flue());
 

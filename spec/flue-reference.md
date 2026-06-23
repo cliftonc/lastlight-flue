@@ -519,16 +519,42 @@ Do not assume `09`/older notes' "Flue's `web_search` (Pi)" — it must be built.
   (`define-store-contract-tests`) any adapter must pass — useful to validate a
   custom/extended adapter.
 
-- **Read paths (validated against `RunStore`/`EventStreamStore` source):**
-  `listRuns({ status, workflowName, limit, cursor })` returns blob-free pointers
-  (satisfies "list excludes blobs" natively); `getRun(id)` for detail; an
-  **`EventStreamStore`** yields transcripts via `runStreamPath(runId)` and
-  `agentStreamPath(name, instanceId)`. This is what **replaces** Last Light's
-  JSONL shim + `SessionReader`/`ChatSessionReader` (§— retired in `10`). `GET
-  /runs/<id>` + `client.runs` remain the HTTP read paths.
+- **Read paths (VERIFIED vs INSTALLED beta.2, 2026-06-23 — Phase 7 s1; this
+  OVERRIDES the @main design narrative which drifted):**
+  - `listRuns({ status, workflowName, limit, cursor })` returns blob-free pointers
+    (satisfies "list excludes blobs" natively); `getRun(id)` for detail (§0).
+  - **`EventStreamStore`** (`dist/event-stream-store-*.d.mts`) is the transcript
+    source. The READ method is **`readEvents(path, { offset?, limit? })`** (NOT
+    `read(...)` as the design said), returning `{ events: Array<{ data: unknown;
+    offset: string }>, nextOffset: string, upToDate: boolean, closed: boolean }`.
+    `offset:"-1"` = from start. `getStreamMeta(path) → { nextOffset; closed } |
+    null` (existence probe). `DEFAULT_READ_LIMIT 100`, `MAX_READ_LIMIT 1000`.
+  - **`runStreamPath`/`agentStreamPath` are NOT public exports** (internal to
+    `handle-agent-*.mjs`). They are trivial VERIFIED templates — `runs/${runId}`
+    and `agents/${name}/${instanceId}` — re-declared in-tree
+    (`src/admin/session-reader.ts` `streamPathForRun`/`streamPathForAgent`) to
+    avoid reaching into a hashed internal chunk.
+  - **Obtaining the stores in-process:** there is NO public free function for the
+    `EventStreamStore` instance (the route handlers reach it via internal
+    `requireNodeEventStreamStore(rt)`). The PUBLIC seam is the persistence
+    adapter: `PersistenceAdapter.connect() → PersistenceStores = { runStore,
+    eventStreamStore, executionStore }` (`@flue/runtime/adapter`). The default
+    admin `SessionReader` lazily `connect()`s `src/db.ts`'s `sqlite()` adapter —
+    behind an injectable seam (like `RunsReader`), because `connect()` throws
+    outside a configured runtime.
+  - **Persisted event shape:** the durable stream carries the `FlueEvent` union
+    MINUS `turn_request` (excluded — never persisted; `docs/api/events-reference.md`).
+    Each event is decorated `{ ...event, runId|instanceId, dispatchId?,
+    submissionId?, v:1, eventIndex, timestamp }`. Transcript-relevant types:
+    `message_start`/`message_end` (authoritative user/assistant messages, `message`
+    payload mirrors pi-agent-core `AgentMessage` — **explicitly NOT stable
+    pre-1.0**, so map defensively), `tool_start`/`tool` (tool calls + results),
+    `run_*`/`agent_*`/`log` (lifecycle). `text_delta`/`thinking_*` are buffered
+    live-progress deltas (`isBufferedRunEvent`), NOT transcript rows.
+  - `GET /runs/<id>` + `client.runs` remain the HTTP read paths (SSE-follow).
 - The only views **not** natively reproducible (small app-owned tables): per-phase
-  cost/token **stats rollups** and **messaging-thread grouping**. Validate the
-  rest in Phase 7 before deleting the shim (risk #3).
+  cost/token **stats rollups** and **messaging-thread grouping**. Sessions +
+  transcripts now Flue-backed (Phase 7 s1); stats/grouping pending.
 
 ---
 

@@ -74,14 +74,20 @@ describe('app-owned surface (createApp, in-process)', () => {
     }
   });
 
-  it('genuinely-Phase-7 admin routes stay 501 (stats/sessions)', async () => {
-    for (const path of ['/admin/api/stats', '/admin/api/sessions']) {
-      const res = await app.request(path);
-      expect(res.status).toBe(501);
-      const body = (await res.json()) as Record<string, unknown>;
-      expect(body.error).toBe('not_implemented');
-      expect(body.slice).toBe('phase-7');
-    }
+  it('genuinely-Phase-7 stats route stays 501', async () => {
+    const res = await app.request('/admin/api/stats');
+    expect(res.status).toBe(501);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('not_implemented');
+    expect(body.slice).toBe('phase-7');
+  });
+
+  it('sessions 501 with NO session reader wired (honest, not fake)', async () => {
+    const res = await app.request('/admin/api/sessions');
+    expect(res.status).toBe(501);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe('not_implemented');
+    expect(body.slice).toContain('no session reader');
   });
 
   it('approvals 501 with NO approvals backend wired (honest, not fake)', async () => {
@@ -546,5 +552,173 @@ describe('default approvals backend (build run-store + injected resume)', () => 
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── Sessions / transcripts on the Flue durable store (Phase 7 · slice 1) ──────
+//
+// Routes via `app.request` with the SessionReader seam MOCKED — the real Flue
+// RunStore/EventStreamStore throw outside a configured runtime, so the routes
+// are exercised fully OFFLINE with a fake (list returns blob-free metas; :id
+// returns a transcript; 404 unknown; operator-auth 401).
+
+import type {
+  SessionReader,
+  SessionMeta,
+  TranscriptReadResult,
+} from '../src/admin/session-reader.ts';
+
+describe('admin sessions with injected SessionReader (offline)', () => {
+  const sampleMeta: SessionMeta = {
+    id: 'run_a',
+    source: 'run',
+    sessionType: 'build',
+    model: null,
+    started_at: 1_700_000_000,
+    last_message_at: 1_700_000_300,
+    message_count: 0,
+    tool_call_count: 0,
+    conversation_message_count: 0,
+    last_assistant_content: null,
+    agentIds: [],
+    platform: null,
+  };
+
+  const transcript: TranscriptReadResult = {
+    events: [
+      { data: { type: 'message_end', message: { role: 'user', content: 'hi' }, timestamp: 't1' }, offset: '0_1' },
+      {
+        data: {
+          type: 'message_end',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }, { type: 'tool_use', id: 'tu_1', name: 'github_read', input: {} }], model: 'openai/x' },
+          timestamp: 't2',
+        },
+        offset: '0_2',
+      },
+      { data: { type: 'tool', toolName: 'github_read', toolCallId: 'tu_1', result: 'done', timestamp: 't3' }, offset: '0_3' },
+    ],
+    nextOffset: '0_3',
+    upToDate: true,
+  };
+
+  const fakeReader = (overrides: Partial<SessionReader> = {}): SessionReader => ({
+    async listSessions() {
+      return { sessions: [sampleMeta], nextCursor: 'cur_next' };
+    },
+    async exists(id) {
+      return id === 'run_a';
+    },
+    async readTranscript() {
+      return transcript;
+    },
+    ...overrides,
+  });
+
+  const makeApp = (reader: SessionReader) =>
+    createApp({ sessionReader: reader, authConfig: { password: '', secret: 'x' } });
+
+  it('GET /admin/api/sessions → 200 blob-free list { sessions, liveCount, nextCursor }', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/sessions');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessions: SessionMeta[]; liveCount: number; nextCursor: string | null };
+    expect(body.sessions).toHaveLength(1);
+    expect(body.sessions[0]!.id).toBe('run_a');
+    expect(body.sessions[0]!.message_count).toBe(0); // list path reads no transcript
+    expect(body.liveCount).toBe(0);
+    expect(body.nextCursor).toBe('cur_next');
+  });
+
+  it('list path NEVER calls readTranscript (blob-free invariant)', async () => {
+    let read = 0;
+    const app = makeApp(
+      fakeReader({
+        async readTranscript() {
+          read++;
+          return transcript;
+        },
+      }),
+    );
+    await app.request('/admin/api/sessions');
+    expect(read).toBe(0);
+  });
+
+  it('GET /admin/api/sessions/:id → 200 meta with counts derived from transcript', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/sessions/run_a');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { session: SessionMeta };
+    expect(body.session.id).toBe('run_a');
+    expect(body.session.message_count).toBe(3); // user + assistant + tool rows
+    expect(body.session.tool_call_count).toBe(1);
+    expect(body.session.model).toBe('openai/x');
+    expect(body.session.last_assistant_content).toBe('hello');
+  });
+
+  it('GET /admin/api/sessions/:id/messages → 200 transcript { source, messages, last_id }', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/sessions/run_a/messages');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      source: string;
+      messages: Array<{ id: number; role: string; content?: unknown; tool_calls?: unknown[] }>;
+      last_id: string;
+    };
+    expect(body.source).toBe('flue');
+    expect(body.last_id).toBe('0_3'); // the stream resume offset
+    expect(body.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'tool']);
+    expect(body.messages[1]!.tool_calls).toEqual([
+      { id: 'tu_1', name: 'github_read', arguments: {} },
+    ]);
+  });
+
+  it('GET /admin/api/sessions/:id unknown → 404', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/sessions/nope');
+    expect(res.status).toBe(404);
+  });
+
+  it('GET /admin/api/sessions/:id/messages unknown → 200 empty (source none)', async () => {
+    const app = makeApp(fakeReader());
+    const res = await app.request('/admin/api/sessions/nope/messages');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { source: string; messages: unknown[] };
+    expect(body.source).toBe('none');
+    expect(body.messages).toEqual([]);
+  });
+
+  it('kind=agent selects the chat-agent transcript stream', async () => {
+    let usedKind: string | undefined;
+    const app = makeApp(
+      fakeReader({
+        async exists() {
+          return true;
+        },
+        async readTranscript(_id, opts) {
+          usedKind = opts?.kind;
+          return transcript;
+        },
+      }),
+    );
+    const res = await app.request('/admin/api/sessions/thread-7/messages?kind=agent');
+    expect(res.status).toBe(200);
+    expect(usedKind).toBe('agent');
+  });
+
+  it('operator auth gates the session routes → 401 without a token', async () => {
+    const SECRET = 'sek';
+    const app = createApp({
+      sessionReader: fakeReader(),
+      authConfig: { password: 'pw', secret: SECRET },
+      serveDashboard: false,
+    });
+    const res = await app.request('/admin/api/sessions');
+    expect(res.status).toBe(401);
+
+    const token = createToken(SECRET, 'password');
+    const ok = await app.request('/admin/api/sessions', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(ok.status).toBe(200);
   });
 });

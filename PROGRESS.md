@@ -41,8 +41,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   channels{github,slack}; dist vitest=1 (inlined text, 0 module imports).
 - Phase-6 deferrals: full LIVE Slack e2e needs a public HTTPS endpoint (Phase 8);
   GitHub `check_run` re-review routes still TODO; durable channel dedup = Phase 7.
-- **NEXT = Phase 7** (persistence + re-back admin API). Gate correlation
-  (`conversation_key` col + `findPausedRunByConversation`) detailed in Phase status.
+- **Phase 7 STARTED — sessions/transcripts onto Flue ✅** (slice 1). `/admin/api/
+  sessions` (+`/:id`, `/:id/messages`) re-backed onto Flue's durable store
+  [VERIFIED beta.2 API]: LIST blob-free via `RunStore.listRuns`; TRANSCRIPT via
+  `EventStreamStore.readEvents(runStreamPath|agentStreamPath, {offset,limit})` →
+  pure adapter `toTranscriptMessages` (message_end/tool/run_end → role/content/
+  tool_calls; defensive on unstable `message` payload). `SessionReader` seam
+  (like `RunsReader`) — default lazily `adapter.connect()`s `src/db.ts`; routes
+  test offline w/ a fake. Replaced the `/admin/api/sessions` 501. Dashboard shapes
+  matched (`{sessions,liveCount}`/`{session}`/`{source,messages,last_id}`). +19
+  tests (10 adapter, 9 route incl. blob-free/404/auth-401). flue build green,
+  discovery unchanged, dist vitest=1. Suite **749 passed / 6 skipped**.
+- **NEXT = Phase 7 slice 2** — stats rollups (app-owned `executions` table) OR OTel.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -169,8 +179,8 @@ Durable, reusable facts the loop/subagents rely on. Where a fact is also in
   repo-health (`TODO(phase-6/channels)`, behind the existing `deliver` seam).
 - **Other open TODOs to track:** web-research seam in `answer`
   (`TODO(phase-5/web-tools)` — web tools were built + consumed by explore, but answer
-  was left as-is); Phase-7 admin data (`stats`/`sessions` still 501; RunPointer lacks
-  `currentPhase`/`repo`/`issueNumber`/`restartCount` → returned as explicit `null`);
+  was left as-is); Phase-7 admin data (`stats` still 501; `sessions` DONE [s1];
+  RunPointer lacks `currentPhase`/`repo`/`issueNumber`/`restartCount` → explicit `null`);
   chat-channel auth (`agents/chat.ts` `route` open, `TODO(phase-6) channel auth`).
 - **runtime-file-read follow-up:** `src/config.ts` + `src/admin/dashboard.ts` use
   `import.meta.url`+`readFileSync` for EXTERNAL runtime files (config YAML from cwd;
