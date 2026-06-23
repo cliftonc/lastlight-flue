@@ -18,6 +18,23 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 9 DONE ✅ — `security-review` ported (kind:health, repo-scoped, SANDBOXED)
+- **`src/workflows/security-review.ts`** (`run`→`runSecurityReview(ctx,deps,scanDate)` DI seam): SIBLING
+  of repo-health but SANDBOXED — mints `issues-write` (contents:read clone+issues:write file), REUSES
+  `withBuildSandbox` (by IMPORT) to CLONE; agent `src/agent-lib/security-review.ts` (`security-review` skill,
+  persona, model/thinking key `security`, read tools, sandbox+cwd /workspace) reviews checkout → REPORT;
+  prompt wraps repo desc/topics UNTRUSTED.
+- **DETERMINISTIC dated-issue post** `src/security-review-post.ts` (`fileSecurityScanIssue`, bound ref+token,
+  NOT a model tool): inverts ref agent-files-issue → workflow files a NEW dated snapshot (title
+  `Security scan — <date>`, labels `[security,security-scan]`, issue-format for security-feedback); CREATE each
+  run (never update-in-place); NO_FINDINGS/empty → files nothing.
+- **gitleaks/semgrep DEFERRED** (image lacks them+egress deferred) → LLM SDLC review only,
+  `TODO(phase-9/egress + scanner-image)` (like repo-health's Slack deferral; no apt-install).
+- **Tests +18** (546→564 passed/6 skipped): agent config + prompt golden + run-level (token mint right profile,
+  BOUND ref, NO_FINDINGS no-file, token-not-logged) + REAL sandbox clone + ALWAYS-teardown(incl. throw) + filer
+  (exact em-dash title/labels, snapshot-not-update, 403/422). flue build green; **discovery+=security-review**
+  (workflows=10); grep -c vitest dist=1. **NO LIVE SIDE EFFECT**, no shared-file edits. Next=**security-feedback**.
+
 ## Phase 5 slice 8 DONE ✅ — read-only CHAT agent (`src/agents/chat.ts`)
 - **DISCOVERED agent** (default `createAgent(({id})=>…)` + `route` open [TODO(phase-6) channel auth]
   + `description`). `id`=per-THREAD key → durable per-thread session (db.ts sqlite); agent
