@@ -22,7 +22,7 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - **Phase 6 IN PROGRESS — GitHub ✅ + Slack ✅ (OFFLINE/MOCKED).** Phases 0-5 ✅
   (Phase 4 LIVE build DEFERRED). Suite **696 passed / 6 skipped**.
 - **NEXT = Phase 6 wrap** (router/maintainer-gate finalize, classifier-LLM + reply
-  posts) or **Phase 7**. Slack LIVE verification DEFERRED (needs SLACK_SIGNING_SECRET).
+  posts) or **Phase 7**. Slack runtime-capable (SLACK_SIGNING_SECRET present); full live e2e needs a public endpoint (Phase 8).
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -127,11 +127,13 @@ Durable, reusable facts the loop/subagents rely on. Where a fact is also in
   Crons built `{paused:true}`; positive-enable; per-repo failure isolated; overlap-skip.
 
 ### Carried unknowns / blockers / deferred
-- **⏸ Slack LIVE DEFERRED — needs `SLACK_SIGNING_SECRET`** (HTTP Events API). The Slack
-  channel CODE is built+tested OFFLINE/MOCKED (constructs with a placeholder; server
-  boots + `flue build` passes w/o the secret). NOT in `secrets/.env` (source only has the
-  Socket-Mode app token) → no live signed request verifies until the user adds the real
-  secret. Set `SLACK_SIGNING_SECRET` to activate live ingress, then verify with the user.
+- **Slack: `SLACK_SIGNING_SECRET` NOW PRESENT in `secrets/.env`** (user added 2026-06-23,
+  git-ignored) → the channel is RUNTIME-CAPABLE (real signature verification at runtime;
+  code reads `process.env.SLACK_SIGNING_SECRET ?? placeholder`). Blocker LIFTED. Remaining
+  for full LIVE e2e: a PUBLIC HTTPS endpoint (tunnel/deploy) with the Slack app's Event
+  Subscriptions Request URL → `…/channels/slack/events` — a **Phase-8/cutover (or tunnel)
+  step that changes the user's Slack app config → ask before touching**. Channel built
+  + tested OFFLINE/MOCKED; server boots + `flue build` passes.
 - **⏸ Phase-4 LIVE build acceptance DEFERRED (user-gated):** the live `flue run build`
   (writes real code, pushes a branch, opens a REAL PR, pauses at the gate for human
   approval) is NOT to be run autonomously — run it later WITH THE USER supervising the
