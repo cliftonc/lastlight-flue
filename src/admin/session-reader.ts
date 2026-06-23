@@ -243,15 +243,24 @@ function textOf(content: unknown): string {
   return '';
 }
 
-/** Pull tool_use blocks out of an assistant message's content array. */
+/**
+ * Pull tool-call blocks out of an assistant message's content array. Handles
+ * BOTH the Claude-JSONL shape (`type:'tool_use'`, args under `input`) the
+ * dashboard historically consumed AND Flue's pi-agent shape (`type:'toolCall'`,
+ * args under `arguments`). Without the `toolCall` branch, Flue's tool-calling
+ * assistant turns carry no recognised blocks and get dropped entirely.
+ */
 function toolCallsOf(content: unknown): TranscriptMessage['tool_calls'] | undefined {
   if (!Array.isArray(content)) return undefined;
   const calls = content
     .filter(
-      (b): b is { type?: string; id?: string; name?: string; input?: unknown } =>
-        typeof b === 'object' && b !== null && (b as { type?: string }).type === 'tool_use',
+      (b): b is { type?: string; id?: string; name?: string; input?: unknown; arguments?: unknown } =>
+        typeof b === 'object' &&
+        b !== null &&
+        ((b as { type?: string }).type === 'tool_use' ||
+          (b as { type?: string }).type === 'toolCall'),
     )
-    .map((b) => ({ id: b.id, name: b.name, arguments: b.input }));
+    .map((b) => ({ id: b.id, name: b.name, arguments: b.input ?? b.arguments }));
   return calls.length ? calls : undefined;
 }
 
@@ -269,6 +278,12 @@ export function toTranscriptMessages(events: RawStreamEvent[]): TranscriptMessag
       // Authoritative completed user/assistant messages (stream of record).
       case 'message_end': {
         const msg = (ev.message ?? {}) as { role?: string; content?: unknown; model?: string };
+        // Flue emits every tool result TWICE: once as the canonical `tool`
+        // event (handled below) and again as a message_end with role
+        // `toolResult` (the conversation-message form). Skip the latter — it has
+        // no `assistant`/`user`/`tool` mapping, would fall through to `user`,
+        // and surface raw tool-output JSON as a bogus user message.
+        if (msg.role === 'toolResult' || msg.role === 'tool') break;
         const role = msg.role === 'assistant' ? 'assistant' : 'user';
         const text = textOf(msg.content);
         const calls = role === 'assistant' ? toolCallsOf(msg.content) : undefined;

@@ -181,7 +181,12 @@ async function runResearchPhase(
     token,
     async (sandbox) => {
       const agent = createExploreAgent(ref, octokit, { taskKey, sandbox, withWebTools: true });
-      const harness = await ctx.init(agent);
+      // Distinct harness NAME per phase. Flue allows each harness name to be
+      // initialized once per workflow invocation; explore's first invocation
+      // runs `read` then `ask:0` before the reply gate (2 inits), so the default
+      // 'default' name would collide ("init() has already been called"). The
+      // phase string (`read`/`ask:0`/`synthesize`) is unique within a run.
+      const harness = await ctx.init(agent, { name: phase });
       const session = await harness.session(phase);
       const prompt = renderPhasePrompt(input, run, phase);
       const res = await session.prompt(prompt);

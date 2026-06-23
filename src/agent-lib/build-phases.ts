@@ -263,7 +263,14 @@ async function runGuardrailsSession(
   prompt: string,
 ): Promise<string> {
   const agent = createGuardrailsAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
+  // Distinct harness NAME per phase. Flue allows each harness name to be
+  // initialized ONCE per workflow invocation (api/agent-api: "Each harness name
+  // may be initialized once per context"). A gateless `flue run` executes
+  // several phases in one invocation, so each must init a differently-named
+  // harness — the default 'default' would collide on the 2nd phase with
+  // "init() has already been called with name 'default'". Each phase keeps its
+  // own scoped agent (distinct tools/token), so we cannot share one harness.
+  const harness = await ctx.init(agent, { name: 'guardrails' });
   const session = await harness.session('guardrails');
   // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
   // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
@@ -385,7 +392,8 @@ async function runArchitectSession(
   prompt: string,
 ): Promise<string> {
   const agent = createArchitectAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
+  // Distinct harness name per phase (see runGuardrailsSession).
+  const harness = await ctx.init(agent, { name: 'architect' });
   // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
   // re-open exactly the architect conversation.
   const session = await harness.session('architect');
@@ -503,7 +511,8 @@ async function runExecutorSession(
   prompt: string,
 ): Promise<string> {
   const agent = createExecutorAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
+  // Distinct harness name per phase (see runGuardrailsSession).
+  const harness = await ctx.init(agent, { name: 'executor' });
   // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
   // re-open exactly the executor conversation.
   const session = await harness.session('executor');
@@ -656,7 +665,10 @@ async function runReviewerSession(
   sessionName: string,
 ): Promise<string> {
   const agent = createBuildReviewerAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
+  // Distinct harness name per phase (see runGuardrailsSession). The per-cycle
+  // sessionName (`reviewer:0` / `recheck:0` / …) is unique within an invocation,
+  // so it also disambiguates the harness across reviewer-loop iterations.
+  const harness = await ctx.init(agent, { name: sessionName });
   // Top-level NAMED per-cycle session (`reviewer:0` / `recheck:0` — NOT a subagent)
   // so a post-gate resume re-opens exactly the right cycle's conversation.
   const session = await harness.session(sessionName);
@@ -778,7 +790,9 @@ async function runFixSession(
   sessionName: string,
 ): Promise<string> {
   const agent = createFixAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
+  // Distinct harness name per phase (see runGuardrailsSession); the per-cycle
+  // `fix:N` sessionName is unique within an invocation.
+  const harness = await ctx.init(agent, { name: sessionName });
   const session = await harness.session(sessionName);
   const res = await runPhasePrompt(session, prompt, {
     runId: ctx.payload.runId,

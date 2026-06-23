@@ -250,6 +250,51 @@ describe('toTranscriptMessages (FlueEvent[] → transcript)', () => {
     expect(() => toTranscriptMessages(events)).not.toThrow();
     expect(toTranscriptMessages(events)).toHaveLength(0);
   });
+
+  it("maps Flue's `toolCall` blocks (args under `arguments`) to assistant tool_calls", () => {
+    const events = [
+      ev(
+        {
+          type: 'message_end',
+          message: {
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'hmm' },
+              { type: 'toolCall', id: 'call_1', name: 'github_get_issue', arguments: { number: 277 } },
+            ],
+          },
+        },
+        '0_1',
+      ),
+    ];
+    const rows = toTranscriptMessages(events);
+    // A thinking+toolCall turn (no text) is KEPT because it carries a tool call.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.role).toBe('assistant');
+    expect(rows[0]!.tool_calls).toEqual([
+      { id: 'call_1', name: 'github_get_issue', arguments: { number: 277 } },
+    ]);
+  });
+
+  it('skips `toolResult` role message_end (deduped by the canonical `tool` event)', () => {
+    // Flue emits a tool result as BOTH a `tool` event and a `toolResult`
+    // message_end. Only the `tool` event should produce a row — the toolResult
+    // must NOT become a bogus `user` message of raw tool-output JSON.
+    const events = [
+      ev({ type: 'tool', toolName: 'github_get_issue', toolCallId: 'call_1', result: '{"number":277}' }, '0_1'),
+      ev(
+        {
+          type: 'message_end',
+          message: { role: 'toolResult', content: [{ type: 'text', text: '{"number":277}' }] },
+        },
+        '0_2',
+      ),
+    ];
+    const rows = toTranscriptMessages(events);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.role).toBe('tool');
+    expect(rows.some((r) => r.role === 'user')).toBe(false);
+  });
 });
 
 describe('readFullTranscript (drains every page)', () => {
