@@ -18,12 +18,29 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
-## Current position
-- **Phase 7 ✅ COMPLETE — admin fully re-backed on Flue store + app tables**
-  (sessions/transcripts, stats, OTel, run-record/approvals/gate-correlation, threads).
-  Phases 0-6 ✅ (Phase 4 LIVE build + live Slack e2e DEFERRED → Phase 8).
-  Suite **810 passed / 6 skipped**. **NEXT = Phase 8 cutover** (largely user-gated:
-  live build PR, live Slack e2e, deploy).
+## ⏹ BUILD WRAPPED — FEATURE-COMPLETE (Phases 0-7), loop STOPPED at user request 2026-06-23
+**The /loop is STOPPED.** If a stray scheduled wakeup fires: re-read this, do NOTHING
+(no slice, no subagent, no reschedule) — just stop. Resume ONLY when the user re-runs
+`/loop`. Clean at HEAD (810 passed / 6 skipped, `flue build` green, tree clean).
+
+### Phase 8 — REMAINING (for a future session)
+1. **Egress hardening (autonomous, the #1 deferred risk #1):** re-host the CoreDNS/nginx
+   allowlist + SSRF metadata floor into the Docker `SandboxFactory` (`src/sandboxes/docker.ts`)
+   so containers aren't on an open network. Port from `~/work/lastlight`:
+   `src/sandbox/egress-allowlist.ts` (partially ported → `src/engine/egress-allowlist.ts`),
+   `egress-firewall-config.ts`, `nginx-*.conf`, `Corefile.*`, `docker-compose.yml`. Add the
+   off-allowlist + metadata-block tests that Spike 2 DEFERRED. Required before ANY prod.
+   (Also unblocks the riders: gitleaks/semgrep scanner image for security-review, etc.)
+2. **User-gated:** the live `build` workflow run (writes code, opens a real PR — needs an
+   issue target + supervision at the approval gate); full live **Slack e2e** (public HTTPS
+   endpoint → Slack app Event Subscriptions Request URL `…/channels/slack/events`); the
+   **deploy** (Node service on the host) + **webhook cutover** (point GitHub App + Slack at
+   the new stack); **dual-run** vs the old stack + diff, keep old parked 1 cycle, then retire.
+
+## Current position (at wrap)
+- **Phases 0-7 ✅ COMPLETE — feature-complete.** admin fully re-backed on Flue store + app
+  tables (sessions/transcripts, stats, OTel, run-record/approvals/gate-correlation, threads).
+  Phase 4 LIVE build + live Slack e2e DEFERRED → Phase 8 (user-gated). Suite **810/6 skipped**.
 - **Classifier-LLM wired** (`src/agent-lib/classify-llm.ts`, shared by both channels'
   default `PromptRunner`): a small NO-TOOLS chat call to `resolveModel('classifier')`'s
   provider (openai default, anthropic adapter too), bounded (max_tokens+8s timeout),
