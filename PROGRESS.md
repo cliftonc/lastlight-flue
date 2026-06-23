@@ -18,6 +18,23 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   commits to `main`. Do NOT create feature branches (ignore the generic
   "branch first" habit); a stray branch strands the slice from the next one.
 
+## Phase 5 slice 10 DONE ✅ — `security-feedback` ported (kind:health, single-phase, TOOL-ONLY)
+- **`src/workflows/security-feedback.ts`** (`run`→`runSecurityFeedback(ctx,deps,today)` DI seam): CONSUMER of
+  the `Security scan — <date>` issue security-review files. Mints `issues-write`; FETCHES + PARSES the parent
+  body DETERMINISTICALLY (`agent-lib/security-feedback-parse.ts`: version check + finding-row/severity regex
+  from issue-format.md). Agent (`agent-lib/security-feedback.ts`, `security-feedback` skill, persona, model
+  key `security`, read tools, NO sandbox) CLASSIFIES intent+selection → `FEEDBACK:` marker; workflow ACTS.
+- **PRIMARY create-issues flow** (`src/security-feedback-post.ts`, bound ref+token, NOT model tools): files
+  sub-issues (labels `[security,<severity>]`), rewrites parent rows pending/ticked→broken-out (`~~…~~ → #N`),
+  posts summary. discuss/reopen→reply; version-mismatch/empty-selection→canned reply; ignore→noop. UNTRUSTED-wrap
+  parent body (bot-authored but carries user-derived snippets) + triggering comment. **accept-risk/false-positive
+  SECURITY.md-PR DEFERRED** TODO(phase-9/security-md-pr) (needs clone+push, like security-review's scanners).
+- **Tests +23** (564→587 passed/6 skipped): parser (3 states+version+severity) + classify/select (ticked/all/
+  severity/items, broken-out-dropped) + poster (row-rewrite/sub-issue body/summary/create on BOUND ref) + prompt
+  golden (untrusted-wrap incl. hostile escape) + run-level (profile, BOUND ref, version-mismatch, empty-selection,
+  discuss/reopen/ignore, token-not-logged). flue build green; **discovery+=security-feedback** (workflows=11);
+  grep -c vitest dist=1 (no module import). **NO LIVE SIDE EFFECT**, no shared-file edits. Next=**pr-comment**, then crons.
+
 ## Phase 5 slice 9 DONE ✅ — `security-review` ported (kind:health, repo-scoped, SANDBOXED)
 - **`src/workflows/security-review.ts`** (`run`→`runSecurityReview(ctx,deps,scanDate)` DI seam): SIBLING
   of repo-health but SANDBOXED — mints `issues-write` (contents:read clone+issues:write file), REUSES
