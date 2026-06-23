@@ -20,6 +20,7 @@
   "dependencies": {
     "@clack/prompts": "^1.6.0",
     "@flue/cli": "1.0.0-beta.1",
+    "@flue/github": "1.0.0-beta.1",
     "@flue/runtime": "1.0.0-beta.2",
     "@hono/node-server": "^2.0.5",
     "@octokit/auth-app": "7.2.2",

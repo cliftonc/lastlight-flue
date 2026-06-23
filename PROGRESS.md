@@ -19,12 +19,9 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 5 ✅ COMPLETE** (all 12 workflows + chat + web tools + crons + shutdown).
-  Phases 0-4 ✅ (Phase 4 structurally complete; its LIVE build acceptance is DEFERRED
-  — see blockers). Suite **614 passed / 6 skipped**.
-- **NEXT = Phase 6 (channels)** — replace connectors + router.
-- No active blockers besides those in "Carried unknowns / blockers / deferred" below
-  (Phase-6 Slack secret is a STOP-AND-ASK; the GitHub channel is unblocked).
+- **Phase 6 IN PROGRESS — GitHub channel ✅** (Slack channel = next, STOP-AND-ASK).
+  Phases 0-5 ✅ (Phase 4 LIVE build acceptance DEFERRED). Suite **655 passed / 6 skipped**.
+- **NEXT = Phase 6 Slack channel** — BLOCKED on `SLACK_SIGNING_SECRET` (STOP-AND-ASK).
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -44,7 +41,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
 - [x] **5 — Remaining workflows + crons + chat** ✅ COMPLETE — issue-triage,
   issue-comment, pr-fix, answer, web-tools, explore, repo-health, chat,
   security-review, security-feedback, pr-comment, crons+shutdown. Last commit `7718f71`.
-- [ ] **6 — Channels** (replace connectors + router) ← **NEXT**
+- [~] **6 — Channels** — **GitHub channel ✅** (Slack = next): `src/channels/github.ts`
+  `createGitHubChannel({ webhookSecret, webhook })` → discovered `/channels/github/webhook`.
+  Pipeline (NON-discovered helpers): DEDUPE (`DeliveryDedupe` on `deliveryId`) → SCREEN
+  (`github-screener.ts`: ignored-actions/allowlist/bot self-loop[PR exception]/bot-authored-PR/
+  maintainer gate) → MAP (`github-mapper.ts`→`LastLightEvent` in `events.ts`, snapshot+
+  `conversationKey`) → ROUTE (code-based `github-router.ts`, NO LLM picks wf) → INVOKE (admit-fast,
+  injected `invokeWorkflow`=spawn `flue run`). Classifier+screener (`github-classify.ts`) parallel,
+  maintainer-NL-only, LLM behind injected seam. ROUTES: issue.opened/reopened→issue-triage,
+  pr.opened/sync/reopened→pr-review, @mention→approve/reject(resume)|security-review|build|explore|
+  pr-fix|pr-comment|security-feedback|issue-comment, reply-gate→explore. DEFERRED(TODO 6/7):
+  classifier-LLM wiring, decline-reply post, conversation→runId gate correlation, check_run routes.
+  `@flue/github 1.0.0-beta.1` (verified, NO drift — flue-ref §8). +41 tests. Last commit: P6 GitHub channel.
 - [ ] 7 — Persistence + re-back admin API
 - [ ] 8 — Deploy & cutover
 

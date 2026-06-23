@@ -551,6 +551,22 @@ export const channel = createGitHubChannel({
   per-conversation id ↔ ref. JSON content-type only; respond `2xx` within 10s
   (GitHub doesn't auto-retry) — admit durable work fast and **dedupe on
   `delivery.deliveryId`**. Filtering is application policy inside `webhook()`.
+- **✅ INSTALLED-VERIFIED `@flue/github` 1.0.0-beta.1 (2026-06-23, Phase 6):** API
+  matches the design — NO drift. Verified against `node_modules/@flue/github/
+  {dist/index.d.mts,docs/api/github-channel.md}`. `createGitHubChannel({
+  webhookSecret, bodyLimit?, webhook({ c, delivery }) })` → `GitHubChannel {
+  routes, conversationKey(ref), parseConversationKey(id) }`. `delivery` =
+  `{ name, payload, deliveryId, hookId?, installationTarget? }` (`name` =
+  X-GitHub-Event, narrows `payload` to `@octokit/webhooks-types`). The channel
+  **verifies HMAC over exact bytes + answers `ping` internally + rejects
+  form-encoded pre-verification**, and **does NOT dedupe** (app owns it). Handler
+  return: `undefined`→empty 200, JSON value→JSON, Hono/Fetch `Response`
+  passthrough; a throw falls to Hono's error handler. Deps: `@octokit/webhooks-types`
+  + `hono` (peer; `octokit`/`@octokit/auth-app` already present — NO `@octokit/rest`
+  needed). `createGitHubChannel` THROWS on an empty `webhookSecret` at
+  construction (eager, module-eval). The discovered `src/channels/github.ts`
+  exporting `channel` publishes **`/channels/github/webhook`**. Our env var is
+  **`WEBHOOK_SECRET`** (not `GITHUB_WEBHOOK_SECRET` shown in the sketch above).
 
 **Slack** (`@flue/slack` + `@slack/web-api@^8`):
 ```ts
