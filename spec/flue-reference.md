@@ -246,7 +246,7 @@ import `@flue/runtime/internal`):
 | `@flue/sdk` | client for **consuming** deployed agents/workflows over HTTP |
 | `@flue/github`, `@flue/slack`, … | channels (verified event ingress) |
 | `@flue/libsql`, `@flue/postgres`, `@flue/mysql`, `@flue/mongodb`, `@flue/redis` | persistence adapters |
-| `@flue/opentelemetry` | OTel tracing adapter |
+| `@flue/opentelemetry` | OTel tracing adapter (pinned `1.0.0-beta.3`; see §10) |
 
 `@flue/runtime` subpath exports (from `packages/runtime/package.json`): `.`,
 `./adapter`, `./routing`, `./tool`, `./node`, `./cloudflare`, `./test-utils`,
@@ -661,6 +661,40 @@ workflow run. Mount everything with `app.route('/', flue())` on a Hono app
 `docs/guide/observability/`: built-in observer + adapters for
 **OpenTelemetry** (`@flue/opentelemetry`), Braintrust, Sentry. Last Light's
 existing `LASTLIGHT_OTEL_*` env feeds the OTel adapter.
+
+**✅ VERIFIED API (installed, 2026-06-23 — Phase 7 OTel slice).**
+- **`observe` (`@flue/runtime` `1.0.0-beta.2`):**
+  `observe(subscriber: (event: FlueEvent, ctx: FlueContext) => void): () => void`
+  — adds a plain subscriber to a process-global Set, returns an unsubscribe fn.
+  `FlueEvent` carries `type` + ISO-string `timestamp` and the variants the OTel
+  adapter consumes: `run_start`/`run_resume`/`run_end`, `operation_start`/
+  `operation`, `turn_start`/`turn`, `tool_start`/`tool`, `task_start`/`task`,
+  `compaction_start`/`compaction`, `message_start`/`message_end`, `log`.
+- **`@flue/opentelemetry` `1.0.0-beta.3`:** exports
+  `createOpenTelemetryInstrumentation(options?) → { key, observe, interceptor,
+  dispose }`; options = `{ tracer?, meter?, logger?, content?: false |
+  GenAIContentPolicy, resolveRootContext?, diagnostic? }`. Its `.observe` IS a
+  `(event, ctx) => void` subscriber. **Register on beta.2 via
+  `observe(instr.observe)`** — emits spans for runs/operations/turns/tools/tasks/
+  compactions. The adapter does NOT configure an SDK/exporter — a NodeSDK + OTLP
+  exporter is an operator/deploy concern (`OTEL_EXPORTER_OTLP_*`).
+- **⚠ BETA DRIFT (recorded, non-blocking):** (a) the **bundled beta.2 docs**
+  describe `createOpenTelemetryObserver()` + `exportContent(event)`; the
+  **installed beta.3** package exports `createOpenTelemetryInstrumentation()` +
+  `content` policy instead (wire the installed surface). (b) beta.3's `interceptor`
+  (cross-execution trace-context propagation) has **no beta.2 `observe()` hook**;
+  `observe(instr.observe)` alone emits spans, but distributed trace-context
+  parenting is reduced under this pin. (c) beta.3 renames `FlueEvent`/
+  `FlueEventSubscriber` → `FlueObservation`/`FlueObservationSubscriber` (same
+  runtime shape; beta.2 keeps the older type names).
+- **Last Light wiring (`src/otel.ts`):** `LASTLIGHT_OTEL_*` → `OtelConfig`:
+  `ENABLED` (master gate; off ⇒ inert), `SERVICE_NAME` (OTLP `service.name`),
+  `INCLUDE_CONTENT` ⇒ adapter `content` (`false` privacy-default, else
+  `{enabled:true}`), `STRICT` (fail-hard vs warn on init error). `COLLECTOR_HOSTS`
+  + `FORWARD_TO_SANDBOX` have NO adapter analogue (egress/sandbox-forwarding only)
+  — carried for parity, not passed to the adapter. `startOtel()` armed in
+  `app.ts` module scope: enabled-gated, run-once, non-fatal, VITEST/
+  `LASTLIGHT_SKIP_OTEL`-inert.
 
 **⚠ Correction: there is no "Flue Studio."** A docs-tree grep for `studio`
 returns zero hits, and the CLI has no `studio` command; `flue dev` is a

@@ -32,6 +32,7 @@ import {
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
 import { startCrons, stopCrons } from './crons.ts';
+import { startOtel } from './otel.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -530,6 +531,19 @@ function runBootRecovery(): void {
     });
 }
 runBootRecovery();
+
+// ── OpenTelemetry observability wiring (Phase 7 · slice 3) ────────────────────
+// Register the `@flue/opentelemetry` adapter onto Flue's `observe(...)` live
+// stream, fed by `LASTLIGHT_OTEL_*` env — armed HERE at module-eval, alongside
+// the boot-recovery + cron hooks. `startOtel()` is:
+//   - ENABLED-gated: only subscribes when LASTLIGHT_OTEL_ENABLED is truthy;
+//     otherwise COMPLETELY INERT (no adapter, no exporter, no error);
+//   - run-once (a module-level guard) so a re-import can't double-register;
+//   - NON-FATAL: a bad OTel config logs a warning, never crashes the server
+//     (strict-off warns; even a strict rethrow is caught at this boot hook);
+//   - SKIPPED under VITEST / LASTLIGHT_SKIP_OTEL so tests/imports never start an
+//     exporter or subscribe to the live stream. See src/otel.ts.
+startOtel();
 
 // ── Cron scheduler start + graceful shutdown (Phase 5 · FINAL slice) ──────────
 // The four scheduled jobs (cron-health/security/triage/review → repo-health/

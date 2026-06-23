@@ -17,6 +17,9 @@ importers:
       '@flue/github':
         specifier: 1.0.0-beta.1
         version: 1.0.0-beta.1
+      '@flue/opentelemetry':
+        specifier: 1.0.0-beta.3
+        version: 1.0.0-beta.3(@flue/runtime@1.0.0-beta.2(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3))(@opentelemetry/api@1.9.0)
       '@flue/runtime':
         specifier: 1.0.0-beta.2
         version: 1.0.0-beta.2(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3)
@@ -29,6 +32,9 @@ importers:
       '@octokit/auth-app':
         specifier: 7.2.2
         version: 7.2.2
+      '@opentelemetry/api':
+        specifier: ^1.9.0
+        version: 1.9.0
       chalk:
         specifier: ^5.6.2
         version: 5.6.2
@@ -595,6 +601,13 @@ packages:
   '@flue/github@1.0.0-beta.1':
     resolution: {integrity: sha512-LEB4OfD8bUPQx5JrCOZFilchZsyGETlPKu5SNhUUafqTsymhs4lnAohtdRibsWklOZTNpUkw3867VOzUE2JnMA==}
     engines: {node: '>=22.19.0'}
+
+  '@flue/opentelemetry@1.0.0-beta.3':
+    resolution: {integrity: sha512-R8QR8GKxPvHMzwvlBX9dmubcZ8s7xc6JpNg+w6hK3MbcgX8K4CMcmumoKOczgcOxKKs/qM+N9xJthloskYqQUw==}
+    engines: {node: '>=22.19.0'}
+    peerDependencies:
+      '@flue/runtime': ^1.0.0-beta.3
+      '@opentelemetry/api': ^1.9.0
 
   '@flue/runtime@1.0.0-beta.1':
     resolution: {integrity: sha512-Ts5Za1j6uhjfby0JUut7MaoWpTXP+RCGA7EiZBMYkX/PCpwInVAVjdAxknmOilCdqx4MvsonjZG1VrQQlxFIRA==}
@@ -3245,6 +3258,11 @@ snapshots:
     dependencies:
       '@octokit/webhooks-types': 7.6.1
       hono: 4.12.22
+
+  '@flue/opentelemetry@1.0.0-beta.3(@flue/runtime@1.0.0-beta.2(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3))(@opentelemetry/api@1.9.0)':
+    dependencies:
+      '@flue/runtime': 1.0.0-beta.2(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3)
+      '@opentelemetry/api': 1.9.0
 
   '@flue/runtime@1.0.0-beta.1(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@5.9.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@4.4.3))(zod@4.4.3)':
     dependencies:

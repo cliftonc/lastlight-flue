@@ -64,7 +64,19 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   operator-auth gated, CLI shape `{total_executions,today_count,running,by_skill}`
   + rich `{byPhase,byWorkflow,byRun,totals}`, empty→zeros. +21 tests. flue build
   green, discovery unchanged, dist vitest=1. Suite **770 passed / 6 skipped**.
-- **NEXT = Phase 7 slice 3** — OTel (final Phase-7 slice), then thread-grouping if needed.
+- **Phase 7 slice 3 — OTel WIRED ✅.** `src/otel.ts`: `LASTLIGHT_OTEL_*`→`OtelConfig`
+  (ENABLED gate / SERVICE_NAME / INCLUDE_CONTENT⇒adapter `content` privacy `false`|`{enabled:true}`
+  / STRICT fail-hard-vs-warn; COLLECTOR_HOSTS+FORWARD_TO_SANDBOX carried-not-mapped, no adapter
+  analogue) → registers `@flue/opentelemetry@1.0.0-beta.3` `createOpenTelemetryInstrumentation
+  ({content})` via VERIFIED beta.2 `observe(instr.observe)` (flue-ref §10). `startOtel()` in
+  app.ts module scope: ENABLED-gated (off⇒inert), NON-FATAL, VITEST/`LASTLIGHT_SKIP_OTEL`-inert,
+  run-once. ⚠DRIFT: bundled docs say `createOpenTelemetryObserver`/`exportContent`; installed
+  beta.3 = `createOpenTelemetryInstrumentation`/`content`+`interceptor`(no beta.2 hook→observe-only).
+  Seam-injected observe+factory → +16 tests OFFLINE (no exporter/NodeSDK in dist, grep=0). flue
+  build green, discovery unchanged, dist vitest=1. Suite **786/6 skipped**. Deps +`@flue/opentelemetry
+  @1.0.0-beta.3` +`@opentelemetry/api@1.9.0`. **Phase 7 NOT yet ✅ — NEXT = messaging-thread grouping**
+  (sessions LIST = workflow runs only; chat THREADS render by id but aren't listed; app table
+  `conversationKey↔instanceId`, spec/10+design/phase-7) → then flip Phase 7 ✅.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
