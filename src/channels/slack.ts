@@ -49,6 +49,7 @@ import { resume as resumeBuild } from "../resume.ts";
 import { screenEvent, SlackEventDedupe } from "../agent-lib/slack-screener.ts";
 import { toLastLightEvent } from "../agent-lib/slack-mapper.ts";
 import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
+import { recordThreadActivity } from "../agent-lib/record-thread.ts";
 import {
   routeEvent,
   routeCommand,
@@ -149,6 +150,13 @@ function defaultGateLookup(storePath?: string) {
 function defaultDispatchDeps(): SlackDispatchDeps {
   return {
     dispatchChat: async (id, input) => {
+      // RECORD the messaging thread (Phase 7 thread grouping): `id` IS the
+      // conversationKey == the chat-agent instanceId, so this UPSERTs the thread on
+      // first sight and bumps its activity on every subsequent turn — the source
+      // the sessions list groups chat threads from. NON-FATAL + TEST-INERT (the
+      // recorder seam): a write failure never blocks the dispatch, and it's a no-op
+      // under tests unless a fake recorder is injected.
+      recordThreadActivity(id);
       // The chat agent's instance == the thread; `id` IS the durable session key.
       await dispatch(chatAgent, { id, input });
     },

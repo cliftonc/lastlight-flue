@@ -42,6 +42,7 @@
 // routes + tests inject a fake and run fully offline.
 
 import type { ListRunsResponse, RunPointer } from '@flue/runtime';
+import type { MessagingThread } from '../threads-store.ts';
 
 // ── Stream path helpers (re-declared — see header: NOT public exports) ────────
 //
@@ -83,6 +84,9 @@ export interface SessionMeta {
   source: string;
   /** Coarse session kind for the dashboard chip (workflow name / "chat"). */
   sessionType: string;
+  /** Discriminator the dashboard uses to pick the transcript stream path:
+   *  a workflow `run` (`runStreamPath`) or a `chat` thread (`agentStreamPath`). */
+  kind: 'run' | 'chat';
   model: string | null;
   started_at: number;
   last_message_at: number | null;
@@ -164,6 +168,7 @@ export function toSessionMeta(p: RunPointer): SessionMeta {
     id: p.runId,
     source: 'run',
     sessionType: p.workflowName,
+    kind: 'run',
     model: null, // not on a blob-free pointer; transcript read surfaces it
     started_at: started,
     last_message_at: toEpochSeconds(p.endedAt) ?? null,
@@ -173,6 +178,42 @@ export function toSessionMeta(p: RunPointer): SessionMeta {
     last_assistant_content: null,
     agentIds: [],
     platform: null,
+  };
+}
+
+// ── List adapter: MessagingThread → SessionMeta (blob-free, kind:'chat') ──────
+//
+// A chat thread IS a session too — but its transcript lives in the chat-agent
+// event stream (`agentStreamPath('chat', instanceId)`), NOT a workflow-run stream.
+// The thread row (app-owned `messaging_threads`) carries the GROUPING metadata
+// blob-free: channel/repo, last-activity, message-count. `agentIds:[instanceId]`
+// fills the old `agentIds:[]` stub — the chat thread's transcript is read from
+// `agentStreamPath('chat', instanceId)` (already wired). Timestamps → epoch
+// seconds (the dashboard's unit).
+
+const isoToEpochSeconds = (iso: string): number | null => {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime();
+  return Number.isNaN(ms) ? null : ms / 1000;
+};
+
+export function toChatSessionMeta(t: MessagingThread): SessionMeta {
+  const started = isoToEpochSeconds(t.createdAt) ?? Date.now() / 1000;
+  return {
+    id: t.instanceId,
+    source: 'chat',
+    sessionType: 'chat',
+    kind: 'chat',
+    model: null, // surfaced on the transcript read, not the grouping row
+    started_at: started,
+    last_message_at: isoToEpochSeconds(t.lastActivityAt),
+    message_count: t.messageCount,
+    tool_call_count: 0, // blob-free — real count on the transcript read
+    conversation_message_count: t.messageCount,
+    last_assistant_content: null,
+    // The chat-agent instanceId IS the conversationKey — fills the agentIds stub.
+    agentIds: [t.instanceId],
+    platform: t.channel,
   };
 }
 
@@ -305,11 +346,26 @@ interface FlueStoresLike {
   };
 }
 
+/** Lists app-owned chat threads (the `messaging_threads` table) blob-free. */
+export interface ThreadLister {
+  listThreads(opts?: { limit?: number; cursor?: string }): {
+    threads: MessagingThread[];
+    nextCursor: string | null;
+  };
+}
+
 export interface DefaultSessionReaderOptions {
   /** Override the store-connector (tests). Default: connect `src/db.ts`. */
   connect?: () => Promise<FlueStoresLike>;
   /** Default agent name for agent-stream transcripts (chat threads). */
   defaultAgentName?: string;
+  /**
+   * The app-owned chat-thread grouping source (`messaging_threads`). When wired,
+   * `listSessions` MERGES chat threads (kind:'chat') into the run list, newest
+   * activity first. Injected so tests run offline; the default lazily opens the
+   * on-disk threads-store. Omit to list workflow runs only.
+   */
+  threadLister?: ThreadLister | (() => ThreadLister);
 }
 
 /**
@@ -322,6 +378,30 @@ export function createDefaultSessionReader(
 ): SessionReader {
   const agentName = opts.defaultAgentName ?? 'chat';
   let storesPromise: Promise<FlueStoresLike> | null = null;
+
+  // The chat-thread grouping source. Resolved lazily (a function form opens the
+  // on-disk threads-store on first use); a missing/failing source is NON-FATAL —
+  // the session list degrades to workflow runs only, never errors.
+  const resolveThreadLister = (): ThreadLister | null => {
+    const tl = opts.threadLister;
+    if (!tl) return null;
+    return typeof tl === 'function' ? tl() : tl;
+  };
+  const listChatSessions = (listOpts?: {
+    limit?: number;
+    cursor?: string;
+  }): SessionMeta[] => {
+    try {
+      const lister = resolveThreadLister();
+      if (!lister) return [];
+      const res = lister.listThreads({ limit: listOpts?.limit });
+      return res.threads.map(toChatSessionMeta);
+    } catch (err) {
+      // NON-FATAL: a thread-list failure must not break the sessions list.
+      console.error('[sessions] chat-thread list failed (non-fatal):', err);
+      return [];
+    }
+  };
 
   const connect = async (): Promise<FlueStoresLike> => {
     if (!storesPromise) {
@@ -350,8 +430,20 @@ export function createDefaultSessionReader(
         limit: listOpts?.limit,
         cursor: listOpts?.cursor,
       });
+      // MERGE workflow runs (kind:'run') + chat threads (kind:'chat'), newest
+      // activity first. Both blob-free. Chat threads fill the old `agentIds:[]`
+      // stub; their transcripts come from `agentStreamPath('chat', instanceId)`.
+      const runs = res.runs.map(toSessionMeta);
+      const chats = listChatSessions(listOpts);
+      const merged = [...runs, ...chats].sort(
+        (a, b) =>
+          (b.last_message_at ?? b.started_at) - (a.last_message_at ?? a.started_at),
+      );
       return {
-        sessions: res.runs.map(toSessionMeta),
+        sessions: merged,
+        // The runs cursor still drives run pagination; chat threads are a small
+        // bounded set (the first page covers them). Honest: chat threads aren't
+        // re-paginated by this cursor.
         nextCursor: res.nextCursor ?? null,
       };
     },

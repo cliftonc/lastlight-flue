@@ -2,11 +2,15 @@ import { describe, it, expect } from 'vitest';
 import type { RunPointer } from '@flue/runtime';
 import {
   toSessionMeta,
+  toChatSessionMeta,
   toTranscriptMessages,
   streamPathForRun,
   streamPathForAgent,
+  createDefaultSessionReader,
   type RawStreamEvent,
+  type ThreadLister,
 } from './session-reader.ts';
+import type { MessagingThread } from '../threads-store.ts';
 
 // Phase 7 · slice 1 — PURE unit tests for the Flue-event-stream → dashboard
 // transcript adapter and the blob-free RunPointer → SessionMeta list adapter.
@@ -51,6 +55,105 @@ describe('toSessionMeta (RunPointer → SessionMeta, blob-free)', () => {
   it('handles a running run with no endedAt (null last_message_at)', () => {
     const m = toSessionMeta({ ...pointer, status: 'active', endedAt: undefined });
     expect(m.last_message_at).toBeNull();
+  });
+});
+
+describe('toChatSessionMeta (MessagingThread → SessionMeta, kind:chat)', () => {
+  const thread: MessagingThread = {
+    instanceId: 'slack:v1:T1:C2:100.1',
+    channel: 'slack',
+    repo: null,
+    meta: { teamId: 'T1', channelId: 'C2', threadTs: '100.1' },
+    title: null,
+    createdAt: '2026-06-23T09:00:00.000Z',
+    lastActivityAt: '2026-06-23T09:30:00.000Z',
+    messageCount: 4,
+  };
+
+  it('projects a chat thread to a kind:chat session row (fills agentIds stub)', () => {
+    const m = toChatSessionMeta(thread);
+    expect(m.id).toBe('slack:v1:T1:C2:100.1');
+    expect(m.kind).toBe('chat');
+    expect(m.source).toBe('chat');
+    expect(m.sessionType).toBe('chat');
+    expect(m.platform).toBe('slack');
+    expect(m.message_count).toBe(4);
+    // The agentIds stub is FILLED with the chat-agent instanceId (= conversationKey).
+    expect(m.agentIds).toEqual(['slack:v1:T1:C2:100.1']);
+    expect(m.started_at).toBe(Date.parse('2026-06-23T09:00:00.000Z') / 1000);
+    expect(m.last_message_at).toBe(Date.parse('2026-06-23T09:30:00.000Z') / 1000);
+  });
+});
+
+describe('createDefaultSessionReader.listSessions — merges runs + chat threads', () => {
+  const runPointer: RunPointer = {
+    runId: 'run_a',
+    workflowName: 'build',
+    status: 'completed',
+    startedAt: '2026-06-23T08:00:00.000Z',
+    endedAt: '2026-06-23T08:30:00.000Z', // last activity 08:30
+  };
+  const chatThread: MessagingThread = {
+    instanceId: 'slack:v1:T1:C2:100.1',
+    channel: 'slack',
+    repo: null,
+    meta: {},
+    title: null,
+    createdAt: '2026-06-23T09:00:00.000Z',
+    lastActivityAt: '2026-06-23T09:30:00.000Z', // newer activity → sorts first
+    messageCount: 4,
+  };
+
+  const fakeStores = {
+    runStore: {
+      async listRuns() {
+        return { runs: [runPointer], nextCursor: undefined };
+      },
+    },
+    eventStreamStore: {
+      async readEvents() {
+        return { events: [], nextOffset: '-1', upToDate: true };
+      },
+      async getStreamMeta() {
+        return null;
+      },
+    },
+  };
+
+  const fakeThreadLister = (threads: MessagingThread[]): ThreadLister => ({
+    listThreads: () => ({ threads, nextCursor: null }),
+  });
+
+  it('merges chat threads (kind:chat) with workflow runs (kind:run), newest activity first', async () => {
+    const reader = createDefaultSessionReader({
+      connect: async () => fakeStores as never,
+      threadLister: fakeThreadLister([chatThread]),
+    });
+    const { sessions } = await reader.listSessions();
+    expect(sessions).toHaveLength(2);
+    // Chat thread (09:30) sorts ahead of the run (08:30).
+    expect(sessions.map((s) => s.kind)).toEqual(['chat', 'run']);
+    expect(sessions[0]!.id).toBe('slack:v1:T1:C2:100.1');
+    expect(sessions[1]!.id).toBe('run_a');
+  });
+
+  it('lists workflow runs only when no threadLister is wired (degrades cleanly)', async () => {
+    const reader = createDefaultSessionReader({
+      connect: async () => fakeStores as never,
+    });
+    const { sessions } = await reader.listSessions();
+    expect(sessions.map((s) => s.kind)).toEqual(['run']);
+  });
+
+  it('is NON-FATAL: a throwing threadLister degrades to runs only, no error', async () => {
+    const reader = createDefaultSessionReader({
+      connect: async () => fakeStores as never,
+      threadLister: () => {
+        throw new Error('threads-store unavailable');
+      },
+    });
+    const { sessions } = await reader.listSessions();
+    expect(sessions.map((s) => s.kind)).toEqual(['run']);
   });
 });
 

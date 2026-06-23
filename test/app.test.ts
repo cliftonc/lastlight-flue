@@ -578,6 +578,7 @@ describe('admin sessions with injected SessionReader (offline)', () => {
     id: 'run_a',
     source: 'run',
     sessionType: 'build',
+    kind: 'run',
     model: null,
     started_at: 1_700_000_000,
     last_message_at: 1_700_000_300,
@@ -675,6 +676,37 @@ describe('admin sessions with injected SessionReader (offline)', () => {
     expect(body.messages[1]!.tool_calls).toEqual([
       { id: 'tu_1', name: 'github_read', arguments: {} },
     ]);
+  });
+
+  it('sessions list surfaces chat threads + runs together with kind tags', async () => {
+    const chatRow: SessionMeta = {
+      id: 'slack:v1:T1:C2:100.1',
+      source: 'chat',
+      sessionType: 'chat',
+      kind: 'chat',
+      model: null,
+      started_at: 1_700_000_500,
+      last_message_at: 1_700_000_900,
+      message_count: 4,
+      tool_call_count: 0,
+      conversation_message_count: 4,
+      last_assistant_content: null,
+      agentIds: ['slack:v1:T1:C2:100.1'],
+      platform: 'slack',
+    };
+    const app = makeApp(
+      fakeReader({
+        async listSessions() {
+          return { sessions: [chatRow, sampleMeta], nextCursor: null };
+        },
+      }),
+    );
+    const res = await app.request('/admin/api/sessions');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessions: SessionMeta[] };
+    expect(body.sessions.map((s) => s.kind)).toEqual(['chat', 'run']);
+    expect(body.sessions[0]!.agentIds).toEqual(['slack:v1:T1:C2:100.1']);
+    expect(body.sessions[0]!.platform).toBe('slack');
   });
 
   it('GET /admin/api/sessions/:id unknown → 404', async () => {

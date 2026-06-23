@@ -29,6 +29,7 @@ import {
   createDefaultStatsReader,
   type StatsReader,
 } from './admin/stats-reader.ts';
+import { ThreadsStore } from './threads-store.ts';
 import { recoverOrphanRuns } from './resume.ts';
 import { recoverOrphanExploreRuns } from './resume-explore.ts';
 import { startCrons, stopCrons } from './crons.ts';
@@ -476,7 +477,15 @@ const liveRunsReader: RunsReader = { listRuns, getRun, listAgents };
 const app = createApp({
   runsReader: liveRunsReader,
   approvals: createDefaultApprovalsBackend(),
-  sessionReader: createDefaultSessionReader(),
+  sessionReader: createDefaultSessionReader({
+    // The chat-thread grouping source (app-owned `messaging_threads`). Lazily
+    // opens the on-disk threads-store; the sessions list MERGES chat threads
+    // (kind:'chat') with workflow runs — filling the old `agentIds:[]` stub.
+    threadLister: () =>
+      new ThreadsStore(
+        process.env.LASTLIGHT_THREADS_STORE ?? './data/threads-store.db',
+      ),
+  }),
   statsReader: createDefaultStatsReader(),
 });
 app.route('/', flue());

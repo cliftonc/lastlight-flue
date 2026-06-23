@@ -121,6 +121,56 @@ describe("slack channel — handleEvent pipeline (offline, no side effects)", ()
   });
 });
 
+// Phase 7 final slice — the chat-dispatch path RECORDS a messaging thread (the
+// grouping the sessions list reads). Exercises the PRODUCTION `defaultDispatchDeps`
+// (NO injected `dispatch`) with `@flue/runtime`'s `dispatch` mocked (so no real
+// runtime) and a FAKE thread recorder injected (test-inert seam) — proving the
+// hook upserts on first sight and bumps on the next turn.
+describe("slack channel — chat-dispatch records a messaging thread", () => {
+  beforeEach(() => vi.resetModules());
+
+  it("records the thread (channel/key derived) on dispatch, bumps on a second turn", async () => {
+    const dispatched: Array<{ id: string }> = [];
+    // Mock ONLY `dispatch` so the PRODUCTION chat path runs offline; keep the rest
+    // of @flue/runtime (createAgent etc., used by the imported chat agent).
+    vi.doMock("@flue/runtime", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("@flue/runtime")>();
+      return {
+        ...actual,
+        dispatch: vi.fn(async (_agent: unknown, opts: { id: string }) => {
+          dispatched.push({ id: opts.id });
+        }),
+      };
+    });
+    const { handleEvent } = await import("../slack.ts");
+    const { SlackEventDedupe } = await import("../../agent-lib/slack-screener.ts");
+    const { setThreadRecorder } = await import("../../agent-lib/record-thread.ts");
+
+    const recorded: string[] = [];
+    const prev = setThreadRecorder({ record: (a) => recorded.push(a.instanceId) });
+    try {
+      const router = {
+        run: async () => { throw new Error("no LLM"); },
+        classify: async () => ({ intent: "chat" as const }),
+        screen: async () => ({ flagged: false }),
+      };
+      const dedupe = new SlackEventDedupe();
+      // First turn → dispatch + record (NO `dispatch` opt → production seam).
+      await handleEvent(ev(), "T1", "Ev-A", key, { allowedUsers: ["U_ALICE"], dedupe, router });
+      // Second turn on the SAME thread (new ts, but thread_ts anchors the thread).
+      await handleEvent(ev({ ts: "100.2", thread_ts: "100.1" }), "T1", "Ev-B", key, { allowedUsers: ["U_ALICE"], dedupe, router });
+
+      // Both turns dispatched the chat agent on the same thread key.
+      expect(dispatched.map((d) => d.id)).toEqual(["slack:T1:C9:100.1", "slack:T1:C9:100.1"]);
+      // And BOTH recorded the thread (the store upserts insert→bump on the key).
+      expect(recorded).toEqual(["slack:T1:C9:100.1", "slack:T1:C9:100.1"]);
+    } finally {
+      setThreadRecorder(prev ?? null);
+      vi.doUnmock("@flue/runtime");
+    }
+  });
+});
+
 describe("slack channel — handleCommand (/approve /reject → resume)", () => {
   beforeEach(() => vi.resetModules());
 

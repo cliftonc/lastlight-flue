@@ -19,9 +19,11 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   "branch first" habit); a stray branch strands the slice from the next one.
 
 ## Current position
-- **Phase 6 ✅ COMPLETE — channels: GitHub + Slack + gate correlation + classifier-LLM
-  + decline-reply (OFFLINE/MOCKED).** Phases 0-5 ✅ (Phase 4 LIVE build DEFERRED).
-  Suite **730 passed / 6 skipped**.
+- **Phase 7 ✅ COMPLETE — admin fully re-backed on Flue store + app tables**
+  (sessions/transcripts, stats, OTel, run-record/approvals/gate-correlation, threads).
+  Phases 0-6 ✅ (Phase 4 LIVE build + live Slack e2e DEFERRED → Phase 8).
+  Suite **810 passed / 6 skipped**. **NEXT = Phase 8 cutover** (largely user-gated:
+  live build PR, live Slack e2e, deploy).
 - **Classifier-LLM wired** (`src/agent-lib/classify-llm.ts`, shared by both channels'
   default `PromptRunner`): a small NO-TOOLS chat call to `resolveModel('classifier')`'s
   provider (openai default, anthropic adapter too), bounded (max_tokens+8s timeout),
@@ -74,9 +76,18 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   beta.3 = `createOpenTelemetryInstrumentation`/`content`+`interceptor`(no beta.2 hook→observe-only).
   Seam-injected observe+factory → +16 tests OFFLINE (no exporter/NodeSDK in dist, grep=0). flue
   build green, discovery unchanged, dist vitest=1. Suite **786/6 skipped**. Deps +`@flue/opentelemetry
-  @1.0.0-beta.3` +`@opentelemetry/api@1.9.0`. **Phase 7 NOT yet ✅ — NEXT = messaging-thread grouping**
-  (sessions LIST = workflow runs only; chat THREADS render by id but aren't listed; app table
-  `conversationKey↔instanceId`, spec/10+design/phase-7) → then flip Phase 7 ✅.
+  @1.0.0-beta.3` +`@opentelemetry/api@1.9.0`.
+- **Phase 7 final slice — MESSAGING-THREAD GROUPING ✅.** App-owned `messaging_threads` table
+  (`src/threads-store.ts`, raw sqlite: instance_id[=conversationKey] PK / channel[slack|github] /
+  repo / meta[parsed key coords] / created/last_activity/message_count; CREATE-IF-NOT-EXISTS +
+  idempotent ALTER migration, blob-free; `recordActivity` UPSERT insert→bump, `listThreads`[keyset
+  cursor]/`getThread`; `parseThreadKey` for both channel key shapes). RECORDED on chat-dispatch
+  via `recordThreadActivity` seam (`record-thread.ts`, NON-FATAL + TEST-INERT like record-execution)
+  hooked into Slack `defaultDispatchDeps.dispatchChat` (GitHub never emits chat→agent). FILLED the
+  `agentIds:[]` stub: `SessionReader.listSessions` MERGES chat threads (kind:'chat', agentIds=[id],
+  platform=channel) with workflow runs (kind:'run'), newest-first; chat transcript still via
+  `agentStreamPath('chat',instanceId)`. +24 tests. flue build green, discovery unchanged, dist
+  vitest=1, `messaging_threads` in bundle. Suite **810 passed / 6 skipped**.
 
 ## Phase status
 - [x] **0 — Spike & de-risk** (HARD GATE) ✅ — hello agent (openai/*) + Docker
@@ -123,8 +134,11 @@ local Docker + secrets/.env + ~/work/lastlight, absent in cloud.)
   gate correlation ✅ (convKey col + `gateLookup` filled).
   `@flue/slack 1.0.0-beta.1` verified (flue-ref §8; deps @slack/types+hono,
   NOT @slack/web-api). +41 tests. discovery channels{github,slack}. Last commit: P6 Slack channel.
-- [ ] 7 — Persistence + re-back admin API
-- [ ] 8 — Deploy & cutover
+- [x] **7 — Persistence + re-back admin API ✅ COMPLETE** — admin fully re-backed on
+  Flue's durable store + app tables: sessions/transcripts (RunStore/EventStreamStore),
+  stats rollups (`executions`), OTel, run-record/approvals/gate-correlation, and now
+  messaging-thread grouping (`messaging_threads`). Last commit: Phase 7 final slice.
+- [ ] 8 — Deploy & cutover (largely user-gated: live build PR, live Slack e2e, deploy)
 
 ### Verified runtime facts
 Durable, reusable facts the loop/subagents rely on. Where a fact is also in
