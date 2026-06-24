@@ -1,4 +1,4 @@
-import { spawnFlueRun } from './agent-lib/spawn-flue-run.ts';
+import { invokeFlueRun } from './agent-lib/invoke-flue-run.ts';
 import { Cron, scheduledJobs } from 'croner';
 import { getRuntimeConfig, loadConfig, type LastLightConfig } from './config.ts';
 
@@ -9,11 +9,14 @@ import { getRuntimeConfig, loadConfig, type LastLightConfig } from './config.ts'
 // `src/cron/{scheduler,jobs,fanout}.ts`. Each cron, on its tick, FANS OUT over
 // the managed repos and INVOKES the target workflow once per repo.
 //
-// INVOKE MECHANISM — the SAME path as `src/resume.ts`'s `reinvoke`: spawn
-// `flue run <workflow> --payload <json>`. There is NO top-level `invoke` in
-// @flue/runtime 1.0.0-beta.2 (flue-reference §0/§9: "crons = plain croner +
-// invoke"); a fresh `flue run` process is the proven cross-process entry. It is
-// an INJECTED seam (`invoke`) so tests never spawn anything.
+// INVOKE MECHANISM — the SAME path as `src/resume.ts`'s `reinvoke`: in-process
+// `invoke(workflow, { input })` (beta.3), via `src/agent-lib/invoke-flue-run.ts`.
+// (Beta.2 had NO top-level `invoke` — flue-reference §0/§9 — so this used to spawn a
+// fresh `flue run` process; beta.3 exports it, so we call the runtime directly. This
+// also keeps the agent transcript off stdout — see invoke-flue-run.ts.) It is an
+// INJECTED seam (`invoke`) so tests never touch the real runtime. The fan-out is now
+// fire-and-forget: each per-repo run admits quickly and proceeds concurrently under the
+// runtime's own scheduling, rather than serially awaiting a child process's exit.
 //
 // POSITIVE-ENABLE — a cron registers only when ENABLED. `enabled` is computed
 // from config: a cron is enabled unless its name is in `config.disabled.crons`
@@ -46,13 +49,12 @@ export type CronInvoker = (
 ) => Promise<void>;
 
 /**
- * Default production invoker: spawn `flue run <workflow> --input <json>` —
- * the SAME cross-process re-entry `src/resume.ts` uses (beta.3 renamed the flag
- * `--payload`→`--input`). NEVER called under tests (the registry/fanout tests inject
- * a fake; `startCrons` is VITEST-inert).
+ * Default production invoker: in-process `invoke(workflow, { input })` — the SAME
+ * re-entry `src/resume.ts` uses. NEVER called under tests (the registry/fanout tests
+ * inject a fake; `startCrons` is VITEST-inert).
  */
 export const defaultCronInvoker: CronInvoker = async (workflow, payload) => {
-  await spawnFlueRun(workflow, payload);
+  await invokeFlueRun(workflow, payload);
 };
 
 /** A registered cron job definition (pre-scheduling). */

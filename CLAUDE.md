@@ -46,7 +46,7 @@ native payload
   → (c) MAP           native payload → LastLightEvent  (one normalized Valibot schema)
   → (c′) ENRICH       LastLightEvent → RoutableEvent    (src/agent-lib/event-enrich.ts)
   → (d) ROUTE         code-based decision (+ a cheap classifier/screener on NL only)
-  → (e) ADMIT         dispatch(chatAgent) | invokeWorkflow(`flue run`) | resume | reply
+  → (e) ADMIT         dispatch(chatAgent) | invokeWorkflow(in-process `invoke`) | resume | reply
 ```
 
 ### Event model & enrichment
@@ -79,7 +79,7 @@ The `src/app.ts` Slack chat-reply relay clears the status when the turn ends; a 
 
 ### GitHub live status (👀 ack)
 
-The GitHub analogue of `defaultAck` (`src/agent-lib/github-ack-reaction.ts`, best-effort, inert without the GitHub App): `handleDelivery` reacts 👀 **right after enrich, BEFORE the (slow, LLM) classifier and the blocking `flue run`** — the earliest meaningful point, mirroring Slack's defaultAck. It's gated by `willActOn(ev)` (`github-router.ts`): a cheap deterministic predicate (no LLM, no gate lookup) that mirrors `routeEvent`'s gates — structural issue/PR events always act; a comment must @mention the bot **and** come from a maintainer. So an unrelated comment or one we'll decline gets no reaction; the rare explore reply-gate resume (an un-mentioned reply) routes without an early ack. The reaction targets the *triggering comment* (`reactions.createForIssueComment`, using `ev.commentId`) when present, else the *issue/PR* itself (`reactions.createForIssue`), over a scoped `issues-write` token (minted by the short repo **name**, not the slug — the API 422s on a slug). The `content` is a fixed literal, never model-selectable (distinct from the `github_react_*` model tools in `src/tools/github.ts`). Injected `ack` seam → offline-tested (incl. an ordering guard that the ack precedes the classifier).
+The GitHub analogue of `defaultAck` (`src/agent-lib/github-ack-reaction.ts`, best-effort, inert without the GitHub App): `handleDelivery` reacts 👀 **right after enrich, BEFORE the (slow, LLM) classifier and the workflow invocation** — the earliest meaningful point, mirroring Slack's defaultAck. It's gated by `willActOn(ev)` (`github-router.ts`): a cheap deterministic predicate (no LLM, no gate lookup) that mirrors `routeEvent`'s gates — structural issue/PR events always act; a comment must @mention the bot **and** come from a maintainer. So an unrelated comment or one we'll decline gets no reaction; the rare explore reply-gate resume (an un-mentioned reply) routes without an early ack. The reaction targets the *triggering comment* (`reactions.createForIssueComment`, using `ev.commentId`) when present, else the *issue/PR* itself (`reactions.createForIssue`), over a scoped `issues-write` token (minted by the short repo **name**, not the slug — the API 422s on a slug). The `content` is a fixed literal, never model-selectable (distinct from the `github_react_*` model tools in `src/tools/github.ts`). Injected `ack` seam → offline-tested (incl. an ordering guard that the ack precedes the classifier).
 
 ## Durability model (the core invariant)
 
@@ -89,7 +89,7 @@ Flue does **not** checkpoint TypeScript workflow `run()` execution and has **no 
 - **App-owned run-stores** (`src/build-run-store.ts`, `src/explore-run-store.ts`, `src/run-store.ts`) → per-phase done-flags, approval/reply gates, restart counters.
 - **Resume = idempotent re-`invoke`**: re-running a workflow with the same app `runId` (= `correlationId`) skips completed phases via the done-flags and lands just past the gate. Approval/reply **gates are 100% application-owned**: `run()` writes `pendingGate=…`, posts the question/asks for approval, and **returns**; an external signal (a GitHub comment, a Slack `/approve`, a thread reply) re-invokes. A per-run restart breaker caps crash loops.
 
-The production invoker spawns `pnpm exec flue run <workflow> --input <json>` (`src/crons.ts` `defaultCronInvoker`, also used by `src/resume.ts`/`src/resume-explore.ts`) — there is no in-process `invoke`. It's an injected seam so tests never spawn.
+The production invoker calls beta.3's in-process `invoke(workflow, { input })` (`src/agent-lib/invoke-flue-run.ts`, used by `src/crons.ts` `defaultCronInvoker` and both `src/resume.ts`/`src/resume-explore.ts`). It resolves the workflow *definition* from a name→def map (`src/agent-lib/workflow-registry.ts`, dynamically imported so the all-workflows graph stays off the seam callers' module-load path) and admits the run **in-process** (no child `flue run` process). It's an injected seam so tests never touch the real runtime. Two consequences: (1) `invoke()` is **fire-and-forget** — it resolves after admission, not completion, so the run record (not the receipt) is the source of truth; (2) it requires the configured server (`configureFlueRuntime()` ran at boot) — crons start post-boot and resumes are channel-triggered, so this holds. This also keeps the agent transcript **off stdout**: per-delta thinking/message/tool printing lives only in the `@flue/cli` `flue run` presenter, never in the runtime — events still persist to `.data/flue.db` for the admin console.
 
 ## Workflows (`src/workflows/*.ts`)
 

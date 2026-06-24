@@ -3,9 +3,8 @@
  * transcript + re-invoke idempotently.
  *
  * THE REPLY-GATE RESUME. It is the SAME re-invoke mechanism as build's `resume`
- * (src/resume.ts) — there is no top-level `invoke` in @flue/runtime 1.0.0-beta.2
- * (flue-reference §0); a workflow is re-entered by re-RUNNING it, and the on-disk app
- * run record's phasesDone + socraticIter make it land just past the gate. The ONE
+ * (src/resume.ts): a workflow is re-entered by re-RUNNING it, and the on-disk app run
+ * record's phasesDone + socraticIter make it land just past the gate. The ONE
  * difference from build's APPROVE/REJECT gate: the human supplies an ANSWER, not a
  * decision — so resumeExplore APPENDS the answer to `scratch.socratic.qa` BEFORE the
  * re-invoke, then re-runs explore with `resumedGate='reply:<round>'`. The ask phase of
@@ -18,12 +17,12 @@
  *
  * The re-invoker is an INJECTED seam (`reinvoke`) so this is testable offline: tests
  * pass an in-process fake that calls runExplore() directly; production defaults to
- * spawning `flue run explore --payload {…resumedGate}` (the cross-process re-entry
- * Spike-3 proved). NO LIVE SIDE EFFECTS in the default path here this slice.
+ * in-process `invokeFlueRun('explore', {…resumedGate})` (beta.3's `invoke`; beta.2 had
+ * none, so this used to spawn `flue run`). Fire-and-forget — the run record is the truth.
  */
 import { ExploreRunStore } from "./explore-run-store.ts";
 import type { ExploreInput, ExploreResult } from "./agent-lib/explore-phases.ts";
-import { spawnFlueRun } from "./agent-lib/spawn-flue-run.ts";
+import { invokeFlueRun } from "./agent-lib/invoke-flue-run.ts";
 
 /** Re-invoke the explore workflow for an app runId, carrying the parked reply gate. */
 export type ExploreReinvoker = (input: ExploreInput) => Promise<ExploreResult | void>;
@@ -37,10 +36,10 @@ export interface ResumeExploreOptions {
 const defaultStorePath = () =>
   process.env.LASTLIGHT_EXPLORE_RUNSTORE ?? "./.data/explore-run-store.db";
 
-/** Default production re-invoker: spawn a fresh `flue run explore` with the gate token. */
+/** Default production re-invoker: in-process `invoke('explore', { …gate })` (fire-and-forget). */
 function defaultReinvoke(input: ExploreInput): ExploreReinvoker {
   return async () => {
-    await spawnFlueRun("explore", input);
+    await invokeFlueRun("explore", input);
   };
 }
 

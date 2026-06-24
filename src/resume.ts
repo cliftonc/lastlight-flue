@@ -1,22 +1,26 @@
-import { spawnFlueRun } from './agent-lib/spawn-flue-run.ts';
+import { invokeFlueRun } from './agent-lib/invoke-flue-run.ts';
 import { BuildRunStore } from './build-run-store.ts';
 import type { BuildInput, BuildResult } from './agent-lib/build-phases.ts';
 
 // Phase 4 — resume(runId, decision): clear the gate + re-invoke idempotently.
 //
-// THE RE-INVOKE MECHANISM. There is NO top-level `invoke` in @flue/runtime
-// 1.0.0-beta.2 (flue-reference §0): a workflow is re-entered by re-RUNNING it. The
-// Spike-3 gated workflow ALREADY PROVED this works across 3 separate `flue run`
-// processes — a fresh process re-runs run() from the top, and the on-disk app run
-// record's phasesDone makes it land just past the gate (idempotent). resume() is
-// that same mechanism, applied to the `build` workflow.
+// THE RE-INVOKE MECHANISM. A workflow is re-entered by re-RUNNING it: the on-disk app
+// run record's phasesDone makes a fresh run() land just past the gate (idempotent). The
+// Spike-3 gated workflow proved this across separate processes; it holds identically
+// in-process because durability is app-owned, not process-bound. resume() applies that
+// same mechanism to the `build` workflow.
 //
-// The re-invoker is an INJECTED seam (`reinvoke`) so this is testable offline:
+// Beta.3 exports a top-level `invoke(workflow, { input })`, so the default re-entry is
+// now IN-PROCESS (`src/agent-lib/invoke-flue-run.ts`) rather than spawning `flue run`
+// (beta.2 had no `invoke` — flue-reference §0). The re-invoker is an INJECTED seam
+// (`reinvoke`) so this is testable offline:
 //   - tests pass an in-process fake that calls runBuild() directly;
-//   - production defaults to spawning `flue run build --payload {...resumedGate}`,
-//     exactly the cross-process path Spike-3 proved (or, when invoked from inside
-//     the running server, the channel layer can call `invokeWorkflowAttached` —
-//     TODO(phase-4/channels): wire that entry once channels land).
+//   - production defaults to `invokeFlueRun('build', { …resumedGate })`.
+//
+// FIRE-AND-FORGET: `invoke()` returns after admission, before the run completes, so the
+// `store.get(runId)` read below reflects the run as it stands NOW (still active/paused),
+// not its final state. That's fine — callers rely on the workflow's own async post-back,
+// and the run record remains the source of truth.
 //
 // Decision flow (design/phase-4 §"Approval gate"):
 //   reject  → runStore.fail(runId, 'rejected') — terminal, NO re-invoke.
@@ -45,13 +49,13 @@ const defaultStorePath = () =>
   process.env.LASTLIGHT_BUILD_RUNSTORE ?? './.data/build-run-store.db';
 
 /**
- * Default production re-invoker: spawn a fresh `flue run build` process with the
- * resumedGate token — the cross-process re-entry Spike-3 proved. (Stdout carries
- * the workflow's JSON result; we don't parse it here — the run record is the truth.)
+ * Default production re-invoker: in-process `invoke('build', { …resumedGate })`. Returns
+ * after admission (fire-and-forget); the run record is the truth, so we don't read the
+ * receipt here.
  */
 function defaultReinvoke(input: BuildInput): Reinvoker {
   return async () => {
-    await spawnFlueRun('build', input);
+    await invokeFlueRun('build', input);
   };
 }
 
