@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { Cron } from 'croner';
+import { Cron, scheduledJobs } from 'croner';
 import { getRuntimeConfig, loadConfig, type LastLightConfig } from './config.ts';
 
 // ── Last Light on Flue · cron scheduler (Phase 5 · FINAL slice) ──────────────
@@ -49,14 +49,15 @@ export type CronInvoker = (
 ) => Promise<void>;
 
 /**
- * Default production invoker: spawn `flue run <workflow> --payload <json>` —
- * the SAME cross-process re-entry `src/resume.ts` uses. NEVER called under
- * tests (the registry/fanout tests inject a fake; `startCrons` is VITEST-inert).
+ * Default production invoker: spawn `flue run <workflow> --input <json>` —
+ * the SAME cross-process re-entry `src/resume.ts` uses (beta.3 renamed the flag
+ * `--payload`→`--input`). NEVER called under tests (the registry/fanout tests inject
+ * a fake; `startCrons` is VITEST-inert).
  */
 export const defaultCronInvoker: CronInvoker = async (workflow, payload) => {
   await exec(
     'pnpm',
-    ['exec', 'flue', 'run', workflow, '--payload', JSON.stringify(payload)],
+    ['exec', 'flue', 'run', workflow, '--input', JSON.stringify(payload)],
     { timeout: 600_000 },
   );
 };
@@ -220,6 +221,14 @@ export class CronRegistry {
           }
           return dispatched;
         };
+        // Evict any stale croner job with this name FIRST. croner keeps named
+        // jobs in a PROCESS-GLOBAL `scheduledJobs` array that survives Vite's HMR
+        // module re-eval — so a dev-server reload would re-build this registry and
+        // collide ("name already taken") with the prior module instance's job.
+        // `stop()` splices the job out of the global array, freeing the name.
+        for (const stale of scheduledJobs.filter((j) => j.name === def.name)) {
+          stale.stop();
+        }
         // Construct PAUSED → no live timer until start(); merely building the
         // registry (tests) never schedules anything.
         const cron = new Cron(def.schedule, { paused: true, name: def.name }, () => {

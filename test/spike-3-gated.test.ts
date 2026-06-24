@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { run } from '../src/workflows/gated.ts';
+import { runGated } from '../src/workflows/gated.ts';
 import type { RunRecord } from '../src/run-store.ts';
 
 // Phase 0 · Spike 3 acceptance — durable HITL gate.
@@ -53,8 +53,11 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-// Minimal FlueContext stub — the gated workflow only reads `payload`.
-const ctx = (payload: { runId: string; resumed?: boolean }) => ({ payload }) as never;
+// beta.3: the gated workflow's testable core `runGated(input)` takes the input
+// directly (the workflow `run({ input })` just forwards it). `ctx` returns the input;
+// `run` is the core.
+const run = runGated;
+const ctx = (payload: { runId: string; resumed?: boolean }) => payload;
 
 describe('spike-3 durable gate (in-process)', () => {
   it('pauses at the gate on the initial invoke', async () => {

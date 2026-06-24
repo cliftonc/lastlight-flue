@@ -15,16 +15,25 @@
  * reply-gate question post + the spec publish are deterministic (bound ref + token).
  * All user-authored text is UNTRUSTED-wrapped by the prompt renderers.
  */
-import type { FlueContext } from "@flue/runtime";
+import {
+  defineAgent,
+  type FlueHarness,
+  type FlueLogger,
+  type ToolDefinition,
+} from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import { GITHUB_PERMISSION_PROFILES, type GitAccessProfile } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { withBuildSandbox } from "./build-sandbox.ts";
+import { dockerSandbox } from "../sandboxes/docker.ts";
+import { cloneRepoIntoHarness, BUILD_WORKSPACE } from "./build-sandbox.ts";
 import {
-  createExploreAgent,
-  EXPLORE_TASK_KEY,
-  SYNTHESIZE_TASK_KEY,
+  exploreProfile,
+  synthesizeProfile,
+  EXPLORE_PROFILE_NAME,
+  SYNTHESIZE_PROFILE_NAME,
+  EXPLORE_CWD,
   type ResearchPhase,
 } from "./explore.ts";
 import {
@@ -32,48 +41,85 @@ import {
   renderExploreAskPrompt,
   renderExploreSynthesizePrompt,
 } from "./explore-prompts.ts";
+import { webTools } from "../tools/web.ts";
+import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { runPhasePrompt } from "./record-execution.ts";
+import { ProgressNotifier } from "../notify/notifier.ts";
+import { GitHubTransport } from "../notify/transports/github.ts";
+import { SlackTransport } from "../notify/transports/slack.ts";
+import { NULL_REPORTER, readNotifierState } from "../notify/state.ts";
+import { runDashboardUrl } from "../notify/model.ts";
+import type {
+  NotifierState,
+  NotifierTransport,
+  ProgressReporter,
+} from "../notify/types.ts";
+import { buildExploreModel } from "./explore-notify.ts";
+import { slackPosterFromConfig, parseSlackConversationKey } from "../slack-client.ts";
 import { postReplyGateQuestion, type ExploreReplyRef } from "../explore-github-post.ts";
 import {
   publishSpecDeterministically,
   type PublishRef,
 } from "../explore-publish.ts";
 import type { ExploreRun } from "../explore-run-store.ts";
-import type { RepoRef } from "../tools/github-read.ts";
 
 /** The `issues-write` profile explore runs under (the only writes are the comment / issue). */
 export const EXPLORE_PROFILE: GitAccessProfile = "issues-write";
 
-/** The workflow input payload (identifies the idea + how/where to publish the spec). */
-export type ExploreInput = {
+/** The `explore` workflow input — validated at admission (`defineWorkflow({ input })`). */
+export const ExploreInputSchema = v.object({
   /** The APP run id (the reply contract — stable across re-invokes). */
-  runId: string;
-  owner: string;
-  repo: string;
+  runId: v.string(),
+  owner: v.string(),
+  repo: v.string(),
   /** The originating issue number; 0/absent → a Slack-originated run (publish a new issue). */
-  issue?: number;
+  issue: v.optional(v.number()),
   /** A stable trigger id for non-GitHub origins (e.g. `slack:team:chan:thread`). */
-  triggerId?: string;
+  triggerId: v.optional(v.string()),
   /**
    * The CHANNEL conversation key this reply gate is parked on — the SAME
    * `conversationKey` a channel computes from an event (Phase 6 gate correlation).
-   * Recorded on the run record at a reply-gate pause so a channel reply on that
-   * conversation resolves THIS run. When triggered from a channel this equals
-   * `triggerId` (the channels pass `triggerId: ev.conversationKey`).
    */
-  conversationKey?: string;
+  conversationKey: v.optional(v.string()),
   /** The issue title (untrusted). */
-  issueTitle?: string;
+  issueTitle: v.optional(v.string()),
   /** The issue body (untrusted). */
-  issueBody?: string;
+  issueBody: v.optional(v.string()),
   /** The triggering comment / Slack message (untrusted). */
-  commentBody?: string;
+  commentBody: v.optional(v.string()),
   /** Who triggered it (trigger metadata). */
-  sender?: string;
+  sender: v.optional(v.string()),
   /** Set on a resumed re-invoke — the parked reply gate (`reply:<round>`). */
-  resumedGate?: string;
+  resumedGate: v.optional(v.string()),
   /** Trigger provenance: "webhook" | "cron" | "cli" | "resume" | "boot". */
-  triggerType?: string;
-};
+  triggerType: v.optional(v.string()),
+});
+export type ExploreInput = v.InferOutput<typeof ExploreInputSchema>;
+
+/**
+ * The `explore` COORDINATOR agent (beta.3). It owns a fresh self-terminating Docker
+ * sandbox (`dockerSandbox()`) + `cwd: /workspace`; the research phases are SUBAGENT
+ * PROFILES (`explore` for read/ask, `synthesize` for the spec) delegated via
+ * `session.task({ agent, tools })`. The coordinator declares NO tools — the per-run
+ * READ GitHub tools + the GATED web tools are injected per task call (gating stays
+ * on the call, never global).
+ */
+export const exploreAgent = defineAgent(() => ({
+  sandbox: dockerSandbox(),
+  cwd: EXPLORE_CWD,
+  subagents: [exploreProfile, synthesizeProfile],
+}));
+
+/**
+ * The action-context surface the explore phase bodies + the testable core need: the
+ * supplied `harness` (initialized from `exploreAgent`, sandbox attached), the validated
+ * `input`, and `log`. Replaces beta.2 `FlueContext<ExploreInput>`.
+ */
+export interface ExploreRunCtx {
+  harness: FlueHarness;
+  input: ExploreInput;
+  log: FlueLogger;
+}
 
 /** The workflow result. */
 export type ExploreResult = {
@@ -111,7 +157,7 @@ export interface ExplorePublishResult {
 export interface ExploreDeps {
   /** Run a research phase (read / ask:<round> / synthesize) → its text. */
   runPhase(
-    ctx: FlueContext<ExploreInput>,
+    ctx: ExploreRunCtx,
     run: ExploreRun,
     phase: string,
   ): Promise<ExplorePhaseResult>;
@@ -119,13 +165,27 @@ export interface ExploreDeps {
   isReady(text: string): boolean;
   /** Deterministically post the reply-gate question (bound ref + token). */
   postQuestion(
-    ctx: FlueContext<ExploreInput>,
+    ctx: ExploreRunCtx,
     run: ExploreRun,
     round: number,
     question: string,
   ): Promise<PostedReplyGate>;
   /** Deterministically publish the synthesized spec (bound ref + token). */
-  publish(ctx: FlueContext<ExploreInput>, run: ExploreRun): Promise<ExplorePublishResult>;
+  publish(ctx: ExploreRunCtx, run: ExploreRun): Promise<ExplorePublishResult>;
+  /**
+   * Phase 8 egress — build, SEED (start), and return the in-place progress
+   * reporter for this run: a {@link ProgressReporter} fanning the per-phase
+   * checklist to the originating GitHub issue (when issue-scoped) and/or a Slack
+   * thread (when the run carries a Slack conversation). `save` persists the
+   * in-place-update handles into the run record so a RESUMED run re-attaches to
+   * the SAME surface. Optional + best-effort: omitted (tests) → the control flow
+   * uses {@link NULL_REPORTER} and the durable spine is unchanged.
+   */
+  makeReporter?(
+    ctx: ExploreRunCtx,
+    run: ExploreRun,
+    save: (patch: NotifierState) => void,
+  ): Promise<ProgressReporter>;
 }
 
 /** Detect the READY marker the ask phase emits to end the Socratic loop. */
@@ -158,13 +218,43 @@ function exploreBranch(run: ExploreRun): string {
   return `lastlight/explore-${run.issue || run.id.replace(/[^a-z0-9]+/gi, "-")}`;
 }
 
-/** Run one research phase: mint → clone → session over the explorer agent. */
+/** The coordinator session name explore phases delegate their subagent tasks from. */
+const EXPLORE_SESSION = "explore";
+
+/** Harnesses whose /workspace already holds the cloned checkout (clone-once-per-invocation). */
+const clonedExploreHarnesses = new WeakSet<FlueHarness>();
+
+/**
+ * Clone the repo into the coordinator harness's `/workspace` ONCE per invocation
+ * (guarded by harness identity). explore is READ-ONLY — it never pushes — so the
+ * tokenized remote is SCRUBBED after clone (`scrubRemote`).
+ */
+async function ensureExploreCheckout(
+  harness: FlueHarness,
+  run: ExploreRun,
+  token: string,
+): Promise<void> {
+  if (clonedExploreHarnesses.has(harness)) return;
+  await cloneRepoIntoHarness(
+    harness,
+    { owner: run.owner, repo: run.repo, branch: exploreBranch(run), scrubRemote: true },
+    token,
+  );
+  clonedExploreHarnesses.add(harness);
+}
+
+/**
+ * Run one research phase: mint → ensure the shared checkout → delegate a SUBAGENT TASK
+ * over the right profile (`explore` for read/ask, `synthesize` for the spec). The
+ * per-run READ GitHub tools + the GATED web tools are injected for THIS call only
+ * (gating stays on the call, never global) — owner/repo/token never model-selectable.
+ */
 async function runResearchPhase(
-  ctx: FlueContext<ExploreInput>,
+  ctx: ExploreRunCtx,
   run: ExploreRun,
   phase: string,
 ): Promise<ExplorePhaseResult> {
-  const input = ctx.payload;
+  const input = ctx.input;
   const ref: RepoRef = { owner: run.owner, repo: run.repo };
   const token = await mintIssuesWriteToken(input);
   const octokit = new Octokit({ auth: token });
@@ -174,25 +264,22 @@ async function runResearchPhase(
     : phase === "synthesize"
       ? "synthesize"
       : "read";
-  const taskKey = phaseKind === "synthesize" ? SYNTHESIZE_TASK_KEY : EXPLORE_TASK_KEY;
+  const profileName = phaseKind === "synthesize" ? SYNTHESIZE_PROFILE_NAME : EXPLORE_PROFILE_NAME;
 
-  return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: exploreBranch(run), taskId: run.id },
-    token,
-    async (sandbox) => {
-      const agent = createExploreAgent(ref, octokit, { taskKey, sandbox, withWebTools: true });
-      // Distinct harness NAME per phase. Flue allows each harness name to be
-      // initialized once per workflow invocation; explore's first invocation
-      // runs `read` then `ask:0` before the reply gate (2 inits), so the default
-      // 'default' name would collide ("init() has already been called"). The
-      // phase string (`read`/`ask:0`/`synthesize`) is unique within a run.
-      const harness = await ctx.init(agent, { name: phase });
-      const session = await harness.session(phase);
-      const prompt = renderPhasePrompt(input, run, phase);
-      const res = await session.prompt(prompt);
-      return { text: res.text };
-    },
-  );
+  await ensureExploreCheckout(ctx.harness, run, token);
+  const session = await ctx.harness.session(EXPLORE_SESSION);
+  const prompt = renderPhasePrompt(input, run, phase);
+  const tools: ToolDefinition[] = [...githubReadTools(ref, octokit), ...webTools()];
+  const taskRunner = {
+    prompt: (text: string, opts?: unknown) =>
+      session.task(text, { ...((opts as object | undefined) ?? {}), agent: profileName }),
+  };
+  const res = await runPhasePrompt(taskRunner as never, prompt, {
+    runId: run.id,
+    workflow: "explore",
+    phase,
+  }, { tools });
+  return { text: res.text };
 }
 
 /** Render the right prompt for a research phase (untrusted-wrapping in the renderers). */
@@ -232,7 +319,7 @@ function renderPhasePrompt(input: ExploreInput, run: ExploreRun, phase: string):
 
 /** Deterministically post the reply-gate question to the originating issue. */
 async function postQuestionDeterministically(
-  ctx: FlueContext<ExploreInput>,
+  ctx: ExploreRunCtx,
   run: ExploreRun,
   _round: number,
   question: string,
@@ -246,7 +333,7 @@ async function postQuestionDeterministically(
     });
     return {};
   }
-  const token = await mintIssuesWriteToken(ctx.payload);
+  const token = await mintIssuesWriteToken(ctx.input);
   const octokit = new Octokit({ auth: token });
   const ref: ExploreReplyRef = { owner: run.owner, repo: run.repo, issue_number: run.issue };
   const posted = await postReplyGateQuestion(octokit, ref, question);
@@ -255,11 +342,11 @@ async function postQuestionDeterministically(
 
 /** Deterministically publish the synthesized spec (comment on the issue / new issue). */
 async function publishDeterministically(
-  ctx: FlueContext<ExploreInput>,
+  ctx: ExploreRunCtx,
   run: ExploreRun,
 ): Promise<ExplorePublishResult> {
   const cfg = loadConfig();
-  const token = await mintIssuesWriteToken(ctx.payload);
+  const token = await mintIssuesWriteToken(ctx.input);
   const octokit = new Octokit({ auth: token });
 
   // GitHub-originated → publish to the originating repo/issue. Slack-originated → the
@@ -293,6 +380,72 @@ function parseOwnerRepo(spec?: string): { owner: string; repo: string } | undefi
   return { owner, repo };
 }
 
+/**
+ * Build + seed the live progress reporter for an explore run (Phase 8 egress,
+ * best-effort). Posts (and edits in place) ONE GitHub status comment on the
+ * originating issue (when issue-scoped) and/or ONE Slack message when the run
+ * carries a Slack conversation (`conversationKey` / `triggerId`) + a bot token.
+ * The in-place-update handles are read from / persisted to the run record's
+ * scratch (via `save`) so a RESUMED run re-attaches. A failed token mint or
+ * transport degrades to {@link NULL_REPORTER}, never the durable spine.
+ */
+export async function makeExploreReporter(
+  ctx: ExploreRunCtx,
+  run: ExploreRun,
+  save: (patch: NotifierState) => void,
+): Promise<ProgressReporter> {
+  const cfg = loadConfig();
+  const transports: NotifierTransport[] = [];
+  const state = readNotifierState(run.scratch);
+
+  // GitHub surface — only when the run is issue-scoped (a Slack-origin run has no
+  // originating issue until publish opens one). A token-mint failure just drops it.
+  if (run.issue > 0) {
+    try {
+      const token = await mintIssuesWriteToken(ctx.input);
+      const octokit = new Octokit({ auth: token });
+      transports.push(
+        new GitHubTransport({
+          octokit,
+          owner: run.owner,
+          repo: run.repo,
+          issueNumber: run.issue,
+          commentId: state.githubCommentId,
+          save: (commentId) => save({ githubCommentId: commentId }),
+        }),
+      );
+    } catch (err: unknown) {
+      ctx.log.warn("explore: notifier GitHub transport unavailable (continuing)", {
+        runId: run.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Slack mirror — when the run carries a Slack conversation (the channels pass
+  // `triggerId: ev.conversationKey`) AND a bot token is configured.
+  const slackKey = run.conversationKey ?? ctx.input.conversationKey ?? run.triggerId;
+  const loc = slackKey ? parseSlackConversationKey(slackKey) : undefined;
+  const poster = loc ? slackPosterFromConfig() : undefined;
+  if (loc && poster) {
+    transports.push(
+      new SlackTransport({
+        poster,
+        channel: loc.channelId,
+        thread: loc.threadTs,
+        ts: state.slackTs,
+        save: (ts) => save({ slackTs: ts, slackChannel: loc.channelId, slackThread: loc.threadTs }),
+      }),
+    );
+  }
+
+  if (transports.length === 0) return NULL_REPORTER;
+  const reporter = new ProgressNotifier(transports);
+  const runUrl = runDashboardUrl(cfg.publicUrl, run.id, "explore");
+  await reporter.start(buildExploreModel(run, { runUrl }));
+  return reporter;
+}
+
 /** Default production dependencies. */
 export function defaultExploreDeps(): ExploreDeps {
   return {
@@ -300,5 +453,6 @@ export function defaultExploreDeps(): ExploreDeps {
     isReady: isReadyMarker,
     postQuestion: postQuestionDeterministically,
     publish: publishDeterministically,
+    makeReporter: makeExploreReporter,
   };
 }

@@ -15,25 +15,24 @@
  *
  * Slice scope: single phase, no loop, no gate, no run-record/resume (that's Phase 4).
  *
- * SANDBOX (now wired): the WORKFLOW owns the container lifetime (Spike-2 contract)
- * via `withReviewerSandbox` — it `DockerContainer.create()`s a node+git image with
- * the scoped token baked as env, pre-clones the PR at its head ref into /workspace,
- * builds the reviewer with `sandbox: docker(container)` + `cwd: /workspace`, runs
- * it, and ALWAYS `container.remove()`s in a finally. The sandbox is ADDITIVE: if
- * provisioning/clone fails it falls back to the (live-proven) tool-only reviewer —
- * logged, never silent. EGRESS DEFERRED (the clone reaches github.com over the open
- * network; no SSRF floor) — do not run untrusted input through it.
+ * SANDBOX: this migration runs the reviewer TOOL-ONLY. The beta.2 additive Docker
+ * checkout (`withReviewerSandbox`, workflow-owned container) is dropped — it was an
+ * ADDITIVE enhancement whose tool-only fallback was already the proven path. The
+ * reviewer reviews via the bound read tools + the PR diff. TODO(phase-F/sandbox):
+ * re-add via `dockerSandbox()` on the agent + a PR-head clone in `run()`.
  *
- * Beta.2 form: `export async function run(ctx)` — there is NO `defineWorkflow` /
- * object form in @flue/runtime 1.0.0-beta.2 (spec/flue-reference.md §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. Per-run READ
+ * tools (closed over ref + scoped-token Octokit) are injected per-call via
+ * `session.prompt(_, { tools })`. `ctx.payload`→`input`, `ctx.init`→the `harness`.
  *
- * TESTABILITY: `run` defers to `runPrReview(ctx, deps)` with an injectable `deps`
- * seam (token minter, octokit factory, reviewer prompt runner, poster, config).
- * The default deps wire the real implementations; tests pass fakes so the whole
- * flow runs with NO live model and NO live GitHub.
+ * TESTABILITY: the inline `run` defers to `runPrReview(ctx, deps)` with an
+ * injectable `deps` seam (token minter, octokit factory, reviewer prompt runner,
+ * poster, config). The default deps wire the real implementations; tests pass fakes
+ * so the whole flow runs with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
 import { Octokit } from "octokit";
+import * as v from "valibot";
 import { runPhasePrompt } from "../agent-lib/record-execution.ts";
 import { parseReviewerVerdict, type ReviewerVerdict } from "../engine/verdict.ts";
 import {
@@ -42,14 +41,9 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createReviewerAgent } from "../agent-lib/reviewer.ts";
+import { reviewerAgent } from "../agent-lib/reviewer.ts";
 import { renderReviewPrompt } from "../agent-lib/pr-review-prompt.ts";
-import {
-  withReviewerSandbox,
-  defaultReviewerSandboxOps,
-  type ReviewerSandboxOps,
-} from "../agent-lib/reviewer-sandbox.ts";
-import type { SandboxFactory } from "@flue/runtime";
+import { githubReadTools } from "../tools/github-read.ts";
 import {
   mapVerdictToEvent,
   extractReviewBody,
@@ -60,12 +54,25 @@ import {
 } from "../github-post.ts";
 
 /** The workflow input payload (validated shape; identifies the PR + trigger). */
-export interface PrReviewInput {
-  owner: string;
-  repo: string;
-  prNumber: number;
+export const PrReviewInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
+  prNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type PrReviewInput = v.InferOutput<typeof PrReviewInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (initialized from the bound `reviewerAgent`), the validated `input`, and `log`.
+ */
+export interface PrReviewRunCtx {
+  harness: FlueHarness;
+  input: PrReviewInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -97,29 +104,15 @@ export interface PrReviewDeps {
   /** Resolve the bot login used for the self-authored guard. */
   botLogin(): string;
   /**
-   * Resolve the PR's head ref (branch) deterministically — used to pre-clone the
-   * checkout into the sandbox. This is workflow code (not a model tool), reading
-   * `pulls.get().head.ref` over the bound octokit.
-   */
-  getHeadRef(octokit: Octokit, ref: PrRef): Promise<string>;
-  /**
-   * Run the reviewer agent for this PR and return its raw text output. Wraps
-   * agent-init + session.prompt so tests can return a canned VERDICT output. The
-   * `sandbox` (when present) is a `docker(container)` factory whose container the
-   * lifecycle (`sandboxOps` + `withReviewerSandbox`) created + pre-cloned the PR
-   * into; when `undefined` the reviewer runs tool-only.
+   * Run the reviewer agent for this PR and return its raw text output. Opens a
+   * session on the supplied harness and prompts it with the per-run READ tools
+   * injected, so tests can return a canned VERDICT output. Tool-only this slice.
    */
   runReviewer(
-    ctx: FlueContext<PrReviewInput>,
+    ctx: PrReviewRunCtx,
     ref: PrRef,
     octokit: Octokit,
-    sandbox: SandboxFactory | undefined,
   ): Promise<string>;
-  /**
-   * Container lifecycle ops for the reviewer sandbox (create container w/ baked
-   * token). Default = real Docker; tests inject a fake so no real Docker runs.
-   */
-  sandboxOps: ReviewerSandboxOps;
   /** Determine whether the PR is bot-authored (COMMENT-fallback decision). */
   isSelfAuthored(octokit: Octokit, ref: PrRef, botLogin: string): Promise<boolean>;
   /** Deterministically post the review (formal review or issue-comment fallback). */
@@ -151,37 +144,26 @@ async function mintReviewWriteToken(input: PrReviewInput): Promise<string> {
   return token;
 }
 
-/** Resolve the PR head ref deterministically (workflow code, not a model tool). */
-async function getHeadRef(octokit: Octokit, ref: PrRef): Promise<string> {
-  const { data } = await octokit.rest.pulls.get({
-    owner: ref.owner,
-    repo: ref.repo,
-    pull_number: ref.pull_number,
-  });
-  return data.head.ref;
-}
-
-/** The real reviewer run: init the agent, open a session, prompt with the request. */
+/** The real reviewer run: open a session on the bound harness, prompt with the request. */
 async function runReviewerSession(
-  ctx: FlueContext<PrReviewInput>,
+  ctx: PrReviewRunCtx,
   ref: PrRef,
   octokit: Octokit,
-  sandbox: SandboxFactory | undefined,
 ): Promise<string> {
-  const agent = createReviewerAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
-  const session = await harness.session();
+  const session = await ctx.harness.session();
   // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
   // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
+  // Per-run READ tools injected for THIS call only — owner/repo/token never model-selectable.
   const res = await runPhasePrompt(
     session,
     renderReviewPrompt({
       owner: ref.owner,
       repo: ref.repo,
       prNumber: ref.pull_number,
-      triggerType: ctx.payload.triggerType,
+      triggerType: ctx.input.triggerType,
     }),
-    { runId: ctx.id, workflow: 'pr-review', phase: 'review' },
+    { runId: ctx.input.runId ?? ctx.harness.name, workflow: 'pr-review', phase: 'review' },
+    { tools: githubReadTools(ref, octokit) },
   );
   return res.text;
 }
@@ -192,9 +174,7 @@ export function defaultDeps(): PrReviewDeps {
     mintToken: mintReviewWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
     botLogin: () => loadConfig().botLogin,
-    getHeadRef,
     runReviewer: runReviewerSession,
-    sandboxOps: defaultReviewerSandboxOps(),
     isSelfAuthored: selfAuthoredImpl,
     post: postReviewDeterministically,
   };
@@ -205,32 +185,24 @@ export function defaultDeps(): PrReviewDeps {
  * uses `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
  */
 export async function runPrReview(
-  ctx: FlueContext<PrReviewInput>,
+  ctx: PrReviewRunCtx,
   deps: PrReviewDeps = defaultDeps(),
 ): Promise<PrReviewResult> {
-  const { owner, repo, prNumber } = ctx.payload;
+  const { owner, repo, prNumber } = ctx.input;
   const ref: PrRef = { owner, repo, pull_number: prNumber };
 
   // 1. Mint the review-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Self-review guard (defense in depth; decides the COMMENT fallback).
   const botLogin = deps.botLogin();
   const isSelf = await deps.isSelfAuthored(octokit, ref, botLogin);
 
-  // 3. Resolve the PR head ref, then run the reviewer inside a Docker sandbox with
-  //    the PR pre-cloned at that ref (CALLER owns the container lifetime — created
-  //    here, torn down in withReviewerSandbox's finally). The sandbox is ADDITIVE:
-  //    if provisioning/clone fails, withReviewerSandbox falls back to a tool-only
-  //    reviewer (the proven path) rather than failing the run — logged, not silent.
-  const headRef = await deps.getHeadRef(octokit, ref);
-  const { result: output, usedSandbox } = await withReviewerSandbox(
-    { owner, repo, headRef },
-    token,
-    (sandbox) => deps.runReviewer(ctx, ref, octokit, sandbox),
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  // 3. Run the reviewer TOOL-ONLY (the per-run read tools are injected per-call in
+  //    runReviewerSession). The beta.2 additive Docker checkout is dropped this
+  //    slice — see the module header + reviewer.ts TODO(phase-F/sandbox).
+  const output = await deps.runReviewer(ctx, ref, octokit);
 
   // 4. Parse the VERDICT marker (the code↔prompt contract).
   const { verdict, viaFallback } = parseReviewerVerdict(output);
@@ -255,11 +227,15 @@ export async function runPrReview(
     posted: true,
     reviewUrl: posted.html_url || undefined,
     postKind: posted.kind,
-    usedSandbox,
+    usedSandbox: false,
   };
 }
 
-/** Flue workflow entry — discovered as the `pr-review` workflow. */
-export async function run(ctx: FlueContext<PrReviewInput>): Promise<PrReviewResult> {
-  return runPrReview(ctx);
-}
+/** Flue workflow — discovered as the `pr-review` workflow. */
+export default defineWorkflow({
+  agent: reviewerAgent,
+  input: PrReviewInputSchema,
+  async run({ harness, input, log }) {
+    return (await runPrReview({ harness, input, log })) as unknown as JsonValue;
+  },
+});

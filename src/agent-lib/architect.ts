@@ -34,10 +34,7 @@
  * ⚠ EGRESS DEFERRED: the container runs with full network + no SSRF floor. Do NOT
  * run untrusted input through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgentProfile } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import building from "../skills/building/SKILL.md" with { type: "skill" };
@@ -51,24 +48,22 @@ export const ARCHITECT_TASK_KEY = "architect" as const;
 /** The working directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
 export const ARCHITECT_CWD = "/workspace" as const;
 
+/** The subagent-profile name the build coordinator delegates the architect phase to. */
+export const ARCHITECT_PROFILE_NAME = "architect" as const;
+
 /**
- * Build the architect agent bound to a repo ref + scoped Octokit + the build
- * sandbox. `ref`/`octokit` are closed over the read-tool factories (the model
- * cannot widen scope); `cwd: /workspace` points the agent's bash/file tools at
- * the pre-cloned checkout where it writes + commits the plan.
+ * The architect SUBAGENT PROFILE on the `build` coordinator (beta.3). It carries NO
+ * tools (the per-run READ tools are injected per `session.task(_, { tools })`) and NO
+ * sandbox/cwd (inherited from the coordinator harness — one shared `/workspace`
+ * checkout across phases). The persona (`loadPersona`, incl. security.md) anchors the
+ * untrusted-content markers in the architect prompt; the `building` skill carries the
+ * install/test-gate discipline. Model + thinkingLevel come from the `architect` task key.
  */
-export function createArchitectAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(ARCHITECT_TASK_KEY),
-    thinkingLevel: resolveThinking(ARCHITECT_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [building],
-    sandbox,
-    cwd: ARCHITECT_CWD,
-  }));
-}
+export const architectProfile = defineAgentProfile({
+  name: ARCHITECT_PROFILE_NAME,
+  description,
+  model: resolveModel(ARCHITECT_TASK_KEY),
+  thinkingLevel: resolveThinking(ARCHITECT_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});

@@ -34,7 +34,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { DockerContainer, docker } from "../sandboxes/docker.ts";
-import type { SandboxFactory } from "@flue/runtime";
+import type { FlueHarness, SandboxFactory } from "@flue/runtime";
 
 /** Image that ships node + npm + git (slim omits git, which the clone needs). */
 export const BUILD_IMAGE = "node:22-bookworm";
@@ -44,6 +44,70 @@ export const BUILD_WORKSPACE = "/workspace";
 
 /** Docker label applied to every build container (for cleanup/identification). */
 export const BUILD_CONTAINER_LABEL = "app=lastlight";
+
+// ── beta.3 harness-owned clone (Option A) ─────────────────────────────────────
+//
+// In beta.3 the HARNESS owns the sandbox (the agent declares `sandbox:
+// dockerSandbox()`, so Flue stands an empty container up at init). The workflow
+// `run()` then populates `/workspace` here via `harness.shell`, the documented
+// per-input pattern. This REPLACES the beta.2 `withBuildSandbox`/`withPrFixSandbox`
+// flow (which created the container in the workflow and passed it to the agent —
+// impossible now that the agent is static and pre-initialized). The token is
+// passed as a shell ENV VAR referenced as `"$REPO_URL"`, so it never appears in
+// argv/logs; for read-only flows that never push, `scrubRemote` strips the token
+// from `.git/config` after cloning.
+
+/** Repo + branch to clone into the harness sandbox's `/workspace`. */
+export interface HarnessCloneSpec {
+  owner: string;
+  repo: string;
+  /** Working branch — continued from its remote tip if it exists, else created with `-B`. */
+  branch: string;
+  /** Strip the tokenized remote after clone (read-only flows that never push). */
+  scrubRemote?: boolean;
+}
+
+/**
+ * Clone `spec` into the harness sandbox at `/workspace` and check out `spec.branch`
+ * (continuing its remote tip if present). The scoped token is passed ONLY as the
+ * `REPO_URL` env var (referenced as `"$REPO_URL"`), so it is never in argv or logs;
+ * errors are token-redacted. Throws on clone/checkout failure (sandboxed flows need
+ * the workspace — no fallback). Reused by build / explore / security-review.
+ */
+export async function cloneRepoIntoHarness(
+  harness: FlueHarness,
+  spec: HarnessCloneSpec,
+  token: string,
+): Promise<void> {
+  const repoUrl = `https://x-access-token:${token}@github.com/${spec.owner}/${spec.repo}.git`;
+  // `"$REPO_URL"` expands inside `sh -lc`; the token lives only in env, not argv.
+  const clone = await harness.shell(`git clone "$REPO_URL" ${BUILD_WORKSPACE}`, {
+    env: { REPO_URL: repoUrl },
+  });
+  if (clone.exitCode !== 0) {
+    throw new Error(`git clone failed (${clone.exitCode}): ${redact(clone.stderr.trim(), token)}`);
+  }
+  // Continue the working branch from its remote tip if it exists; else create fresh.
+  const remoteRef = `refs/remotes/origin/${spec.branch}`;
+  const exists = await harness.shell(`git rev-parse --verify --quiet ${shellArg(remoteRef)}`, {
+    cwd: BUILD_WORKSPACE,
+  });
+  const checkoutCmd =
+    exists.exitCode === 0
+      ? `git checkout -B ${shellArg(spec.branch)} ${shellArg(`origin/${spec.branch}`)}`
+      : `git checkout -B ${shellArg(spec.branch)}`;
+  const checkout = await harness.shell(checkoutCmd, { cwd: BUILD_WORKSPACE });
+  if (checkout.exitCode !== 0) {
+    throw new Error(
+      `git checkout -B ${spec.branch} failed (${checkout.exitCode}): ${redact(checkout.stderr.trim(), token)}`,
+    );
+  }
+  if (spec.scrubRemote) {
+    // Read-only flow: remove the token from the persisted remote URL.
+    const tokenless = `https://github.com/${spec.owner}/${spec.repo}.git`;
+    await harness.shell(`git remote set-url origin ${shellArg(tokenless)}`, { cwd: BUILD_WORKSPACE });
+  }
+}
 
 /** Identify the repo + working branch + the run this workspace belongs to. */
 export interface BuildCloneSpec {

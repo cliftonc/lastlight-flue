@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runSecurityFeedback,
   type SecurityFeedbackDeps,
   type SecurityFeedbackInput,
+  type SecurityFeedbackRunCtx,
   type ParentIssue,
   SECURITY_FEEDBACK_PROFILE,
   UNKNOWN_VERSION_REPLY,
@@ -84,17 +84,17 @@ A live key is committed.
 _No findings._
 `;
 
-function fakeCtx(payload: SecurityFeedbackInput): FlueContext<SecurityFeedbackInput> {
+function fakeCtx(payload: SecurityFeedbackInput): SecurityFeedbackRunCtx {
   return {
     id: "test-run",
-    payload,
+    input: payload,
     env: {},
     req: undefined,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     init: vi.fn(async () => {
       throw new Error("init must not be called — runFeedback is injected in tests");
     }),
-  } as unknown as FlueContext<SecurityFeedbackInput>;
+  } as unknown as SecurityFeedbackRunCtx;
 }
 
 const INPUT: SecurityFeedbackInput = {

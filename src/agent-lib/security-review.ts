@@ -25,11 +25,13 @@
  *   - model + thinkingLevel for the `security` task key (config / the reference's
  *     `{{models.security}}` + `{{variants.security}}` in security-review.yaml).
  *
- * SANDBOX (required, not additive): security-review ALWAYS runs WITH a Docker sandbox —
- * the WORKFLOW (`security-review.ts` → `withBuildSandbox`, reused by import) owns the
- * container lifetime: it creates the container, pre-clones the repo into `/workspace`,
- * passes `docker(container)` here, and `remove()`s it in a `finally`. This factory is a
- * pure mapper from (ref, octokit, sandbox) → CreatedAgent; it creates/removes nothing.
+ * SANDBOX (required, not additive): security-review ALWAYS runs WITH a Docker sandbox.
+ * beta.3: the HARNESS owns the sandbox — this static agent declares
+ * `sandbox: dockerSandbox()` + `cwd: /workspace`, so Flue stands an empty container
+ * up at init; the WORKFLOW `run()` then clones the repo into `/workspace` via
+ * `harness.shell` (`cloneRepoIntoHarness`). The container self-terminates (`--rm` +
+ * ttl) — Flue offers no teardown hook (api/sandbox-api.md). The agent's bash/file
+ * tools then review the checkout at `/workspace`.
  *
  * SCANNER-TOOLING DEVIATION (documented, not a blocker): the reference skill also shells
  * out to `gitleaks` + `semgrep`. The `node:22-bookworm` sandbox image lacks them AND
@@ -40,12 +42,10 @@
  * ⚠ EGRESS DEFERRED: the container runs with full network + no SSRF floor. Do NOT run
  * untrusted input through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
+import { dockerSandbox } from "../sandboxes/docker.ts";
 import securityReview from "../skills/security-review/SKILL.md" with { type: "skill" };
 
 export const description =
@@ -54,28 +54,22 @@ export const description =
 /** The task key both `resolveModel` and `resolveThinking` read for this phase. */
 export const SECURITY_TASK_KEY = "security" as const;
 
-/** The working directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
+/** The working directory the repo is cloned into (matches docker.ts WORKSPACE). */
 export const SECURITY_CWD = "/workspace" as const;
 
 /**
- * Build the security-review agent bound to a repo ref + read-scoped Octokit + the build
- * sandbox. `ref`/`octokit` are closed over the read-tool factories (the model cannot widen
- * scope to another repo); `cwd: /workspace` points the agent's bash/file tools at the
- * pre-cloned checkout it reviews. No GitHub write tool is bound — the summary issue is
- * filed deterministically by the workflow.
+ * The security-review agent definition (beta.3 static `defineAgent`, bound on the
+ * `security-review` workflow). `sandbox: dockerSandbox()` gives the harness a fresh
+ * self-terminating container; `cwd: /workspace` points the agent's bash/file tools at
+ * the checkout the workflow clones in via `cloneRepoIntoHarness`. No GitHub write tool
+ * is bound; per-run READ tools are injected per-call via `session.prompt(_, { tools })`,
+ * and the summary issue is filed deterministically by the workflow.
  */
-export function createSecurityAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(SECURITY_TASK_KEY),
-    thinkingLevel: resolveThinking(SECURITY_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [securityReview],
-    sandbox,
-    cwd: SECURITY_CWD,
-  }));
-}
+export const securityAgent = defineAgent(() => ({
+  model: resolveModel(SECURITY_TASK_KEY),
+  thinkingLevel: resolveThinking(SECURITY_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [securityReview],
+  sandbox: dockerSandbox(),
+  cwd: SECURITY_CWD,
+}));

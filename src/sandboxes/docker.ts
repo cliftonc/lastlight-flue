@@ -147,6 +147,35 @@ export class DockerContainer {
     return new DockerContainer(id, image);
   }
 
+  /**
+   * Create a SELF-TERMINATING container for the beta.3 `dockerSandbox` factory.
+   *
+   * Flue provides NO sandbox teardown hook (api/sandbox-api.md: "Flue does not
+   * manage sandbox lifetime") and a workflow `run()` cannot see the Flue run id
+   * (`harness.name` is the literal `'default'`), so it has no handle to `remove()`
+   * a container created in the agent initializer. We therefore start the container
+   * with `--rm` and a bounded `sleep <ttl>` entrypoint: it self-terminates after
+   * `ttlSeconds` and Docker auto-removes it. Set `ttlSeconds` comfortably above the
+   * longest workflow run. No token/repo is baked in — `run()` populates the empty
+   * `/workspace` via `harness.shell`/`harness.fs`.
+   */
+  static async createEphemeral(
+    opts: { image?: string; ttlSeconds?: number; labels?: Record<string, string> } = {},
+  ): Promise<DockerContainer> {
+    const image = opts.image ?? DEFAULT_IMAGE;
+    const ttl = Math.max(60, Math.floor(opts.ttlSeconds ?? 3600));
+    const args = ['run', '-d', '--rm', '--workdir', WORKSPACE];
+    for (const [k, val] of Object.entries(opts.labels ?? {})) args.push('--label', `${k}=${val}`);
+    args.push(image, 'sleep', String(ttl));
+    const res = await runDocker(args, { timeoutMs: 120_000 });
+    if (res.exitCode !== 0) {
+      throw new Error(`docker run failed (${res.exitCode}): ${res.stderr.trim() || res.stdout.trim()}`);
+    }
+    const id = res.stdout.trim();
+    await runDocker(['exec', id, 'mkdir', '-p', WORKSPACE], { timeoutMs: 30_000 });
+    return new DockerContainer(id, image);
+  }
+
   /** Tear the container down. Idempotent. The CALLER invokes this — never the adapter. */
   async remove(): Promise<void> {
     await runDocker(['rm', '-f', this.id], { timeoutMs: 60_000 });
@@ -258,5 +287,45 @@ export function docker(container: DockerContainer): SandboxFactory {
   };
 }
 
+export interface DockerSandboxOptions {
+  /** Container image. Default `node:22-bookworm` (ships node, npm, git). */
+  image?: string;
+  /**
+   * Container self-terminates (and `--rm` auto-removes it) after this many seconds.
+   * MUST exceed the longest workflow run. Default 1 hour.
+   */
+  ttlSeconds?: number;
+  /** Extra Docker labels (a `lastlight.run=<runId>` label is always added). */
+  labels?: Record<string, string>;
+}
+
+/**
+ * A beta.3 `SandboxFactory` for workflow agents that need a repo checkout.
+ *
+ * `createSessionEnv({ id })` (called once per root-harness init, `id` = Flue run
+ * id) starts a FRESH, EMPTY, self-terminating container (see
+ * `DockerContainer.createEphemeral`) and adapts it to the `SandboxApi`. The
+ * container is auto-removed by Docker after `ttlSeconds` — Flue offers no teardown
+ * hook, so we do not rely on one. The workflow `run()` populates `/workspace`
+ * (e.g. `git clone`) via `harness.shell`/`harness.fs`, passing the per-run scoped
+ * token as a shell env var (never baked into the image or container env).
+ *
+ * ⚠ EGRESS DEFERRED (same as `docker()`): the container has full network and no
+ * SSRF floor. Do not run untrusted input through it until egress is hardened.
+ */
+export function dockerSandbox(opts: DockerSandboxOptions = {}): SandboxFactory {
+  return {
+    async createSessionEnv({ id }: { id: string }): Promise<SessionEnv> {
+      const container = await DockerContainer.createEphemeral({
+        image: opts.image,
+        ttlSeconds: opts.ttlSeconds,
+        labels: { "lastlight.run": id, ...(opts.labels ?? {}) },
+      });
+      const api = new DockerSandboxApi(container);
+      return createSandboxSessionEnv(api, WORKSPACE);
+    },
+  };
+}
+
 /** Exported for direct contract testing (Spike 2 acceptance). */
-export { DockerSandboxApi };
+export { DockerSandboxApi, WORKSPACE };

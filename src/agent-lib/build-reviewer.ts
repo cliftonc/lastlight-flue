@@ -37,12 +37,10 @@
  * ⚠ EGRESS DEFERRED: the container runs with full network + no SSRF floor. Do NOT
  * run untrusted input through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent, defineAgentProfile } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
+import { dockerSandbox } from "../sandboxes/docker.ts";
 import prReview from "../skills/pr-review/SKILL.md" with { type: "skill" };
 import building from "../skills/building/SKILL.md" with { type: "skill" };
 import codeReview from "../skills/code-review/SKILL.md" with { type: "skill" };
@@ -59,48 +57,58 @@ export const FIX_TASK_KEY = "fix" as const;
 /** The working directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
 export const BUILD_REVIEWER_CWD = "/workspace" as const;
 
-/**
- * Build the build-internal reviewer agent (also re-used for the recheck phase,
- * re-prompted with re-reviewer.md) bound to a repo ref + read-scoped Octokit + the
- * build sandbox. `ref`/`octokit` are closed over the read-tool factories (the model
- * cannot widen scope); `cwd: /workspace` points the agent's bash/file tools at the
- * pre-cloned checkout so it can diff + read the committed changes.
- */
-export function createBuildReviewerAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(REVIEW_TASK_KEY),
-    thinkingLevel: resolveThinking(REVIEW_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [prReview, building, codeReview],
-    sandbox,
-    cwd: BUILD_REVIEWER_CWD,
-  }));
-}
+/** The subagent-profile name the build coordinator delegates reviewer:N / recheck:N to. */
+export const BUILD_REVIEWER_PROFILE_NAME = "build-reviewer" as const;
+
+/** The subagent-profile name the build coordinator delegates fix:N to. */
+export const BUILD_FIX_PROFILE_NAME = "build-fix" as const;
 
 /**
- * Build the fix agent bound to a repo ref + read-scoped Octokit + the build
- * sandbox. Mirrors the executor: persona, the `building` skill (the install/test
- * gate), READ-ONLY GitHub tools (code lands via the sandbox git CLI, not a write
- * tool), sandbox + cwd /workspace. Resolves the `fix` task key (falls back to the
- * default model when no explicit fix entry is configured).
+ * The build-internal reviewer SUBAGENT PROFILE on the `build` coordinator (beta.3),
+ * re-used for the recheck phase (re-prompted with re-reviewer.md). NO tools (per-run
+ * READ tools injected per `session.task(_, { tools })`) and NO sandbox/cwd (inherited
+ * from the coordinator harness — the shared `/workspace` checkout it diffs/reads).
+ * Model + thinkingLevel from the `review` task key.
  */
-export function createFixAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(FIX_TASK_KEY),
-    thinkingLevel: resolveThinking(FIX_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [building],
-    sandbox,
-    cwd: BUILD_REVIEWER_CWD,
-  }));
-}
+export const buildReviewerProfile = defineAgentProfile({
+  name: BUILD_REVIEWER_PROFILE_NAME,
+  description,
+  model: resolveModel(REVIEW_TASK_KEY),
+  thinkingLevel: resolveThinking(REVIEW_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [prReview, building, codeReview],
+});
+
+/**
+ * The build-internal fix SUBAGENT PROFILE on the `build` coordinator (beta.3). Mirrors
+ * the executor: persona + the `building` skill, NO tools (per-run READ tools injected
+ * per call; code lands via the sandbox git CLI, not a write tool), NO sandbox/cwd
+ * (inherited from the coordinator harness). Model + thinkingLevel from the `fix` task
+ * key (falls back to the default model when no explicit fix entry is configured).
+ */
+export const buildFixProfile = defineAgentProfile({
+  name: BUILD_FIX_PROFILE_NAME,
+  description: "Addresses reviewer notes in the build checkout and commits the fix (the fix:N phase).",
+  model: resolveModel(FIX_TASK_KEY),
+  thinkingLevel: resolveThinking(FIX_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});
+
+/**
+ * The standalone FIX agent for the single-phase `pr-fix` workflow (beta.3 static
+ * `defineAgent`). Unlike the build reviewer-loop fix (a subagent profile inside the
+ * `build` coordinator), pr-fix binds this directly: `sandbox: dockerSandbox()` gives
+ * the harness a fresh container; `cwd: /workspace` points its bash/file tools at the
+ * PR-head checkout the workflow clones in. It commits in-sandbox via the git CLI; the
+ * workflow reads HEAD + pushes deterministically. Per-run READ tools are injected
+ * per-call via `session.prompt(_, { tools })`.
+ */
+export const fixAgent = defineAgent(() => ({
+  model: resolveModel(FIX_TASK_KEY),
+  thinkingLevel: resolveThinking(FIX_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+  sandbox: dockerSandbox(),
+  cwd: BUILD_REVIEWER_CWD,
+}));

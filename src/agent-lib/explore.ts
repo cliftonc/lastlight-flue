@@ -30,11 +30,7 @@
  * tools carry their OWN host-side SSRF guard (src/tools/web.ts). Do NOT run untrusted
  * input through the container itself.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory, ToolDefinition } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
-import { webTools, type WebToolsOptions } from "../tools/web.ts";
+import { defineAgentProfile } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import building from "../skills/building/SKILL.md" with { type: "skill" };
@@ -53,39 +49,38 @@ export const EXPLORE_CWD = "/workspace" as const;
 /** The explore research phases that opt into the gated web tools. */
 export type ResearchPhase = "read" | "ask" | "synthesize";
 
+/** The subagent-profile name the explore coordinator delegates read/ask phases to. */
+export const EXPLORE_PROFILE_NAME = "explore" as const;
+/** The subagent-profile name the explore coordinator delegates the synthesize phase to. */
+export const SYNTHESIZE_PROFILE_NAME = "synthesize" as const;
+
 /**
- * Build a research agent for an explore phase. The agent always has READ-ONLY GitHub
- * tools bound to (ref, octokit) — closed over, never model-selected — the shared
- * persona, and (for research phases) the GATED web tools. The `taskKey` selects the
- * model/thinkingLevel (explore for read/ask, architect for synthesize).
- *
- * The web tools are attached ONLY here (the explorer), NEVER globally — this is the
- * gating boundary. With no provider key configured `web_search` degrades gracefully
- * (src/tools/web.ts); `web_fetch` works regardless (it needs no key).
+ * The explore research SUBAGENT PROFILE (read / ask phases) on the `explore`
+ * coordinator (beta.3). NO tools (per-run READ GitHub tools + the GATED web tools are
+ * injected per `session.task(_, { tools })` — the gating boundary stays on the call,
+ * never global) and NO sandbox/cwd (inherited from the coordinator harness — the shared
+ * `/workspace` checkout). Model + thinkingLevel from the `explore` task key.
  */
-export function createExploreAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  opts: {
-    taskKey?: string;
-    sandbox?: SandboxFactory;
-    /** Inject web tool options (provider keys / fetch) for offline tests. */
-    webToolsOptions?: WebToolsOptions;
-    /** Bind the gated web tools (default true — the research phases want them). */
-    withWebTools?: boolean;
-  } = {},
-) {
-  const taskKey = opts.taskKey ?? EXPLORE_TASK_KEY;
-  const tools: ToolDefinition[] = [...githubReadTools(ref, octokit)];
-  if (opts.withWebTools !== false) {
-    tools.push(...webTools(opts.webToolsOptions));
-  }
-  return createAgent(() => ({
-    model: resolveModel(taskKey),
-    thinkingLevel: resolveThinking(taskKey),
-    instructions: loadPersona(),
-    tools,
-    skills: [building],
-    ...(opts.sandbox ? { sandbox: opts.sandbox, cwd: EXPLORE_CWD } : {}),
-  }));
-}
+export const exploreProfile = defineAgentProfile({
+  name: EXPLORE_PROFILE_NAME,
+  description,
+  model: resolveModel(EXPLORE_TASK_KEY),
+  thinkingLevel: resolveThinking(EXPLORE_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});
+
+/**
+ * The synthesize SUBAGENT PROFILE on the `explore` coordinator (beta.3): reads the
+ * context doc + the full Q&A transcript and writes the spec. Same shape as
+ * `exploreProfile` but uses the architect model (reference explore.yaml synthesize
+ * phase). Tools injected per-call; sandbox/cwd inherited from the coordinator.
+ */
+export const synthesizeProfile = defineAgentProfile({
+  name: SYNTHESIZE_PROFILE_NAME,
+  description: "Synthesizes the explore context + Q&A transcript into a detailed spec (the synthesize phase).",
+  model: resolveModel(SYNTHESIZE_TASK_KEY),
+  thinkingLevel: resolveThinking(SYNTHESIZE_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});

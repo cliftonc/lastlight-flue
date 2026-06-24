@@ -44,14 +44,17 @@ function byName(tools: ToolDefinition[], name: string): ToolDefinition {
 /** Walk a JSON-Schema parameters object collecting every declared property key. */
 function allPropertyKeys(schema: unknown): string[] {
   const keys: string[] = [];
+  // Walk a valibot schema tree: object schemas carry `.entries`, arrays `.item`,
+  // wrappers (optional/nullable/etc.) `.wrapped`. Collect every declared key.
   const visit = (node: unknown): void => {
     if (!node || typeof node !== "object") return;
     const obj = node as Record<string, unknown>;
-    if (obj.properties && typeof obj.properties === "object") {
-      keys.push(...Object.keys(obj.properties as Record<string, unknown>));
-      for (const v of Object.values(obj.properties as Record<string, unknown>)) visit(v);
+    if (obj.entries && typeof obj.entries === "object") {
+      keys.push(...Object.keys(obj.entries as Record<string, unknown>));
+      for (const v of Object.values(obj.entries as Record<string, unknown>)) visit(v);
     }
-    if (obj.items) visit(obj.items);
+    if (obj.item) visit(obj.item);
+    if (obj.wrapped) visit(obj.wrapped);
   };
   visit(schema);
   return keys;
@@ -134,15 +137,14 @@ describe("SECURITY: token/owner/repo/ids are never model-selectable parameters",
     "private_key",
   ];
 
-  it("no tool exposes a forbidden parameter, and every schema is additionalProperties:false", () => {
+  it("no tool exposes a forbidden parameter (closed-over ref/token, not model-selectable)", () => {
     // repo-write has the widest surface — covers all tools.
     const tools = githubTools(REF, TOKEN, "repo-write");
     expect(tools.length).toBeGreaterThan(0);
     for (const t of tools) {
-      const schema = t.parameters as Record<string, unknown>;
-      // closed schema — model cannot smuggle extra fields
-      expect(schema.additionalProperties).toBe(false);
-      const keys = allPropertyKeys(schema);
+      // The valibot input schema declares ONLY the safe model-supplied fields; the
+      // bound owner/repo/token are closed over, never declared as input entries.
+      const keys = allPropertyKeys(t.input);
       for (const f of FORBIDDEN) {
         expect(keys, `${t.name} must not expose '${f}'`).not.toContain(f);
       }
@@ -161,13 +163,13 @@ describe("execute uses the closed-over ref/token, not model args", () => {
       data: { number: 7, title: "t", state: "open", body: "b", labels: [], user: { login: "u" } },
     });
     const tools = githubTools(REF, TOKEN, "read");
-    const res = await byName(tools, "github_get_issue").execute({ issue_number: 7 });
+    const res = await byName(tools, "github_get_issue").run({ input: { issue_number: 7 } });
     expect(restMock.issues.get).toHaveBeenCalledWith({
       owner: "octo",
       repo: "demo",
       issue_number: 7,
     });
-    expect(JSON.parse(res).number).toBe(7);
+    expect((res as { number: number }).number).toBe(7);
   });
 
   it("commentOnIssue posts with bound owner/repo and the model body", async () => {
@@ -175,9 +177,11 @@ describe("execute uses the closed-over ref/token, not model args", () => {
       data: { id: 42, html_url: "https://x/42" },
     });
     const tools = githubTools(REF, TOKEN, "issues-write");
-    const res = await byName(tools, "github_comment_on_issue").execute({
-      issue_number: 3,
-      body: "hello",
+    const res = await byName(tools, "github_comment_on_issue").run({
+      input: {
+        issue_number: 3,
+        body: "hello",
+      },
     });
     expect(restMock.issues.createComment).toHaveBeenCalledWith({
       owner: "octo",
@@ -185,7 +189,7 @@ describe("execute uses the closed-over ref/token, not model args", () => {
       issue_number: 3,
       body: "hello",
     });
-    expect(JSON.parse(res).id).toBe(42);
+    expect((res as { id: number }).id).toBe(42);
   });
 
   it("createReview submits with bound owner/repo and the model event/body", async () => {
@@ -193,10 +197,12 @@ describe("execute uses the closed-over ref/token, not model args", () => {
       data: { id: 9, state: "APPROVED", html_url: "https://x/9" },
     });
     const tools = githubTools(REF, TOKEN, "review-write");
-    await byName(tools, "github_create_review").execute({
-      pull_number: 5,
-      event: "APPROVE",
-      body: "lgtm",
+    await byName(tools, "github_create_review").run({
+      input: {
+        pull_number: 5,
+        event: "APPROVE",
+        body: "lgtm",
+      },
     });
     expect(restMock.pulls.createReview).toHaveBeenCalledWith({
       owner: "octo",
@@ -212,7 +218,7 @@ describe("execute uses the closed-over ref/token, not model args", () => {
       data: { total_count: 0, items: [] },
     });
     const tools = githubTools(REF, TOKEN, "read");
-    await byName(tools, "github_search_issues").execute({ query: "is:open" });
+    await byName(tools, "github_search_issues").run({ input: { query: "is:open" } });
     expect(restMock.search.issuesAndPullRequests).toHaveBeenCalledWith({
       q: "repo:octo/demo is:open",
       per_page: 20,

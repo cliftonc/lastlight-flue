@@ -1,31 +1,27 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import type { SandboxFactory, AgentCreateContext } from "@flue/runtime";
+import { describe, it, expect, vi } from "vitest";
+import type { FlueHarness } from "@flue/runtime";
 import type { Octokit } from "octokit";
-import type { FlueContext } from "@flue/runtime";
 import {
-  createArchitectAgent,
+  architectProfile,
+  ARCHITECT_PROFILE_NAME,
   ARCHITECT_TASK_KEY,
-  ARCHITECT_CWD,
 } from "../architect.ts";
 import {
   runArchitectPhase,
   type ArchitectPhaseDeps,
   type BuildInput,
+  type BuildRunCtx,
 } from "../build-phases.ts";
-import { resolveModel, resolveThinking, setRuntimeConfig, resetRuntimeConfigForTests } from "../../config.ts";
+import { resolveModel, resolveThinking } from "../../config.ts";
 import { loadPersona } from "../persona.ts";
 import type { BuildRun } from "../../build-run-store.ts";
-import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
-import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
 import { UNTRUSTED_OPEN } from "../../engine/untrusted.ts";
 
-afterEach(() => resetBuildWorkspacesForTests());
+// beta.3 — architect SUBAGENT-PROFILE config + phase WIRING, all offline (no live model
+// / GitHub / Docker). The profile is a STATIC `defineAgentProfile` (resolved at module
+// load); the phase wiring (token mint, clone-into-harness, subagent task) is asserted
+// over injected deps.
 
-// Phase 4 — architect agent CONFIG + phase WIRING, all offline (no live model /
-// GitHub / Docker). The agent's config is asserted by invoking its `initialize`
-// closure; the phase wiring is asserted over injected deps.
-
-const SANDBOX = { __fake: true } as unknown as SandboxFactory;
 const FAKE_OCTOKIT = { __fake: "octokit" } as unknown as Octokit;
 const REF = { owner: "cliftonc", repo: "widget" };
 
@@ -45,75 +41,47 @@ const RUN: BuildRun = {
   failReason: null,
 };
 
-function ctx(payload: Partial<BuildInput> = {}): FlueContext<BuildInput> {
+/** A stub coordinator harness — the wiring tests fake every harness-touching dep. */
+const STUB_HARNESS = { name: "default" } as unknown as FlueHarness;
+
+function ctx(input: Partial<BuildInput> = {}): BuildRunCtx {
   return {
-    payload: {
+    harness: STUB_HARNESS,
+    input: {
       runId: RUN.id,
       owner: RUN.owner,
       repo: RUN.repo,
       issue: RUN.issue,
-      ...payload,
+      ...input,
     },
     log: { info() {}, warn() {}, error() {} },
-  } as unknown as FlueContext<BuildInput>;
+  };
 }
 
-describe("createArchitectAgent — config (model / thinking / persona / skills / sandbox / cwd)", () => {
-  it("resolves model+thinking for the architect task key, carries the persona, the building skill, sandbox + cwd", async () => {
-    // A minimal config so resolveModel/resolveThinking are deterministic.
-    setRuntimeConfig({
-      models: { default: "openai/gpt-5.1", architect: "openai/gpt-5.1-codex" },
-      variants: { architect: "high" },
-    } as never);
-    try {
-      const agent = createArchitectAgent(REF, FAKE_OCTOKIT, SANDBOX);
-      const cfg = await agent.initialize({} as AgentCreateContext<unknown>);
-
-      expect(cfg.model).toBe(resolveModel(ARCHITECT_TASK_KEY));
-      expect(cfg.model).toBe("openai/gpt-5.1-codex");
-      expect(cfg.thinkingLevel).toBe(resolveThinking(ARCHITECT_TASK_KEY));
-      expect(cfg.thinkingLevel).toBe("high");
-      expect(cfg.instructions).toBe(loadPersona());
-      // The architect gets the `building` skill (install/test gate).
-      expect(cfg.skills?.length).toBe(1);
-      // Sandbox + cwd point the agent at the pre-cloned checkout.
-      expect(cfg.sandbox).toBe(SANDBOX);
-      expect(cfg.cwd).toBe(ARCHITECT_CWD);
-      expect(cfg.cwd).toBe("/workspace");
-      // Read-only GitHub tools are bound (closed over ref/octokit).
-      expect((cfg.tools ?? []).length).toBeGreaterThan(0);
-    } finally {
-      resetRuntimeConfigForTests();
-    }
+describe("architectProfile — static subagent-profile config (model / thinking / persona / skill)", () => {
+  it("carries the architect model+thinking task key, the persona, the building skill, and NO tools/sandbox/cwd", () => {
+    expect(architectProfile.name).toBe(ARCHITECT_PROFILE_NAME);
+    expect(architectProfile.model).toBe(resolveModel(ARCHITECT_TASK_KEY));
+    expect(architectProfile.thinkingLevel).toBe(resolveThinking(ARCHITECT_TASK_KEY));
+    expect(architectProfile.instructions).toBe(loadPersona());
+    // The architect gets the `building` skill (install/test gate).
+    expect(architectProfile.skills?.length).toBe(1);
+    // Profiles carry NO tools (injected per `session.task`) and NO sandbox/cwd
+    // (inherited from the coordinator harness — the shared /workspace checkout).
+    expect(architectProfile.tools).toBeUndefined();
+    expect((architectProfile as { sandbox?: unknown }).sandbox).toBeUndefined();
   });
 });
 
-/** A fake build container that records exec calls + teardown, for the sandbox ops. */
-function fakeContainer() {
-  const execCalls: string[] = [];
-  let removed = 0;
-  const container: BuildContainer = {
-    async exec(command) {
-      execCalls.push(command);
-      return { stdout: "", stderr: "", exitCode: 0 };
-    },
-    async remove() {
-      removed += 1;
-    },
-    sandbox: () => SANDBOX,
-  };
-  return { container, execCalls, removed: () => removed };
-}
-
 describe("runArchitectPhase — wiring over injected deps (no live model / GitHub / Docker)", () => {
   function makeDeps(opts: { sessionText?: string } = {}) {
-    const fc = fakeContainer();
     const calls = {
       minted: 0,
       octokitForToken: undefined as string | undefined,
       prompt: undefined as string | undefined,
-      sandboxSeen: undefined as SandboxFactory | undefined,
       refSeen: undefined as { owner: string; repo: string } | undefined,
+      cloned: 0,
+      clonedToken: undefined as string | undefined,
     };
     const deps: ArchitectPhaseDeps = {
       async mintToken() {
@@ -124,32 +92,30 @@ describe("runArchitectPhase — wiring over injected deps (no live model / GitHu
         calls.octokitForToken = token;
         return FAKE_OCTOKIT;
       },
-      sandboxOps: { createContainer: vi.fn(async () => fc.container) } as BuildSandboxOps,
-      async runArchitectSession(_c, ref, _octokit, sandbox, prompt) {
+      async ensureCheckout(_harness, _run, token) {
+        calls.cloned += 1;
+        calls.clonedToken = token;
+      },
+      async runArchitectSession(_c, ref, _octokit, prompt) {
         calls.prompt = prompt;
-        calls.sandboxSeen = sandbox;
         calls.refSeen = ref;
         return opts.sessionText ?? "Branch lastlight/42; wrote the plan.";
       },
     };
-    return { deps, calls, fc };
+    return { deps, calls };
   }
 
-  it("mints a repo-write token, builds octokit, pre-clones into a sandbox, runs the architect session, returns its text", async () => {
-    const { deps, calls, fc } = makeDeps({ sessionText: "PLAN WRITTEN" });
+  it("mints a repo-write token, builds octokit, clones into the harness, runs the architect session, returns its text", async () => {
+    const { deps, calls } = makeDeps({ sessionText: "PLAN WRITTEN" });
     const res = await runArchitectPhase(ctx(), RUN, deps);
 
     expect(res.text).toBe("PLAN WRITTEN");
     expect(calls.minted).toBe(1);
     expect(calls.octokitForToken).toBe("ghs_arch_token");
-    // The session got the sandbox (pre-clone happened) + the bound ref.
-    expect(calls.sandboxSeen).toBe(SANDBOX);
     expect(calls.refSeen).toEqual(REF);
-    // The container was created (pre-clone) and torn down in finally.
-    expect((deps.sandboxOps.createContainer as ReturnType<typeof vi.fn>)).toHaveBeenCalled();
-    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
-    await closeBuildWorkspace(RUN.taskId);
-    expect(fc.removed()).toBe(1);
+    // The checkout was ensured (cloned once) with the minted token.
+    expect(calls.cloned).toBe(1);
+    expect(calls.clonedToken).toBe("ghs_arch_token");
   });
 
   it("renders the prompt with repo/branch/issue + wraps untrusted issue text", async () => {
@@ -166,26 +132,24 @@ describe("runArchitectPhase — wiring over injected deps (no live model / GitHu
     expect(calls.prompt).toContain("make the parser robust");
   });
 
-  it("tears the container down even when the session throws (finally)", async () => {
-    const { deps, fc } = makeDeps();
+  it("propagates a session throw (no swallow)", async () => {
+    const { deps } = makeDeps();
     deps.runArchitectSession = async () => {
       throw new Error("model exploded mid-architect");
     };
     await expect(runArchitectPhase(ctx(), RUN, deps)).rejects.toThrow(
       "model exploded mid-architect",
     );
-    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
-    await closeBuildWorkspace(RUN.taskId);
-    expect(fc.removed()).toBe(1);
   });
 
   it("never leaks the token through the logger", async () => {
     const warn = vi.fn();
     const { deps } = makeDeps();
-    const c = {
-      payload: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
+    const c: BuildRunCtx = {
+      harness: STUB_HARNESS,
+      input: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
       log: { info() {}, warn, error() {} },
-    } as unknown as FlueContext<BuildInput>;
+    };
     await runArchitectPhase(c, RUN, deps);
     for (const call of warn.mock.calls) {
       expect(JSON.stringify(call)).not.toContain("ghs_arch_token");

@@ -1,14 +1,13 @@
 import { describe, it, expect } from "vitest";
-import type { AgentCreateContext } from "@flue/runtime";
 import {
   renderExploreReadPrompt,
   renderExploreAskPrompt,
   renderExploreSynthesizePrompt,
   exploreIssueDir,
 } from "../explore-prompts.ts";
-import { createExploreAgent } from "../explore.ts";
+import { exploreProfile, synthesizeProfile } from "../explore.ts";
 import { isReadyMarker } from "../explore-phases.ts";
-import { setRuntimeConfig, resetRuntimeConfigForTests } from "../../config.ts";
+import { webTools } from "../../tools/web.ts";
 import { UNTRUSTED_OPEN, UNTRUSTED_CLOSE } from "../../engine/untrusted.ts";
 import {
   publishSpecDeterministically,
@@ -100,32 +99,18 @@ describe("explore prompts — untrusted wrapping (security)", () => {
   });
 });
 
-describe("explore agent — web tools are GATED to research phases", () => {
-  const octokit = {} as never;
-
-  async function toolNames(withWebTools: boolean): Promise<string[]> {
-    setRuntimeConfig({ models: { default: "openai/gpt-5.1" }, variants: {} } as never);
-    try {
-      const agent = createExploreAgent(REF, octokit, { withWebTools });
-      const cfg = await agent.initialize({} as AgentCreateContext<unknown>);
-      return (cfg.tools ?? []).map((t: { name: string }) => t.name);
-    } finally {
-      resetRuntimeConfigForTests();
-    }
-  }
-
-  it("research agents bind web_search + web_fetch", async () => {
-    const names = await toolNames(true);
+describe("explore — web tools are GATED to research phases (injected per-call, never on the profile)", () => {
+  it("the gated web-tool set is web_search + web_fetch", () => {
+    // beta.3: the research phases inject these per `session.task(_, { tools })` —
+    // the gating boundary is the per-call inject, not a global binding.
+    const names = webTools().map((t: { name: string }) => t.name);
     expect(names).toContain("web_search");
     expect(names).toContain("web_fetch");
   });
 
-  it("a non-research agent (withWebTools:false) does NOT get web tools", async () => {
-    const names = await toolNames(false);
-    expect(names).not.toContain("web_search");
-    expect(names).not.toContain("web_fetch");
-    // It still has the read-only GitHub tools.
-    expect(names.length).toBeGreaterThan(0);
+  it("the explore subagent profiles carry NO global tools (gating stays on the call)", () => {
+    expect(exploreProfile.tools).toBeUndefined();
+    expect(synthesizeProfile.tools).toBeUndefined();
   });
 });
 

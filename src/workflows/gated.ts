@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { FlueContext } from '@flue/runtime';
+import { defineAgent, defineWorkflow, type JsonValue } from '@flue/runtime';
+import * as v from 'valibot';
 import { RunStore } from '../run-store.ts';
 
 // Phase 0 · Spike 3 — durable HITL (the resume proof).
@@ -18,12 +19,17 @@ import { RunStore } from '../run-store.ts';
 // and for free (no model call). Real workflows (Phase 3+) call init()/session inside
 // the same control flow.
 
-interface GatedInput {
+export const GatedInputSchema = v.object({
   /** APP run id — a stable caller-owned key, distinct from Flue's per-run id. */
-  runId: string;
+  runId: v.string(),
   /** Set by the resume signal to advance past the gate. */
-  resumed?: boolean;
-}
+  resumed: v.optional(v.boolean()),
+});
+export type GatedInput = v.InferOutput<typeof GatedInputSchema>;
+
+// Pure-TS gate proof: the model is never called, so the bound agent declares
+// `model: false` (call-level model selection required — and never exercised).
+const gatedAgent = defineAgent(() => ({ model: false }));
 
 // Read lazily so each process (and each test) can point at its own paths.
 const storePath = () => process.env.LASTLIGHT_RUNSTORE ?? './.data/run-store.db';
@@ -36,10 +42,10 @@ function sideEffect(runId: string, marker: string): void {
   appendFileSync(path, `${marker}\n`);
 }
 
-export async function run({ payload }: FlueContext<GatedInput>) {
+export async function runGated(input: GatedInput): Promise<JsonValue> {
   const store = new RunStore(storePath());
   try {
-    const appRunId = payload.runId;
+    const appRunId = input.runId;
     store.getOrCreate(appRunId);
 
     // STEP 1 — guarded so a re-invocation never repeats the side effect.
@@ -49,7 +55,7 @@ export async function run({ payload }: FlueContext<GatedInput>) {
     }
 
     // GATE — first pass suspends: persist `pending` and END the function.
-    if (!payload.resumed) {
+    if (!input.resumed) {
       store.setPending(appRunId, 'gate-1');
       return { appRunId, paused: true, gate: 'gate-1', step1Done: true };
     }
@@ -74,3 +80,11 @@ export async function run({ payload }: FlueContext<GatedInput>) {
     store.close();
   }
 }
+
+export default defineWorkflow({
+  agent: gatedAgent,
+  input: GatedInputSchema,
+  async run({ input }) {
+    return runGated(input);
+  },
+});

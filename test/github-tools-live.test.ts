@@ -42,8 +42,10 @@ describe.skipIf(!LIVE)("github tools (live) — scoped token reads a real issue"
 
     const tools = githubTools({ owner, repo }, token, "read");
     const getIssue = tools.find((t) => t.name === "github_get_issue")!;
-    const out = await getIssue.execute({ issue_number: issueNumber });
-    const parsed = JSON.parse(out);
+    const parsed = (await getIssue.run({ input: { issue_number: issueNumber } })) as {
+      number: number;
+      title: string;
+    };
     expect(parsed.number).toBe(issueNumber);
     expect(typeof parsed.title).toBe("string");
   });

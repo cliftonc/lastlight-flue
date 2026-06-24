@@ -127,7 +127,7 @@ export interface RunDetail extends RunSummary {
 export function toRunDetail(r: RunRecord): RunDetail {
   return {
     ...toRunSummary(r),
-    payload: r.payload ?? null,
+    payload: r.input ?? null,
     result: r.result ?? null,
     error: r.error ?? null,
   };
@@ -153,7 +153,7 @@ export function toAgentSummary(a: AgentManifestEntry): AgentSummary {
     name: a.name,
     description: a.description ?? null,
     http: a.transports.http === true,
-    created: a.created,
+    created: a.defined,
   };
 }
 

@@ -46,41 +46,59 @@
  * the poster always CREATES — this is the deliberate difference from repo-health's
  * idempotent tracking issue.
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The bound
+ * `securityAgent` declares `sandbox: dockerSandbox()` (the HARNESS owns a fresh
+ * self-terminating container); `run()` clones the repo into `/workspace` via
+ * `cloneRepoIntoHarness(harness, …, token)` then prompts. `ctx.payload`→`input`,
+ * `ctx.init(agent)`→the supplied `harness`. Per-run READ tools are injected
+ * per-call via `session.prompt(_, { tools })`.
  *
- * TESTABILITY: `run` defers to `runSecurityReview(ctx, deps)` with an injectable `deps`
- * seam (token minter, octokit factory, repo-metadata fetcher, sandboxed agent runner,
- * issue filer). The default deps wire the real implementations (and the real
- * `withBuildSandbox` clone); tests pass fakes so the whole flow runs with NO live model,
- * NO live GitHub, and NO live Docker.
+ * TESTABILITY: the inline `run` defers to `runSecurityReview(ctx, deps)` with an
+ * injectable `deps` seam (token minter, octokit factory, repo-metadata fetcher,
+ * sandboxed agent runner, issue filer). Tests pass fakes (incl. a fake `runSecurityAgent`)
+ * so the whole flow runs with NO live model, NO live GitHub, and NO live Docker.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
 import { Octokit } from "octokit";
+import * as v from "valibot";
 import {
   GITHUB_PERMISSION_PROFILES,
   type GitAccessProfile,
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createSecurityAgent } from "../agent-lib/security-review.ts";
+import { securityAgent } from "../agent-lib/security-review.ts";
 import {
   renderSecurityPrompt,
   type SecurityPromptContext,
   SECURITY_NO_FINDINGS,
 } from "../agent-lib/security-review-prompt.ts";
-import { withBuildSandbox, closeBuildWorkspace, type BuildSandboxOps } from "../agent-lib/build-sandbox.ts";
+import { cloneRepoIntoHarness } from "../agent-lib/build-sandbox.ts";
+import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
 import {
   fileSecurityScanIssue,
   type FiledSecurityScan,
 } from "../security-review-post.ts";
-import type { RepoRef } from "../tools/github-read.ts";
 
 /** The workflow input payload (identifies the repo to scan — no issue/PR). */
-export interface SecurityReviewInput {
-  owner: string;
-  repo: string;
+export const SecurityReviewInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
   /** Optional trigger provenance: "cron" | "cli" | "webhook" | "slack". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type SecurityReviewInput = v.InferOutput<typeof SecurityReviewInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (initialized from the bound `securityAgent`, sandbox attached), `input`, `log`.
+ */
+export interface SecurityReviewRunCtx {
+  harness: FlueHarness;
+  input: SecurityReviewInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -121,18 +139,17 @@ export interface SecurityReviewDeps {
   /** Fetch the repo metadata (default branch / description / topics) over the octokit. */
   fetchRepoMeta(octokit: Octokit, ref: RepoRef): Promise<RepoMeta>;
   /**
-   * Clone the repo into a sandbox, run the security agent over the checkout, and return
-   * its raw report text. Wraps `withBuildSandbox` + agent-init + session.prompt so tests
-   * can return a canned report (and assert the clone + ALWAYS-teardown contract).
+   * Clone the repo into the harness sandbox, run the security agent over the checkout,
+   * and return its raw report text. Wraps `cloneRepoIntoHarness` + session.prompt so
+   * tests can return a canned report without live Docker/model.
    */
   runSecurityAgent(
-    ctx: FlueContext<SecurityReviewInput>,
+    ctx: SecurityReviewRunCtx,
     ref: RepoRef,
     octokit: Octokit,
     token: string,
     meta: RepoMeta,
     scanDate: string,
-    sandboxOps?: BuildSandboxOps,
   ): Promise<string>;
   /** Deterministically file the dated summary issue (NEW snapshot each run). */
   fileIssue(
@@ -141,8 +158,6 @@ export interface SecurityReviewDeps {
     report: string,
     opts: { dateISO: string },
   ): Promise<FiledSecurityScan>;
-  /** Docker ops for the sandbox (injected so tests mock Docker entirely). */
-  sandboxOps?: BuildSandboxOps;
 }
 
 /** Mint an issues-write token downscoped to the target repo via the ported git-auth. */
@@ -185,44 +200,33 @@ async function fetchRepoMeta(octokit: Octokit, ref: RepoRef): Promise<RepoMeta> 
  * commits/pushes, so the branch name is inert.
  */
 async function runSecuritySession(
-  ctx: FlueContext<SecurityReviewInput>,
+  ctx: SecurityReviewRunCtx,
   ref: RepoRef,
   octokit: Octokit,
   token: string,
   meta: RepoMeta,
   scanDate: string,
-  sandboxOps?: BuildSandboxOps,
 ): Promise<string> {
   const branch = meta.defaultBranch ?? "main";
-  // security-review is SINGLE-phase (one scan, no commit/push), so it does not
-  // share its workspace across phases — it creates one container and tears it
-  // down right after the scan via `closeBuildWorkspace` in the finally.
-  const taskId = `security:${ref.owner}/${ref.repo}:${scanDate}`;
-  try {
-    return await withBuildSandbox(
-      { owner: ref.owner, repo: ref.repo, branch, taskId },
-      token,
-      async (sandbox) => {
-        const agent = createSecurityAgent(ref, octokit, sandbox);
-        const harness = await ctx.init(agent);
-        const session = await harness.session("security-review");
-        const promptCtx: SecurityPromptContext = {
-          owner: ref.owner,
-          repo: ref.repo,
-          defaultBranch: meta.defaultBranch,
-          description: meta.description,
-          topics: meta.topics,
-          triggerType: ctx.payload.triggerType,
-          scanDate,
-        };
-        const res = await session.prompt(renderSecurityPrompt(promptCtx));
-        return res.text;
-      },
-      { ops: sandboxOps, log: ctx.log },
-    );
-  } finally {
-    await closeBuildWorkspace(taskId, ctx.log);
-  }
+  // beta.3: the HARNESS owns the (self-terminating) container via the agent's
+  // `dockerSandbox()`. Clone the repo into /workspace here; the scan never
+  // commits/pushes, so scrub the tokenized remote after clone.
+  await cloneRepoIntoHarness(ctx.harness, { owner: ref.owner, repo: ref.repo, branch, scrubRemote: true }, token);
+  const session = await ctx.harness.session("security-review");
+  const promptCtx: SecurityPromptContext = {
+    owner: ref.owner,
+    repo: ref.repo,
+    defaultBranch: meta.defaultBranch,
+    description: meta.description,
+    topics: meta.topics,
+    triggerType: ctx.input.triggerType,
+    scanDate,
+  };
+  // Per-run READ tools injected for THIS call only — owner/repo/token never model-selectable.
+  const res = await session.prompt(renderSecurityPrompt(promptCtx), {
+    tools: githubReadTools(ref, octokit),
+  });
+  return res.text;
 }
 
 /** Default production dependencies. */
@@ -231,8 +235,7 @@ export function defaultDeps(): SecurityReviewDeps {
     mintToken: mintIssuesWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
     fetchRepoMeta,
-    runSecurityAgent: (ctx, ref, octokit, token, meta, scanDate, sandboxOps) =>
-      runSecuritySession(ctx, ref, octokit, token, meta, scanDate, sandboxOps),
+    runSecurityAgent: runSecuritySession,
     fileIssue: fileSecurityScanIssue,
   };
 }
@@ -251,32 +254,24 @@ function scanDateUTC(): string {
  * so a top-level `Date` would freeze at build time).
  */
 export async function runSecurityReview(
-  ctx: FlueContext<SecurityReviewInput>,
+  ctx: SecurityReviewRunCtx,
   deps: SecurityReviewDeps = defaultDeps(),
   scanDate: string = scanDateUTC(),
 ): Promise<SecurityReviewResult> {
-  const { owner, repo } = ctx.payload;
+  const { owner, repo } = ctx.input;
   const ref: RepoRef = { owner, repo };
 
   // 1. Mint the issues-write scoped token (contents:read to clone + issues:write to file).
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Fetch the repo metadata deterministically (workflow code, not a model tool).
   const meta = await deps.fetchRepoMeta(octokit, ref);
 
-  // 3. CLONE into a sandbox + run the security agent over the checkout. The agent reviews
-  //    the actual code and emits the findings REPORT (summary-issue body). Container
-  //    ALWAYS torn down by withBuildSandbox's finally (incl. on throw).
-  const report = await deps.runSecurityAgent(
-    ctx,
-    ref,
-    octokit,
-    token,
-    meta,
-    scanDate,
-    deps.sandboxOps,
-  );
+  // 3. CLONE into the harness sandbox + run the security agent over the checkout. The
+  //    agent reviews the actual code and emits the findings REPORT (summary-issue body).
+  //    The container self-terminates (`--rm` + ttl) — no teardown hook in beta.3.
+  const report = await deps.runSecurityAgent(ctx, ref, octokit, token, meta, scanDate);
 
   // 4. NO_FINDINGS / empty → file NOTHING (the cron is intentionally low-noise).
   const trimmed = (report ?? "").trim();
@@ -303,9 +298,11 @@ export async function runSecurityReview(
   };
 }
 
-/** Flue workflow entry — discovered as the `security-review` workflow. */
-export async function run(
-  ctx: FlueContext<SecurityReviewInput>,
-): Promise<SecurityReviewResult> {
-  return runSecurityReview(ctx);
-}
+/** Flue workflow — discovered as the `security-review` workflow. */
+export default defineWorkflow({
+  agent: securityAgent,
+  input: SecurityReviewInputSchema,
+  async run({ harness, input, log }) {
+    return (await runSecurityReview({ harness, input, log })) as unknown as JsonValue;
+  },
+});

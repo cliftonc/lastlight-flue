@@ -30,9 +30,12 @@
  * poster, publisher). Tests pass fakes so the whole ask→gate→reply→research→synthesize→
  * publish loop runs with NO live model, NO live web, NO live GitHub.
  *
- * Beta.2 form: `export async function run(ctx)` (NO defineWorkflow; flue-reference §0).
+ * Beta.3 form: `export default defineWorkflow({ agent: exploreAgent, input, run })`. The
+ * bound coordinator agent owns a self-terminating Docker sandbox; the research phases
+ * delegate to its subagent profiles via `session.task`. `ctx.payload`→`input`;
+ * `ctx.init`→the supplied `harness`. The app-owned `ExploreRunStore` gate is UNCHANGED.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type JsonValue } from "@flue/runtime";
 import {
   ExploreRunStore,
   MAX_RESTART_RESUMES,
@@ -43,10 +46,15 @@ import {
 import {
   type ExploreInput,
   type ExploreResult,
+  type ExploreRunCtx,
   type ExploreDeps,
+  ExploreInputSchema,
+  exploreAgent,
   defaultExploreDeps,
 } from "../agent-lib/explore-phases.ts";
-import { closeBuildWorkspace } from "../agent-lib/build-sandbox.ts";
+import { askRow } from "../agent-lib/explore-notify.ts";
+import { NULL_REPORTER, notifierStatePatch } from "../notify/state.ts";
+import type { NotifierState, ProgressReporter } from "../notify/types.ts";
 
 export type { ExploreInput, ExploreResult } from "../agent-lib/explore-phases.ts";
 
@@ -70,16 +78,48 @@ function replyGate(round: number): ReplyGate {
 }
 
 /**
+ * Build the Phase-8 progress reporter for this run, best-effort: any failure
+ * degrades to {@link NULL_REPORTER} so the egress notifier can NEVER break the
+ * durable control-flow spine.
+ */
+async function makeReporterSafe(
+  deps: ExploreDeps,
+  ctx: ExploreRunCtx,
+  run: ExploreRun,
+  save: (patch: NotifierState) => void,
+): Promise<ProgressReporter> {
+  if (!deps.makeReporter) return NULL_REPORTER;
+  try {
+    return await deps.makeReporter(ctx, run, save);
+  } catch (err: unknown) {
+    ctx.log.warn("explore: progress reporter unavailable (continuing)", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return NULL_REPORTER;
+  }
+}
+
+/**
+ * A short reply-gate ping. Routed via `reporter.noteTerminal` so it reaches ONLY
+ * surfaces with no other signal (Slack) — GitHub already gets the deterministic
+ * reply-gate question comment (`postQuestion`), so this never double-posts there.
+ */
+function questionPing(round: number, question: string): string {
+  const q = question.trim().split("\n")[0]?.slice(0, 200) ?? "";
+  return `❓ Clarifying question (round ${round + 1}) — reply in this thread to continue.\n\n${q}`;
+}
+
+/**
  * The testable core. Drives the full Socratic loop over an injected ExploreRunStore +
  * ExploreDeps. Production wraps this in `run()` with the default store + real deps;
  * tests pass a temp-sqlite store + fake phase bodies.
  */
 export async function runExplore(
-  ctx: FlueContext<ExploreInput>,
+  ctx: ExploreRunCtx,
   store: ExploreRunStore,
   deps: ExploreDeps = defaultExploreDeps(),
 ): Promise<ExploreResult> {
-  const input = ctx.payload;
+  const input = ctx.input;
   const id = input.runId;
   let run = store.getOrCreate(id, seedFrom(input));
 
@@ -109,12 +149,22 @@ export async function runExplore(
   }
   run = store.get(id)!;
 
+  // ── progress notifier (Phase 8 egress, best-effort) ──────────────────────────
+  // Build + SEED the in-place checklist surface(s) AFTER the breaker/clear so the
+  // seed reflects the current phasesDone (a RESUME re-attaches to the SAME comment/
+  // message via the handles in scratch). Strictly best-effort — never the spine.
+  const reporter = await makeReporterSafe(deps, ctx, run, (patch) =>
+    store.recordScratch(id, notifierStatePatch(patch)),
+  );
+
   // ── read / research (skipped if done) ────────────────────────────────────────
   // The explorer clones the repo, reads it, writes a context doc to a file (the
   // durable cross-phase handoff — spec/10 split rule), and returns a BASELINE summary
   // which we record as scratch context for the ask/synthesize phases.
   if (store.shouldRunPhase(run, "read")) {
+    await reporter.step("read", "running");
     const r = await deps.runPhase(ctx, run, "read");
+    await reporter.step("read", "done");
     store.markPhaseDone(id, "read", { baseline: clip(r.text) });
     run = store.get(id)!;
   }
@@ -133,6 +183,7 @@ export async function runExplore(
     // posed yet (idempotency-keyed) — otherwise we recover the question text.
     let questionText: string;
     if (store.shouldRunPhase(run, askPhase)) {
+      await reporter.insertStep(askRow(askPhase, "running"), "synthesize");
       const a = await deps.runPhase(ctx, run, askPhase);
       questionText = a.text;
       const ready = deps.isReady(a.text);
@@ -140,6 +191,8 @@ export async function runExplore(
       // it (and the synthesize phase has the full Q&A). READY rounds carry no question.
       if (!ready) store.appendSocraticTurn(id, { question: questionText });
       store.markPhaseDone(id, askPhase, { [`question:${round}`]: clip(questionText) });
+      // READY → the round resolves; otherwise it parks awaiting the human's reply.
+      await reporter.step(askPhase, ready ? "done" : "awaiting");
       if (ready) store.setSocraticReady(id, true);
       run = store.get(id)!;
       if (ready) break;
@@ -164,12 +217,16 @@ export async function runExplore(
         if (posted?.commentId !== undefined) {
           store.recordScratch(id, { [`gateComment:${gate}`]: String(posted.commentId) });
         }
+        // Ping the silent surfaces (Slack) — GitHub already has the question comment.
+        await reporter.noteTerminal(questionPing(round, questionText));
       }
       return { status: "paused", gate };
     }
 
-    // Resumed past this gate: the reply is already in scratch.socratic.qa. Advance the
-    // cursor so the NEXT round's ask agent runs (and a re-invoke skips this round).
+    // Resumed past this gate: the reply is already in scratch.socratic.qa. Mark the
+    // round resolved + advance the cursor so the NEXT round's ask agent runs (and a
+    // re-invoke skips this round).
+    await reporter.step(askPhase, "done");
     store.setSocraticIter(id, round + 1);
     run = store.get(id)!;
   }
@@ -185,7 +242,9 @@ export async function runExplore(
   // detailed spec to a file. We record the spec text (clipped) so publish can recover
   // it deterministically even after a crash.
   if (store.shouldRunPhase(run, "synthesize")) {
+    await reporter.step("synthesize", "running");
     const s = await deps.runPhase(ctx, run, "synthesize");
+    await reporter.step("synthesize", "done");
     store.markPhaseDone(id, "synthesize", { spec: clip(s.text, 60_000) });
     run = store.get(id)!;
   }
@@ -195,11 +254,16 @@ export async function runExplore(
   // already published, and the publisher itself dedup-guards (a bot comment marker /
   // the recorded URL) so even a re-invoke that lost the flag won't double-publish.
   if (store.shouldRunPhase(run, "publish")) {
+    await reporter.step("publish", "running");
     const pub = await deps.publish(ctx, run);
     const pubScratch: Record<string, string> = {};
     if (pub.specUrl) pubScratch.specUrl = pub.specUrl;
     store.markPhaseDone(id, "publish", pubScratch);
     store.complete(id);
+    await reporter.step("publish", "done", pub.specUrl ? `[spec](${pub.specUrl})` : undefined);
+    await reporter.noteTerminal(
+      pub.specUrl ? `✅ explore complete — spec: ${pub.specUrl}` : "✅ explore complete.",
+    );
     return { status: "complete", specUrl: pub.specUrl, deduped: pub.deduped };
   }
 
@@ -213,18 +277,23 @@ function clip(text: string, max = 8_000): string {
   return t.length > max ? `${t.slice(0, max)}\n…[clipped ${t.length - max} chars]` : t;
 }
 
-/** Flue workflow entry — discovered as the `explore` workflow. */
-export async function run(ctx: FlueContext<ExploreInput>): Promise<ExploreResult> {
-  const store = new ExploreRunStore(storePath());
-  try {
-    return await runExplore(ctx, store);
-  } finally {
-    store.close();
-    // Tear down the shared per-run workspace (keyed by the explore run id, the
-    // same key the phases pass as taskId to withBuildSandbox). Best-effort.
-    await closeBuildWorkspace(ctx.payload.runId, ctx.log);
-  }
-}
+/**
+ * Flue workflow — discovered as the `explore` workflow. The coordinator's
+ * `dockerSandbox()` self-terminates (`--rm` + ttl), so there is NO container teardown
+ * here (beta.3 offers no sandbox teardown hook); only the run-store is closed.
+ */
+export default defineWorkflow({
+  agent: exploreAgent,
+  input: ExploreInputSchema,
+  async run({ harness, input, log }): Promise<JsonValue> {
+    const store = new ExploreRunStore(storePath());
+    try {
+      return (await runExplore({ harness, input, log }, store)) as unknown as JsonValue;
+    } finally {
+      store.close();
+    }
+  },
+});
 
 // Re-export the run record type so resume-explore can reference it without a cycle.
 export type { ExploreRun };

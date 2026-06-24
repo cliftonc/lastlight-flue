@@ -27,10 +27,10 @@ function jsonFetch(body: unknown): typeof fetch {
   })) as unknown as typeof fetch;
 }
 
-/** Walk a JSON-Schema parameters object collecting every declared property key. */
+/** Collect the declared input-property keys from a tool's valibot object schema. */
 function propertyKeys(schema: unknown): string[] {
-  const obj = schema as { properties?: Record<string, unknown> };
-  return Object.keys(obj.properties ?? {});
+  const obj = schema as { entries?: Record<string, unknown> };
+  return Object.keys(obj.entries ?? {});
 }
 
 describe("web_search", () => {
@@ -43,7 +43,7 @@ describe("web_search", () => {
     });
     const tool = webSearch({ keys: { tavily: "tvly-secret" }, fetchImpl });
 
-    const out = await tool.execute({ query: "what is flue" }, undefined);
+    const out = await tool.run({ input: { query: "what is flue" } });
 
     // Provider HTTP was called with the model query + Tavily endpoint.
     const call = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
@@ -61,7 +61,7 @@ describe("web_search", () => {
   it("uses Tavily over Exa/Brave when all keys present (precedence)", async () => {
     const fetchImpl = jsonFetch({ results: [] });
     const tool = webSearch({ keys: { tavily: "t", exa: "e", brave: "b" }, fetchImpl });
-    await tool.execute({ query: "q" }, undefined);
+    await tool.run({ input: { query: "q" } });
     const call = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(call[0]).toContain("api.tavily.com");
   });
@@ -69,7 +69,7 @@ describe("web_search", () => {
   it("falls back to Exa when only Exa key is configured", async () => {
     const fetchImpl = jsonFetch({ results: [{ title: "E", url: "https://e/x", text: "et" }] });
     const tool = webSearch({ keys: { exa: "exa-key" }, fetchImpl });
-    const out = await tool.execute({ query: "q" }, undefined);
+    const out = await tool.run({ input: { query: "q" } });
     const call = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(call[0]).toContain("api.exa.ai");
     expect(out).toContain("https://e/x");
@@ -78,7 +78,7 @@ describe("web_search", () => {
   it("falls back to Brave when only Brave key is configured", async () => {
     const fetchImpl = jsonFetch({ web: { results: [{ title: "B", url: "https://b/x", description: "bd" }] } });
     const tool = webSearch({ keys: { brave: "brave-key" }, fetchImpl });
-    const out = await tool.execute({ query: "q" }, undefined);
+    const out = await tool.run({ input: { query: "q" } });
     const call = (fetchImpl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]!;
     expect(String(call[0])).toContain("api.search.brave.com");
     expect(out).toContain("https://b/x");
@@ -87,7 +87,7 @@ describe("web_search", () => {
   it("returns a graceful unavailable message when no provider key is configured", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
     const tool = webSearch({ keys: {}, fetchImpl });
-    const out = await tool.execute({ query: "q" }, undefined);
+    const out = await tool.run({ input: { query: "q" } });
     expect(out).toMatch(/unavailable/i);
     expect(out).toMatch(/no provider key/i);
     // Did NOT crash and did NOT call the provider.
@@ -96,19 +96,20 @@ describe("web_search", () => {
 
   it("does NOT expose the API key or provider as a model parameter (security)", () => {
     const tool = webSearch({ keys: { tavily: "secret-key" } });
-    const keys = propertyKeys(tool.parameters);
+    const keys = propertyKeys(tool.input);
     expect(keys).toEqual(expect.arrayContaining(["query"]));
     // No key/provider/token/auth fields are model-selectable.
     for (const k of keys) {
       expect(k).not.toMatch(/key|token|provider|auth|secret/i);
     }
-    expect((tool.parameters as { additionalProperties?: boolean }).additionalProperties).toBe(false);
+    // The valibot input declares ONLY query (+ optional count) — no key/provider entry.
+    expect(keys.sort()).toEqual(["count", "query"]);
   });
 
   it("never includes the key in the output string", async () => {
     const fetchImpl = jsonFetch({ results: [{ title: "T", url: "https://x", content: "c" }] });
     const tool = webSearch({ keys: { tavily: "tvly-SUPERSECRET" }, fetchImpl });
-    const out = await tool.execute({ query: "q" }, undefined);
+    const out = await tool.run({ input: { query: "q" } });
     expect(out).not.toContain("tvly-SUPERSECRET");
   });
 });
@@ -179,7 +180,7 @@ describe("web_fetch SSRF guard", () => {
   it("web_fetch tool returns a refusal string (no request) for a blocked URL", async () => {
     const fetchImpl = vi.fn() as unknown as typeof fetch;
     const tool = webFetch({ fetchImpl, resolveHost });
-    const out = await tool.execute({ url: "http://169.254.169.254/" }, undefined);
+    const out = await tool.run({ input: { url: "http://169.254.169.254/" } });
     expect(out).toMatch(/refused/i);
     expect((fetchImpl as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
   });
@@ -194,7 +195,7 @@ describe("web_fetch SSRF guard", () => {
       },
     })) as unknown as typeof fetch;
     const tool = webFetch({ fetchImpl, resolveHost });
-    const out = await tool.execute({ url: "https://public.example.test/page" }, undefined);
+    const out = await tool.run({ input: { url: "https://public.example.test/page" } });
     expect((fetchImpl as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce();
     expect(out).toContain("Hi");
     expect(out).toContain("Body text");
@@ -203,9 +204,9 @@ describe("web_fetch SSRF guard", () => {
 
   it("does NOT expose a resolver/host override as a model parameter", () => {
     const tool = webFetch();
-    const keys = propertyKeys(tool.parameters);
+    const keys = propertyKeys(tool.input);
+    // The valibot input declares ONLY url — no resolver/host/fetch override is model-selectable.
     expect(keys).toEqual(["url"]);
-    expect((tool.parameters as { additionalProperties?: boolean }).additionalProperties).toBe(false);
   });
 });
 
@@ -229,7 +230,7 @@ describe.skipIf(!LIVE)("web_search live smoke (gated)", () => {
   it("performs a real Tavily search", async () => {
     const opts: WebToolsOptions = { keys: { tavily: process.env.TAVILY_API_KEY! } };
     const tool = webSearch(opts);
-    const out = await tool.execute({ query: "Flue framework withastro" }, undefined);
+    const out = await tool.run({ input: { query: "Flue framework withastro" } });
     expect(out).toMatch(/Web search results/i);
   }, 30000);
 });

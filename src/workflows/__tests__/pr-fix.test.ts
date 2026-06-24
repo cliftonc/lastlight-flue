@@ -1,48 +1,50 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext, SandboxFactory } from "@flue/runtime";
+import type { FlueHarness } from "@flue/runtime";
 import type { Octokit } from "octokit";
-import { runPrFix, type PrFixDeps, type PrFixInput } from "../pr-fix.ts";
-import type { BuildContainer, BuildSandboxOps } from "../../agent-lib/build-sandbox.ts";
+import { runPrFix, type PrFixDeps, type PrFixInput, type PrFixRunCtx } from "../pr-fix.ts";
 import type { PrFixRef, PostedAck } from "../../pr-fix-post.ts";
 
-// Phase 5 — pr-fix run-level tests over FAKES: repo-write token minted, PR head ref
-// resolved deterministically, the sandbox pre-clones + checks out the PR BRANCH (not
-// a new one), the container is ALWAYS torn down (incl. on throw), the fix is committed
-// + the bound head branch PUSHED via the MOCKED seam (no real push), the ack comment
-// posts to the bound PR, and the token is never logged. NO live model/git/GitHub/Docker.
+// Phase 5 / beta.3 — pr-fix run-level tests over FAKES: repo-write token minted, PR
+// head ref resolved deterministically, the HARNESS sandbox clones + checks out the PR
+// BRANCH (not a new one) via `harness.shell` (the agent's `dockerSandbox()` self-
+// terminates — no per-run teardown), the fix is committed + the bound head branch
+// PUSHED via the MOCKED seam (no real push), the ack comment posts to the bound PR,
+// and the token is never logged. NO live model/git/GitHub/Docker.
 
 const TOKEN = "ghs_prfix_test_token";
 
-const SANDBOX = { __fake: true } as unknown as SandboxFactory;
-
-function fakeCtx(payload: PrFixInput): FlueContext<PrFixInput> {
-  return {
-    id: "test-run",
-    payload,
-    env: {},
-    req: undefined,
-    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    init: vi.fn(async () => {
-      throw new Error("init must not be called — runFixSession is injected in tests");
-    }),
-  } as unknown as FlueContext<PrFixInput>;
+/** A fake harness recording shell commands; `cloneFails` makes `git clone` exit non-zero. */
+function fakeHarness(opts: { cloneFails?: boolean } = {}) {
+  const shellCalls: string[] = [];
+  const harness = {
+    name: "default",
+    async shell(command: string) {
+      shellCalls.push(command);
+      if (opts.cloneFails && command.includes("git clone")) {
+        return { stdout: "", stderr: "boom", exitCode: 128 };
+      }
+      // `git rev-parse --verify` of the remote head ref → exists (PR branch is real).
+      return { stdout: "", stderr: "", exitCode: 0 };
+    },
+    async session() {
+      throw new Error("session must not be called — runFixSession is injected in tests");
+    },
+    fs: {},
+  } as unknown as FlueHarness;
+  return { harness, shellCalls };
 }
 
-/** A fake container recording exec'd commands + whether it was removed. */
-function fakeContainer() {
-  const execCalls: string[] = [];
-  let removed = 0;
-  const container: BuildContainer = {
-    async exec(command) {
-      execCalls.push(command);
-      return { stdout: "headsha123\n", stderr: "", exitCode: 0 };
-    },
-    async remove() {
-      removed += 1;
-    },
-    sandbox: () => SANDBOX,
+function fakeCtx(
+  payload: PrFixInput,
+  harnessOpts: { cloneFails?: boolean } = {},
+): PrFixRunCtx & { _shellCalls: string[] } {
+  const { harness, shellCalls } = fakeHarness(harnessOpts);
+  return {
+    input: payload,
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+    harness,
+    _shellCalls: shellCalls,
   };
-  return { container, execCalls, removed: () => removed };
 }
 
 interface Recorder {
@@ -51,16 +53,12 @@ interface Recorder {
   minted: PrFixInput[];
   headResolved: PrFixRef[];
   fixSessions: { ref: { owner: string; repo: string }; prompt: string }[];
-  container: ReturnType<typeof fakeContainer>;
 }
 
 function makeDeps(
   rec: Recorder,
   over: Partial<PrFixDeps> = {},
 ): PrFixDeps {
-  const ops: BuildSandboxOps = {
-    createContainer: vi.fn(async () => rec.container.container),
-  };
   return {
     mintToken: vi.fn(async (input) => {
       rec.minted.push(input);
@@ -71,16 +69,12 @@ function makeDeps(
       rec.headResolved.push(ref);
       return { headRef: "feature/login", title: "Add login" };
     }),
-    sandboxOps: ops,
-    runFixSession: vi.fn(async (_ctx, ref, _octokit, _sandbox, prompt) => {
+    runFixSession: vi.fn(async (_ctx, ref, _octokit, prompt) => {
       rec.fixSessions.push({ ref, prompt });
       return "Fixed the handler. tests pass. abc1234";
     }),
-    readHeadSha: vi.fn(async (container) => {
-      const r = await container.exec("git rev-parse HEAD", { cwd: "/workspace" });
-      return r.stdout.trim();
-    }),
-    pushBranch: vi.fn(async (_container, branch) => {
+    readHeadSha: vi.fn(async (_harness) => "headsha123"),
+    pushBranch: vi.fn(async (_harness, branch) => {
       rec.pushed.push({ branch });
     }),
     postAck: vi.fn(async (_octokit, ref, branch, sha): Promise<PostedAck> => {
@@ -98,7 +92,6 @@ function newRecorder(): Recorder {
     minted: [],
     headResolved: [],
     fixSessions: [],
-    container: fakeContainer(),
   };
 }
 
@@ -136,8 +129,13 @@ describe("runPrFix — happy path", () => {
     ]);
     expect(res.acked).toBe(true);
     expect(res.ackUrl).toContain("issuecomment-555");
-    // Container torn down.
-    expect(rec.container.removed()).toBe(1);
+  });
+
+  it("clones the PR head branch into the harness sandbox via git CLI (not a model tool)", async () => {
+    const ctx = fakeCtx(INPUT);
+    await runPrFix(ctx, makeDeps(newRecorder()));
+    const clone = ctx._shellCalls.find((c) => c.includes("git clone"));
+    expect(clone).toBeTruthy();
   });
 
   it("renders the prompt with the UNTRUSTED-wrapped fix request + the resolved branch", async () => {
@@ -164,7 +162,7 @@ describe("runPrFix — security + teardown", () => {
     expect(rec.pushed).toEqual([{ branch: "feature/login" }]);
   });
 
-  it("tears the container down even when the fix session throws (no push, no ack)", async () => {
+  it("a fix session throw surfaces — no push, no ack", async () => {
     const rec = newRecorder();
     const deps = makeDeps(rec, {
       runFixSession: vi.fn(async () => {
@@ -172,24 +170,16 @@ describe("runPrFix — security + teardown", () => {
       }),
     });
     await expect(runPrFix(fakeCtx(INPUT), deps)).rejects.toThrow("fix boom");
-    expect(rec.container.removed()).toBe(1);
     expect(rec.pushed).toEqual([]);
     expect(rec.acked).toEqual([]);
   });
 
-  it("a clone failure (createContainer ok, clone throws) still tears down — no push/ack", async () => {
+  it("a clone failure (harness git clone exits non-zero) surfaces — no push/ack", async () => {
     const rec = newRecorder();
-    // Make the container's clone exec fail.
-    const failing = fakeContainer();
-    failing.container.exec = vi.fn(async (command: string) => {
-      failing.execCalls.push(command);
-      const isClone = command.includes("git clone");
-      return { stdout: "", stderr: "boom", exitCode: isClone ? 128 : 0 };
-    }) as BuildContainer["exec"];
-    rec.container = failing;
     const deps = makeDeps(rec);
-    await expect(runPrFix(fakeCtx(INPUT), deps)).rejects.toThrow(/git clone/);
-    expect(failing.removed()).toBe(1);
+    await expect(runPrFix(fakeCtx(INPUT, { cloneFails: true }), deps)).rejects.toThrow(
+      /git clone/,
+    );
     expect(rec.pushed).toEqual([]);
     expect(rec.acked).toEqual([]);
   });

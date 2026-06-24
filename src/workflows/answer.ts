@@ -46,7 +46,8 @@
  * deps wire the real implementations; tests pass fakes so the whole flow runs with NO
  * live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -54,7 +55,8 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createAnswerAgent } from "../agent-lib/answer.ts";
+import { answerAgent } from "../agent-lib/answer.ts";
+import { githubReadTools } from "../tools/github-read.ts";
 import {
   renderAnswerPrompt,
   type AnswerPromptContext,
@@ -64,38 +66,90 @@ import {
   type AnswerRef,
   type PostedAnswer,
 } from "../answer-post.ts";
+import {
+  slackPosterFromConfig,
+  parseSlackConversationKey,
+  type SlackPoster,
+} from "../slack-client.ts";
+import { deliverReply } from "../reply.ts";
+import { resolveRepoFromText, type OwnerRepo } from "../agent-lib/repo-ref.ts";
 
-/** The workflow input payload (identifies the question issue + how to answer it). */
-export interface AnswerInput {
+/**
+ * The workflow input — the NORMALIZED envelope (one schema for both origins).
+ * GitHub-initiated runs carry `owner`/`repo`/`issueNumber`; Slack-initiated runs carry
+ * `source:"slack"` + `conversationKey` (the thread) and NO issue. `answer` deals with
+ * the no-issue case (parity with the reference: delivery is uniform via the origin
+ * thread's reply, and a Slack answer is scoped to a repo parsed from the message).
+ */
+export const AnswerInputSchema = v.object({
+  /** GitHub origin: the target repo (the answer is posted on its issue). Optional for Slack. */
+  owner: v.optional(v.string()),
+  repo: v.optional(v.string()),
+  /** GitHub origin: the issue number (answer posted here, labelled `question`). */
+  issueNumber: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1))),
+  /**
+   * The specific question. For a routed comment / a Slack message this IS the question;
+   * for a GitHub issue with no routed comment the issue title/body is the question.
+   */
+  question: v.optional(v.string()),
+  /** Who asked (trigger metadata). */
+  sender: v.optional(v.string()),
+  /** Normalized origin. Absent → inferred GitHub when an issue ref is present. */
+  source: v.optional(v.picklist(["github", "slack"])),
+  /** Slack origin: the thread conversation key (`slack:v1:…`) the answer replies into. */
+  conversationKey: v.optional(v.string()),
+  /** Optional trigger provenance: "webhook" | "cron" | "cli" | "slack". */
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type AnswerInput = v.InferOutput<typeof AnswerInputSchema>;
+
+/** True when the input carries a complete GitHub issue reference (GitHub origin). */
+function isGithubOrigin(input: AnswerInput): input is AnswerInput & {
   owner: string;
   repo: string;
-  /** The originating issue number (the answer is posted here, labelled `question`). */
   issueNumber: number;
-  /**
-   * The specific question, when the trigger is a routed comment rather than the issue
-   * itself. When absent, the issue title/body IS the question.
-   */
-  question?: string;
-  /** Who asked (trigger metadata). */
-  sender?: string;
-  /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+} {
+  return (
+    typeof input.owner === "string" &&
+    typeof input.repo === "string" &&
+    typeof input.issueNumber === "number"
+  );
+}
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (already initialized from the bound `answerAgent`), the validated `input`, and the
+ * run-stream `log`. Mirrors Flue's `ActionContext` so the inline `run` passes straight
+ * through.
+ */
+export interface AnswerRunCtx {
+  harness: FlueHarness;
+  input: AnswerInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
 export interface AnswerResult {
-  /** Whether an answer was actually posted. */
+  /** The origin the answer was delivered to. */
+  origin: "github" | "slack" | "none";
+  /** Whether an answer was actually delivered (posted to the issue / thread). */
   posted: boolean;
-  /** The posted comment's URL, when one was posted. */
+  /** The posted comment's URL, when GitHub. */
   commentUrl?: string;
-  /** Whether the `question` label was applied. */
+  /** The posted Slack message ts, when Slack. */
+  slackTs?: string;
+  /** Whether the `question` label was applied (GitHub only). */
   labelled: boolean;
-  /** True when we skipped posting because the issue was already answered (dedup). */
+  /** True when we skipped posting because the issue was already answered (dedup; GitHub). */
   deduped: boolean;
 }
 
-/** The `issues-write` profile this workflow always runs under (spec/09 / design). */
+/** The `issues-write` profile the GitHub answer path runs under (spec/09 / design). */
 export const ANSWER_PROFILE: GitAccessProfile = "issues-write";
+/** The `read` profile the Slack answer path runs under (read-only repo context). */
+export const ANSWER_READ_PROFILE: GitAccessProfile = "read";
 
 /** Issue context fetched deterministically for the prompt (workflow code, not a tool). */
 export interface AnswerContext {
@@ -106,44 +160,58 @@ export interface AnswerContext {
   comments: { author?: string; body: string }[];
 }
 
+/** What the answer agent is run against (GitHub: full issue; Slack: question + repo). */
+export interface AnswerAgentArgs {
+  /** The repo the agent reads from (its read tools are bound here). Absent → no repo tools. */
+  repo?: OwnerRepo;
+  /** The scoped read Octokit for `repo`, when one was minted. */
+  octokit?: Octokit;
+  /** The issue number, for the GitHub prompt context. */
+  issueNumber?: number;
+  /** The fetched issue context (GitHub origin); absent for a Slack question. */
+  issue?: AnswerContext;
+}
+
 /**
  * Injectable dependencies — the seams that make `run()` testable without a live model
- * or GitHub. The default factory wires the real implementations.
+ * or GitHub or Slack. The default factory wires the real implementations.
  */
 export interface AnswerDeps {
-  /** Mint an `issues-write` scoped installation token for this repo. */
-  mintToken(input: AnswerInput): Promise<string>;
   /** Build an Octokit authenticated with the scoped token. */
   makeOctokit(token: string): Octokit;
+  /** Mint a scoped installation token (issues-write for GitHub, read for Slack) for a repo. */
+  mintToken(repo: string, profile: GitAccessProfile): Promise<string>;
   /** Fetch the issue context (title/body/labels/comments) over the bound octokit. */
   fetchIssue(octokit: Octokit, ref: AnswerRef): Promise<AnswerContext>;
   /**
    * Run the answer agent and return its raw text answer. Wraps agent-init +
-   * session.prompt so tests can return a canned answer.
+   * session.prompt so tests can return a canned answer. Repo read tools are bound only
+   * when `args.repo` + `args.octokit` are present.
    */
-  runAnswerAgent(
-    ctx: FlueContext<AnswerInput>,
-    ref: AnswerRef,
-    octokit: Octokit,
-    issue: AnswerContext,
-  ): Promise<string>;
-  /** Deterministically post the answer + apply the `question` label (with dedup). */
+  runAnswerAgent(ctx: AnswerRunCtx, args: AnswerAgentArgs): Promise<string>;
+  /** Deterministically post the answer + apply the `question` label (with dedup; GitHub). */
   post(
     octokit: Octokit,
     ref: AnswerRef,
     body: string,
     opts: { botLogin: string },
   ): Promise<PostedAnswer>;
+  /** The egress poster for Slack delivery (undefined when no bot token configured). */
+  poster?: SlackPoster;
   /** The bot's own login (for the dedup author check). */
   botLogin: string;
+  /** The managed-repo allowlist (for the Slack repo resolution). */
+  managedRepos: string[];
+  /** The fallback repo (`owner/repo`) when a Slack message names none. */
+  fallbackRepo?: string;
 }
 
-/** Mint an issues-write token downscoped to the target repo via the ported git-auth. */
-async function mintIssuesWriteToken(input: AnswerInput): Promise<string> {
+/** Mint a scoped token downscoped to the target repo via the ported git-auth. */
+async function mintScopedToken(repo: string, profile: GitAccessProfile): Promise<string> {
   const cfg = loadConfig();
   if (!cfg.githubApp) {
     throw new Error(
-      "answer: GitHub App not configured (GITHUB_APP_ID / _PRIVATE_KEY_PATH / _INSTALLATION_ID). Cannot mint an issues-write token.",
+      "answer: GitHub App not configured (GITHUB_APP_ID / _PRIVATE_KEY_PATH / _INSTALLATION_ID). Cannot mint a scoped token.",
     );
   }
   const { token } = await configureGitAuth({
@@ -151,8 +219,8 @@ async function mintIssuesWriteToken(input: AnswerInput): Promise<string> {
     privateKeyPath: cfg.githubApp.privateKeyPath,
     installationId: cfg.githubApp.installationId,
     botName: cfg.botLogin.replace(/\[bot\]$/, ""),
-    repositories: [input.repo],
-    permissions: GITHUB_PERMISSION_PROFILES[ANSWER_PROFILE],
+    repositories: [repo],
+    permissions: GITHUB_PERMISSION_PROFILES[profile],
   });
   return token;
 }
@@ -182,80 +250,111 @@ async function fetchIssueContext(
   };
 }
 
-/** The real run: init the agent, open a session, prompt with the question + issue. */
+/**
+ * The real run: open a session on the bound harness, prompt with the question + issue.
+ * Repo READ tools (closed over ref + scoped-token Octokit) are injected for THIS call
+ * only and ONLY when a repo was resolved — owner/repo/token are never model-selectable.
+ */
 async function runAnswerSession(
-  ctx: FlueContext<AnswerInput>,
-  ref: AnswerRef,
-  octokit: Octokit,
-  issue: AnswerContext,
+  ctx: AnswerRunCtx,
+  args: AnswerAgentArgs,
 ): Promise<string> {
-  const agent = createAnswerAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("answer");
+  const session = await ctx.harness.session("answer");
   const promptCtx: AnswerPromptContext = {
-    owner: ref.owner,
-    repo: ref.repo,
-    issueNumber: ref.issue_number,
-    title: issue.title,
-    body: issue.body,
-    author: issue.author,
-    labels: issue.labels,
-    comments: issue.comments,
-    question: ctx.payload.question,
-    sender: ctx.payload.sender,
-    triggerType: ctx.payload.triggerType,
+    owner: args.repo?.owner ?? "",
+    repo: args.repo?.repo ?? "",
+    issueNumber: args.issueNumber,
+    title: args.issue?.title ?? "",
+    body: args.issue?.body ?? "",
+    author: args.issue?.author,
+    labels: args.issue?.labels,
+    comments: args.issue?.comments,
+    question: ctx.input.question,
+    sender: ctx.input.sender,
+    triggerType: ctx.input.triggerType,
   };
-  const res = await session.prompt(renderAnswerPrompt(promptCtx));
+  const tools =
+    args.repo && args.octokit
+      ? githubReadTools({ owner: args.repo.owner, repo: args.repo.repo }, args.octokit)
+      : [];
+  const res = await session.prompt(
+    renderAnswerPrompt(promptCtx),
+    tools.length ? { tools } : undefined,
+  );
   return res.text;
 }
 
 /** Default production dependencies. */
 export function defaultDeps(): AnswerDeps {
+  const cfg = loadConfig();
   return {
-    mintToken: mintIssuesWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
+    mintToken: mintScopedToken,
     fetchIssue: fetchIssueContext,
     runAnswerAgent: runAnswerSession,
     post: postAnswerDeterministically,
-    botLogin: loadConfig().botLogin,
+    poster: slackPosterFromConfig(),
+    botLogin: cfg.botLogin,
+    managedRepos: cfg.managedRepos,
+    // A Slack message that names no repo falls back to the workspace's default repo
+    // (the explore default, else the first managed repo).
+    fallbackRepo: cfg.exploreDefaultRepo ?? cfg.managedRepos[0],
   };
 }
 
 /**
  * The testable core. Drives the full flow over injected dependencies; production uses
- * `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
+ * `defaultDeps()`, tests pass fakes (no live model, no live GitHub, no live Slack).
+ * Dispatches on the normalized origin: a GitHub issue gets a posted+labelled comment;
+ * a Slack thread gets the answer delivered back into the thread.
  */
 export async function runAnswer(
-  ctx: FlueContext<AnswerInput>,
+  ctx: AnswerRunCtx,
   deps: AnswerDeps = defaultDeps(),
 ): Promise<AnswerResult> {
-  const { owner, repo, issueNumber } = ctx.payload;
-  const ref: AnswerRef = { owner, repo, issue_number: issueNumber };
+  if (isGithubOrigin(ctx.input)) {
+    return runGithubAnswer(ctx, deps);
+  }
+  if (ctx.input.source === "slack" && ctx.input.conversationKey) {
+    return runSlackAnswer(ctx, deps);
+  }
+  // Neither a GitHub issue nor a Slack thread — nothing to answer (defensive).
+  ctx.log.info("answer: input carries no GitHub issue or Slack thread — skipping", {
+    source: ctx.input.source,
+  });
+  return { origin: "none", posted: false, labelled: false, deduped: false };
+}
 
-  // 1. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+/** GitHub origin: mint issues-write, fetch the issue, answer, deterministic post + label. */
+async function runGithubAnswer(
+  ctx: AnswerRunCtx,
+  deps: AnswerDeps,
+): Promise<AnswerResult> {
+  const input = ctx.input as AnswerInput & { owner: string; repo: string; issueNumber: number };
+  const ref: AnswerRef = { owner: input.owner, repo: input.repo, issue_number: input.issueNumber };
+
+  const token = await deps.mintToken(input.repo, ANSWER_PROFILE);
   const octokit = deps.makeOctokit(token);
-
-  // 2. Fetch the issue context deterministically (workflow code, not a model tool).
   const issue = await deps.fetchIssue(octokit, ref);
 
-  // 3. Run the answer agent (tool-only, read tools bound to ref+token). The agent
-  //    reads the issue + repo context and composes a free-form markdown answer.
-  const answer = await deps.runAnswerAgent(ctx, ref, octokit, issue);
+  const answer = await deps.runAnswerAgent(ctx, {
+    repo: { owner: input.owner, repo: input.repo },
+    octokit,
+    issueNumber: input.issueNumber,
+    issue,
+  });
 
-  // 4. DETERMINISTIC post + label (workflow, not the model), with the dedup guard keyed
-  //    by the issue number (re-invoke / duplicate delivery safe — design Q5.4). The
-  //    issue is left OPEN.
+  // DETERMINISTIC post + label, with the dedup guard keyed by the issue number. OPEN.
   const posted = await deps.post(octokit, ref, answer, { botLogin: deps.botLogin });
   if (posted.deduped) {
     ctx.log.info("answer: skipping post — issue already answered", {
-      owner,
-      repo,
-      issueNumber,
+      owner: input.owner,
+      repo: input.repo,
+      issueNumber: input.issueNumber,
     });
   }
-
   return {
+    origin: "github",
     posted: posted.posted,
     commentUrl: posted.html_url,
     labelled: posted.labelled,
@@ -263,7 +362,61 @@ export async function runAnswer(
   };
 }
 
-/** Flue workflow entry — discovered as the `answer` workflow. */
-export async function run(ctx: FlueContext<AnswerInput>): Promise<AnswerResult> {
-  return runAnswer(ctx);
+/**
+ * Slack origin (no GitHub issue): resolve a repo from the message (managed allowlist +
+ * fallback), run the agent over that read context, and DELIVER the answer back into the
+ * originating thread via the shared reply layer. No label, no GitHub write.
+ */
+async function runSlackAnswer(
+  ctx: AnswerRunCtx,
+  deps: AnswerDeps,
+): Promise<AnswerResult> {
+  const loc = parseSlackConversationKey(ctx.input.conversationKey!);
+  if (!loc) {
+    ctx.log.info("answer: Slack run has an unparseable conversation key — skipping", {});
+    return { origin: "slack", posted: false, labelled: false, deduped: false };
+  }
+
+  // Resolve which repo the question is about (named in the message, else the fallback).
+  const repo = resolveRepoFromText(ctx.input.question ?? "", {
+    managedRepos: deps.managedRepos,
+    fallback: deps.fallbackRepo,
+  });
+  let octokit: Octokit | undefined;
+  if (repo) {
+    const token = await deps.mintToken(repo.repo, ANSWER_READ_PROFILE);
+    octokit = deps.makeOctokit(token);
+  }
+
+  const answer = (await deps.runAnswerAgent(ctx, { repo, octokit })).trim();
+  if (!answer) {
+    return { origin: "slack", posted: false, labelled: false, deduped: false };
+  }
+
+  if (!deps.poster) {
+    ctx.log.warn("answer: Slack egress inactive (no SLACK_BOT_TOKEN) — answer not delivered", {});
+    return { origin: "slack", posted: false, labelled: false, deduped: false };
+  }
+
+  // Reply INTO the thread (thread_ts only when the key's tail is a real message ts).
+  const threadTs = /^\d+\.\d+$/.test(loc.threadTs) ? loc.threadTs : undefined;
+  const delivered = await deliverReply(
+    { kind: "slack", poster: deps.poster, channel: loc.channelId, threadTs },
+    answer,
+  );
+  return { origin: "slack", posted: true, slackTs: delivered.ts, labelled: false, deduped: false };
 }
+
+/**
+ * Flue workflow — discovered as the `answer` workflow. The runner owns root harness
+ * init from `answerAgent`; the inline `run` defers to the testable core.
+ */
+export default defineWorkflow({
+  agent: answerAgent,
+  input: AnswerInputSchema,
+  async run({ harness, input, log }) {
+    // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
+    // The typed `AnswerResult` is preserved on the testable core for tests.
+    return (await runAnswer({ harness, input, log })) as unknown as JsonValue;
+  },
+});

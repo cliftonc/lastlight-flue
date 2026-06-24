@@ -24,6 +24,7 @@
 import rules from '../agent-context/rules.md' with { type: 'markdown' };
 import security from '../agent-context/security.md' with { type: 'markdown' };
 import soul from '../agent-context/soul.md' with { type: 'markdown' };
+import { FLUE_RUNTIME_VERSION, FLUE_VERSION_TOKEN } from './runtime-identity.ts';
 
 // The canonical persona files, in the order the reference loader emits them
 // (alphabetical filename sort): rules → security → soul. Keep this list explicit
@@ -55,5 +56,8 @@ export function loadPersona(opts: LoadPersonaOptions = {}): string {
     persona += SEPARATOR + suffix;
   }
 
-  return persona;
+  // Fill soul.md's `{{FLUE_VERSION}}` token with the live runtime version so the
+  // agent can state which Flue it runs on when asked (the version is build-inlined
+  // from our `@flue/runtime` pin — see runtime-identity.ts).
+  return persona.split(FLUE_VERSION_TOKEN).join(FLUE_RUNTIME_VERSION);
 }

@@ -31,14 +31,19 @@
  * NO SANDBOX: issue-comment is tool-only (reads the issue/PR + thread via bound read
  * tools — the skill caps it at ≤2 file reads, no checkout). Cheaper + lower latency.
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The bound
+ * `issueCommentAgent` is the root harness/policy; the per-run READ tools (closed over
+ * ref + scoped-token Octokit) are injected per-call via `session.prompt(_, {
+ * tools })`, so the security spine is unchanged. `ctx.payload`→`input`,
+ * `ctx.init(agent)`→the supplied `harness`, `ctx.id`→`harness.name`.
  *
  * TESTABILITY: `run` defers to `runIssueComment(ctx, deps)` with an injectable `deps`
  * seam (token minter, octokit factory, context fetcher, agent runner, poster). The
  * default deps wire the real implementations; tests pass fakes so the whole flow runs
  * with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -46,7 +51,8 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createIssueCommentAgent } from "../agent-lib/issue-comment.ts";
+import { issueCommentAgent } from "../agent-lib/issue-comment.ts";
+import { githubReadTools } from "../tools/github-read.ts";
 import {
   renderIssueCommentPrompt,
   type IssueCommentPromptContext,
@@ -59,21 +65,36 @@ import {
 } from "../issue-comment-post.ts";
 
 /** The workflow input payload (identifies the issue/PR + the triggering comment). */
-export interface IssueCommentInput {
-  owner: string;
-  repo: string;
+export const IssueCommentInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
   /** The issue or PR number the comment is on. */
-  issueNumber: number;
+  issueNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** The body of the triggering comment — the request the agent answers. */
-  commentBody: string;
+  commentBody: v.string(),
   /** The triggering comment's id — the dedup key (re-invoke / duplicate-delivery safe). */
-  commentId: number | string;
+  commentId: v.union([v.number(), v.string()]),
   /** Who wrote the triggering comment — the bot-loop guard reads this. */
-  sender?: string;
+  sender: v.optional(v.string()),
   /** Whether the target is a PR (vs an issue) — phrasing + the comments API are the same. */
-  isPullRequest?: boolean;
+  isPullRequest: v.optional(v.boolean()),
   /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type IssueCommentInput = v.InferOutput<typeof IssueCommentInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (already initialized from the bound `issueCommentAgent`), the validated `input`,
+ * and the run-stream `log`. Mirrors Flue's `ActionContext` so the inline `run`
+ * passes straight through.
+ */
+export interface IssueCommentRunCtx {
+  harness: FlueHarness;
+  input: IssueCommentInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -116,7 +137,7 @@ export interface IssueCommentDeps {
    * session.prompt so tests can return a canned reply.
    */
   runComment(
-    ctx: FlueContext<IssueCommentInput>,
+    ctx: IssueCommentRunCtx,
     ref: IssueCommentRef,
     octokit: Octokit,
     issue: IssueCommentContext,
@@ -177,31 +198,33 @@ async function fetchIssueContext(
   };
 }
 
-/** The real run: init the agent, open a session, prompt with the thread + trigger. */
+/** The real run: open a session on the bound harness, prompt with the thread + trigger. */
 async function runCommentSession(
-  ctx: FlueContext<IssueCommentInput>,
+  ctx: IssueCommentRunCtx,
   ref: IssueCommentRef,
   octokit: Octokit,
   issue: IssueCommentContext,
 ): Promise<string> {
-  const agent = createIssueCommentAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("issue-comment");
+  const session = await ctx.harness.session("issue-comment");
   const promptCtx: IssueCommentPromptContext = {
     owner: ref.owner,
     repo: ref.repo,
     issueNumber: ref.issue_number,
-    isPullRequest: ctx.payload.isPullRequest,
+    isPullRequest: ctx.input.isPullRequest,
     title: issue.title,
     body: issue.body,
     author: issue.author,
     labels: issue.labels,
     comments: issue.comments,
-    sender: ctx.payload.sender,
-    commentBody: ctx.payload.commentBody,
-    triggerType: ctx.payload.triggerType,
+    sender: ctx.input.sender,
+    commentBody: ctx.input.commentBody,
+    triggerType: ctx.input.triggerType,
   };
-  const res = await session.prompt(renderIssueCommentPrompt(promptCtx));
+  // The per-run READ tools (closed over ref + scoped-token Octokit) are injected
+  // for THIS call only — owner/repo/token are never model-selectable.
+  const res = await session.prompt(renderIssueCommentPrompt(promptCtx), {
+    tools: githubReadTools(ref, octokit),
+  });
   return res.text;
 }
 
@@ -222,10 +245,10 @@ export function defaultDeps(): IssueCommentDeps {
  * `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
  */
 export async function runIssueComment(
-  ctx: FlueContext<IssueCommentInput>,
+  ctx: IssueCommentRunCtx,
   deps: IssueCommentDeps = defaultDeps(),
 ): Promise<IssueCommentResult> {
-  const { owner, repo, issueNumber, commentBody, commentId, sender } = ctx.payload;
+  const { owner, repo, issueNumber, commentBody, commentId, sender } = ctx.input;
   const ref: IssueCommentRef = { owner, repo, issue_number: issueNumber };
 
   // 1. BOT-LOOP floor — never act on (or reply to) the bot's own comment.
@@ -239,7 +262,7 @@ export async function runIssueComment(
   }
 
   // 2. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 3. Fetch the issue/PR context deterministically (workflow code, not a model tool).
@@ -273,9 +296,16 @@ export async function runIssueComment(
   };
 }
 
-/** Flue workflow entry — discovered as the `issue-comment` workflow. */
-export async function run(
-  ctx: FlueContext<IssueCommentInput>,
-): Promise<IssueCommentResult> {
-  return runIssueComment(ctx);
-}
+/**
+ * Flue workflow — discovered as the `issue-comment` workflow. The runner owns root
+ * harness init from `issueCommentAgent`; the inline `run` defers to the testable core.
+ */
+export default defineWorkflow({
+  agent: issueCommentAgent,
+  input: IssueCommentInputSchema,
+  async run({ harness, input, log }) {
+    // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
+    // The typed `IssueCommentResult` is preserved on the testable core for tests.
+    return (await runIssueComment({ harness, input, log })) as unknown as JsonValue;
+  },
+});

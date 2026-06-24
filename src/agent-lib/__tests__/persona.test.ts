@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { loadPersona } from '../persona.ts';
+import { FLUE_RUNTIME_VERSION, FLUE_VERSION_TOKEN } from '../runtime-identity.ts';
 
 describe('loadPersona', () => {
   it('returns a non-empty string', () => {
@@ -11,6 +12,16 @@ describe('loadPersona', () => {
   it('includes distinctive content from soul.md', () => {
     // soul.md: identity / core principles.
     expect(loadPersona()).toContain('Last Light');
+  });
+
+  it('fills the Flue version token so the agent knows its runtime version', () => {
+    const persona = loadPersona();
+    // The raw token is replaced (none left behind)...
+    expect(persona).not.toContain(FLUE_VERSION_TOKEN);
+    // ...with the live pinned version, and the runtime is named.
+    expect(FLUE_RUNTIME_VERSION).toMatch(/^\d+\.\d+\.\d+/);
+    expect(persona).toContain(FLUE_RUNTIME_VERSION);
+    expect(persona).toContain('Flue');
   });
 
   it('includes distinctive content from rules.md', () => {

@@ -32,14 +32,18 @@
  *
  * NO SANDBOX: tool-only (gathers metrics via bound read tools; no code inspected).
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The per-run
+ * READ tools (closed over ref + scoped-token Octokit) are injected per-call via
+ * `session.prompt(_, { tools })`. `ctx.payload`→`input`, `ctx.init(agent)`→the
+ * supplied `harness`.
  *
- * TESTABILITY: `run` defers to `runRepoHealth(ctx, deps)` with an injectable `deps` seam
- * (token minter, octokit factory, repo-metadata fetcher, agent runner, deliverer). The
- * default deps wire the real implementations; tests pass fakes so the whole flow runs
- * with NO live model and NO live GitHub.
+ * TESTABILITY: the inline `run` defers to `runRepoHealth(ctx, deps)` with an
+ * injectable `deps` seam (token minter, octokit factory, repo-metadata fetcher,
+ * agent runner, deliverer). The default deps wire the real implementations; tests
+ * pass fakes so the whole flow runs with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -47,7 +51,7 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createHealthAgent } from "../agent-lib/repo-health.ts";
+import { healthAgent } from "../agent-lib/repo-health.ts";
 import {
   renderHealthPrompt,
   type HealthPromptContext,
@@ -56,14 +60,27 @@ import {
   deliverHealthReport,
   type DeliveredHealthReport,
 } from "../repo-health-post.ts";
-import type { RepoRef } from "../tools/github-read.ts";
+import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
 
 /** The workflow input payload (identifies the repo to scan — no issue/PR). */
-export interface RepoHealthInput {
-  owner: string;
-  repo: string;
+export const RepoHealthInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
   /** Optional trigger provenance: "cron" | "cli" (no webhook — repo-scoped). */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type RepoHealthInput = v.InferOutput<typeof RepoHealthInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (initialized from the bound `healthAgent`), the validated `input`, and `log`.
+ */
+export interface RepoHealthRunCtx {
+  harness: FlueHarness;
+  input: RepoHealthInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -110,7 +127,7 @@ export interface RepoHealthDeps {
    * session.prompt so tests can return a canned report.
    */
   runHealthAgent(
-    ctx: FlueContext<RepoHealthInput>,
+    ctx: RepoHealthRunCtx,
     ref: RepoRef,
     octokit: Octokit,
     meta: RepoMeta,
@@ -160,23 +177,24 @@ async function fetchRepoMeta(octokit: Octokit, ref: RepoRef): Promise<RepoMeta> 
 
 /** The real run: init the agent, open a session, prompt with the repo context. */
 async function runHealthSession(
-  ctx: FlueContext<RepoHealthInput>,
+  ctx: RepoHealthRunCtx,
   ref: RepoRef,
   octokit: Octokit,
   meta: RepoMeta,
 ): Promise<string> {
-  const agent = createHealthAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("repo-health");
+  const session = await ctx.harness.session("repo-health");
   const promptCtx: HealthPromptContext = {
     owner: ref.owner,
     repo: ref.repo,
     defaultBranch: meta.defaultBranch,
     description: meta.description,
     topics: meta.topics,
-    triggerType: ctx.payload.triggerType,
+    triggerType: ctx.input.triggerType,
   };
-  const res = await session.prompt(renderHealthPrompt(promptCtx));
+  // Per-run READ tools injected for THIS call only — owner/repo/token never model-selectable.
+  const res = await session.prompt(renderHealthPrompt(promptCtx), {
+    tools: githubReadTools(ref, octokit),
+  });
   return res.text;
 }
 
@@ -197,14 +215,14 @@ export function defaultDeps(): RepoHealthDeps {
  * `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
  */
 export async function runRepoHealth(
-  ctx: FlueContext<RepoHealthInput>,
+  ctx: RepoHealthRunCtx,
   deps: RepoHealthDeps = defaultDeps(),
 ): Promise<RepoHealthResult> {
-  const { owner, repo } = ctx.payload;
+  const { owner, repo } = ctx.input;
   const ref: RepoRef = { owner, repo };
 
   // 1. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Fetch the repo metadata deterministically (workflow code, not a model tool).
@@ -241,7 +259,11 @@ export async function runRepoHealth(
   };
 }
 
-/** Flue workflow entry — discovered as the `repo-health` workflow. */
-export async function run(ctx: FlueContext<RepoHealthInput>): Promise<RepoHealthResult> {
-  return runRepoHealth(ctx);
-}
+/** Flue workflow — discovered as the `repo-health` workflow. */
+export default defineWorkflow({
+  agent: healthAgent,
+  input: RepoHealthInputSchema,
+  async run({ harness, input, log }) {
+    return (await runRepoHealth({ harness, input, log })) as unknown as JsonValue;
+  },
+});

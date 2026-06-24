@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runRepoHealth,
   type RepoHealthDeps,
   type RepoHealthInput,
+  type RepoHealthRunCtx,
   type RepoMeta,
 } from "../repo-health.ts";
 import {
@@ -21,17 +21,17 @@ import type { RepoRef } from "../../tools/github-read.ts";
 
 const BOT = "last-light[bot]";
 
-function fakeCtx(payload: RepoHealthInput): FlueContext<RepoHealthInput> {
+function fakeCtx(payload: RepoHealthInput): RepoHealthRunCtx {
   return {
     id: "test-run",
-    payload,
+    input: payload,
     env: {},
     req: undefined,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     init: vi.fn(async () => {
       throw new Error("init must not be called — runHealthAgent is injected in tests");
     }),
-  } as unknown as FlueContext<RepoHealthInput>;
+  } as unknown as RepoHealthRunCtx;
 }
 
 const META: RepoMeta = {
@@ -53,7 +53,7 @@ function fakeDeps(opts: {
   let agentSaw: { ref: RepoRef; meta: RepoMeta } | undefined;
   const runHealthAgent = vi.fn(
     async (
-      _ctx: FlueContext<RepoHealthInput>,
+      _ctx: RepoHealthRunCtx,
       ref: RepoRef,
       _octokit: Octokit,
       meta: RepoMeta,

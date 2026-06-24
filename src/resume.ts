@@ -54,7 +54,7 @@ const defaultStorePath = () =>
  */
 function defaultReinvoke(input: BuildInput): Reinvoker {
   return async () => {
-    await exec('pnpm', ['exec', 'flue', 'run', 'build', '--payload', JSON.stringify(input)], {
+    await exec('pnpm', ['exec', 'flue', 'run', 'build', '--input', JSON.stringify(input)], {
       timeout: 600_000,
     });
   };

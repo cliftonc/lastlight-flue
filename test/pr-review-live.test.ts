@@ -19,8 +19,7 @@
  * installed on `cliftonc/drizzle-cube`; otherwise token minting fails → it throws.
  */
 import { describe, it, expect } from "vitest";
-import type { FlueContext } from "@flue/runtime";
-import { runPrReview, type PrReviewInput } from "../src/workflows/pr-review.ts";
+import { runPrReview, type PrReviewInput, type PrReviewRunCtx } from "../src/workflows/pr-review.ts";
 
 const LIVE = process.env.PR_REVIEW_LIVE === "1";
 
@@ -42,17 +41,17 @@ describe.skipIf(!LIVE)("pr-review LIVE (gated on PR_REVIEW_LIVE=1 — posts to a
       // is a placeholder that documents the contract; the canonical live path is the
       // CLI invocation. Left throwing-by-default-skipped so it never runs silently.
       const ctx = {
-        id: "live",
-        payload: TARGET,
-        env: process.env,
-        req: undefined,
+        input: TARGET,
         log: { info: console.log, warn: console.warn, error: console.error },
-        init: async () => {
-          throw new Error(
-            "Live pr-review must run under a real Flue runtime (flue run pr-review), which supplies init/session.",
-          );
+        harness: {
+          name: "default",
+          async session() {
+            throw new Error(
+              "Live pr-review must run under a real Flue runtime (flue run pr-review), which supplies the harness/session.",
+            );
+          },
         },
-      } as unknown as FlueContext<PrReviewInput>;
+      } as unknown as PrReviewRunCtx;
 
       const res = await runPrReview(ctx);
       expect(["APPROVE", "REQUEST_CHANGES", "COMMENT"]).toContain(res.event);

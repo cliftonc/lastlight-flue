@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import type { FlueContext, SandboxFactory } from "@flue/runtime";
+import { describe, it, expect, vi } from "vitest";
+import type { FlueHarness } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runSecurityReview,
+  defaultDeps,
   type SecurityReviewDeps,
   type SecurityReviewInput,
+  type SecurityReviewRunCtx,
   type RepoMeta,
   SECURITY_PROFILE,
 } from "../security-review.ts";
@@ -16,11 +18,7 @@ import {
   SECURITY_SCAN_LABEL,
   type FiledSecurityScan,
 } from "../../security-review-post.ts";
-import { resetBuildWorkspacesForTests } from "../../agent-lib/build-sandbox.ts";
-import type { BuildSandboxOps, BuildContainer } from "../../agent-lib/build-sandbox.ts";
 import { GITHUB_PERMISSION_PROFILES } from "../../engine/profiles.ts";
-
-afterEach(() => resetBuildWorkspacesForTests());
 import type { RepoRef } from "../../tools/github-read.ts";
 
 const BOT = "last-light[bot]";
@@ -35,17 +33,22 @@ const META: RepoMeta = {
 const REPORT =
   "<!-- lastlight-security-scan-version: 1 -->\n\n## Summary\n\n| Severity | Count |\n|----------|------:|\n| Critical | 1 |";
 
-function fakeCtx(payload: SecurityReviewInput): FlueContext<SecurityReviewInput> {
+function fakeCtx(
+  payload: SecurityReviewInput,
+  harness?: FlueHarness,
+): SecurityReviewRunCtx {
   return {
-    id: "test-run",
-    payload,
-    env: {},
-    req: undefined,
-    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    init: vi.fn(async () => {
-      throw new Error("init must not be called — runSecurityAgent is injected in tests");
-    }),
-  } as unknown as FlueContext<SecurityReviewInput>;
+    input: payload,
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+    harness:
+      harness ??
+      ({
+        name: "default",
+        async session() {
+          throw new Error("session must not be called — runSecurityAgent is injected in tests");
+        },
+      } as unknown as FlueHarness),
+  };
 }
 
 const INPUT: SecurityReviewInput = {
@@ -67,7 +70,7 @@ function fakeDeps(opts: {
     | undefined;
   const runSecurityAgent = vi.fn(
     async (
-      _ctx: FlueContext<SecurityReviewInput>,
+      _ctx: SecurityReviewRunCtx,
       ref: RepoRef,
       _octokit: Octokit,
       token: string,
@@ -179,107 +182,66 @@ describe("runSecurityReview — full flow over injected deps (no live model / Gi
 // over a fake Docker container, asserting clone happened, the agent saw the sandbox/cwd,
 // and the container is torn down in finally — INCLUDING when the session throws.
 // ---------------------------------------------------------------------------
-describe("runSecurityReview — real sandbox clone + ALWAYS-teardown over a fake container", () => {
-  const SANDBOX = { __fake: "sandbox" } as unknown as SandboxFactory;
-
-  function fakeContainer() {
-    const execCalls: string[] = [];
-    let removed = 0;
-    const container: BuildContainer = {
-      async exec(command) {
-        execCalls.push(command);
+// ---------------------------------------------------------------------------
+// beta.3: the HARNESS owns the (self-terminating) sandbox. The default
+// runSecurityAgent clones the repo into /workspace via `harness.shell`
+// (cloneRepoIntoHarness) then prompts the bound session — NO per-run teardown.
+// ---------------------------------------------------------------------------
+describe("runSecurityReview — harness-clone path (default runSecurityAgent, fake harness)", () => {
+  /** A fake harness recording shell commands + a session whose prompt returns canned text. */
+  function fakeHarness(opts: { promptText?: string; promptThrows?: Error } = {}) {
+    const shellCalls: string[] = [];
+    const harness = {
+      name: "default",
+      async shell(command: string) {
+        shellCalls.push(command);
         return { stdout: "", stderr: "", exitCode: 0 };
       },
-      async remove() {
-        removed += 1;
+      async session() {
+        return {
+          async prompt() {
+            if (opts.promptThrows) throw opts.promptThrows;
+            return { text: opts.promptText ?? REPORT };
+          },
+        };
       },
-      sandbox: () => SANDBOX,
-    };
-    return { container, execCalls, removed: () => removed };
+      fs: {},
+    } as unknown as FlueHarness;
+    return { harness, shellCalls };
   }
 
-  /** Default deps EXCEPT we inject the prompt session so no model runs, and Docker ops. */
-  function realCloneDeps(opts: {
-    sandboxOps: BuildSandboxOps;
-    sessionImpl: (sandbox: SandboxFactory) => Promise<string>;
-  }) {
-    let sawSandbox: SandboxFactory | undefined;
-    const ctx = fakeCtx(INPUT);
-    // Patch ctx.init/session indirectly: we don't use the agent path here; instead we
-    // assert the clone + teardown by driving runSecuritySession through the default
-    // runSecurityAgent. To keep the model out, we override init to a harness whose
-    // session.prompt calls sessionImpl with the sandbox the agent was built against —
-    // but createSecurityAgent closes the sandbox, so we just capture it via the body.
-    const deps: SecurityReviewDeps = {
+  /** Default deps but with the GitHub/token seams faked — keeps the DEFAULT clone path. */
+  function cloneDeps(): SecurityReviewDeps {
+    return {
+      ...defaultDeps(),
       mintToken: async () => "ghs_clone_token",
       makeOctokit: () => ({}) as unknown as Octokit,
       fetchRepoMeta: async () => META,
-      // Use the DEFAULT runSecurityAgent by delegating to runSecuritySession through a
-      // thin wrapper: but to avoid a live agent we inject a session via init below.
-      runSecurityAgent: async (_c, ref, _o, token, meta, scanDate, sandboxOps) => {
-        // Re-implement the default clone path but call sessionImpl instead of the model,
-        // so we exercise withBuildSandbox (clone + teardown) without a model.
-        const { withBuildSandbox, closeBuildWorkspace } = await import(
-          "../../agent-lib/build-sandbox.ts"
-        );
-        // Mirror the real runSecuritySession: single-phase, so create + close
-        // around the scan (the shared workspace isn't reused here).
-        const taskId = `security:${ref.owner}/${ref.repo}:${scanDate}`;
-        try {
-          return await withBuildSandbox(
-            { owner: ref.owner, repo: ref.repo, branch: meta.defaultBranch ?? "main", taskId },
-            token,
-            async (sandbox) => {
-              sawSandbox = sandbox;
-              return sessionImpl(sandbox);
-            },
-            { ops: sandboxOps },
-          );
-        } finally {
-          await closeBuildWorkspace(taskId);
-        }
-      },
       fileIssue: async () => ({
         filed: true,
         issueNumber: 7,
         html_url: "https://gh/issues/7",
         labelled: true,
       }),
-      sandboxOps: opts.sandboxOps,
     };
-    const { sessionImpl } = opts;
-    return { deps, ctx, sawSandbox: () => sawSandbox };
   }
 
-  it("clones the repo into the sandbox and tears the container down (finally)", async () => {
-    const fc = fakeContainer();
-    const ops: BuildSandboxOps = { createContainer: vi.fn(async () => fc.container) };
-    const t = realCloneDeps({ sandboxOps: ops, sessionImpl: async () => REPORT });
-    const res = await runSecurityReview(t.ctx, t.deps, SCAN_DATE);
+  it("clones the repo into the harness sandbox via git CLI, then files the report", async () => {
+    const fh = fakeHarness({ promptText: REPORT });
+    const ctx = fakeCtx(INPUT, fh.harness);
+    const res = await runSecurityReview(ctx, cloneDeps(), SCAN_DATE);
 
+    // A clone command was issued into the harness sandbox.
+    expect(fh.shellCalls.some((c) => c.includes("git clone"))).toBe(true);
     expect(res.filed).toBe(true);
-    expect(ops.createContainer as ReturnType<typeof vi.fn>).toHaveBeenCalled();
-    // A clone command was issued into the container.
-    expect(fc.execCalls.some((c) => c.includes("git clone"))).toBe(true);
-    // The body saw the sandbox the container produced.
-    expect(t.sawSandbox()).toBe(SANDBOX);
-    // Torn down exactly once.
-    expect(fc.removed()).toBe(1);
   });
 
-  it("tears the container down even when the session throws (finally)", async () => {
-    const fc = fakeContainer();
-    const ops: BuildSandboxOps = { createContainer: vi.fn(async () => fc.container) };
-    const t = realCloneDeps({
-      sandboxOps: ops,
-      sessionImpl: async () => {
-        throw new Error("model exploded mid-security-review");
-      },
-    });
-    await expect(runSecurityReview(t.ctx, t.deps, SCAN_DATE)).rejects.toThrow(
+  it("a prompt throw surfaces (no swallow)", async () => {
+    const fh = fakeHarness({ promptThrows: new Error("model exploded mid-security-review") });
+    const ctx = fakeCtx(INPUT, fh.harness);
+    await expect(runSecurityReview(ctx, cloneDeps(), SCAN_DATE)).rejects.toThrow(
       "model exploded mid-security-review",
     );
-    expect(fc.removed()).toBe(1);
   });
 });
 

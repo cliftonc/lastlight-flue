@@ -41,7 +41,7 @@ describe("slack router — chat is the default route", () => {
     expect(d).toEqual({
       action: "chat",
       id: KEY,
-      input: { text: "hey what's up", sender: "U_ALICE", source: "slack" },
+      input: { text: "hey what's up", sender: "U_ALICE", source: "slack", messageTs: "m-1" },
     });
   });
 

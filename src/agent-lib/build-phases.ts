@@ -1,5 +1,9 @@
-import type { FlueContext } from '@flue/runtime';
-import type { SandboxFactory } from '@flue/runtime';
+import {
+  defineAgent,
+  type FlueHarness,
+  type ToolDefinition,
+} from '@flue/runtime';
+import * as v from 'valibot';
 import { Octokit } from 'octokit';
 import type { BuildRun } from '../build-run-store.ts';
 import { parseReviewerVerdict, type ReviewerVerdict } from '../engine/verdict.ts';
@@ -7,12 +11,18 @@ import {
   GITHUB_PERMISSION_PROFILES,
   type GitAccessProfile,
 } from '../engine/profiles.ts';
-import { configureGitAuth } from '../engine/git-auth.ts';
 import { loadConfig } from '../config.ts';
-import { createArchitectAgent } from './architect.ts';
-import { createExecutorAgent } from './executor.ts';
-import { createGuardrailsAgent } from './guardrails.ts';
-import { createBuildReviewerAgent, createFixAgent } from './build-reviewer.ts';
+import { configureGitAuth } from '../engine/git-auth.ts';
+import { dockerSandbox } from '../sandboxes/docker.ts';
+import { architectProfile, ARCHITECT_PROFILE_NAME } from './architect.ts';
+import { executorProfile, EXECUTOR_PROFILE_NAME } from './executor.ts';
+import { guardrailsProfile, GUARDRAILS_PROFILE_NAME } from './guardrails.ts';
+import {
+  buildReviewerProfile,
+  buildFixProfile,
+  BUILD_REVIEWER_PROFILE_NAME,
+  BUILD_FIX_PROFILE_NAME,
+} from './build-reviewer.ts';
 import {
   renderArchitectPrompt,
   architectPlanPath,
@@ -42,15 +52,25 @@ import {
   reviewerVerdictPath,
 } from './reviewer-prompt.ts';
 import {
-  withBuildSandbox,
-  defaultBuildSandboxOps,
-  type BuildSandboxOps,
-  type BuildContainer,
+  cloneRepoIntoHarness,
+  BUILD_WORKSPACE,
 } from './build-sandbox.ts';
-import type { RepoRef } from '../tools/github-read.ts';
+import { githubReadTools, type RepoRef } from '../tools/github-read.ts';
 import { runPhasePrompt } from './record-execution.ts';
+import { ProgressNotifier } from '../notify/notifier.ts';
+import { GitHubTransport } from '../notify/transports/github.ts';
+import { SlackTransport } from '../notify/transports/slack.ts';
+import { NULL_REPORTER, readNotifierState } from '../notify/state.ts';
+import { runDashboardUrl } from '../notify/model.ts';
+import type {
+  NotifierState,
+  NotifierTransport,
+  ProgressReporter,
+} from '../notify/types.ts';
+import { buildBuildModel } from './build-notify.ts';
+import { slackPosterFromConfig, parseSlackConversationKey } from '../slack-client.ts';
 
-// Phase 4 — the BuildDeps DI seam (mirrors pr-review's `deps` pattern).
+// Phase 4 — the BuildDeps DI seam (mirrors pr-review's `deps` pattern), beta.3.
 //
 // The build CONTROL FLOW lives in src/workflows/build.ts; the actual phase BODIES
 // (guardrails / architect / executor / reviewer / fix / recheck) and the side
@@ -58,38 +78,89 @@ import { runPhasePrompt } from './record-execution.ts';
 // resume / idempotency / breaker / phase-skip — is tested OFFLINE with NO live
 // model and NO GitHub.
 //
-// SLICE STATUS (this slice): the ARCHITECT phase body is now WIRED for real (a
-// top-level harness session over the architect agent, in a Docker sandbox with the
-// repo pre-cloned at the working branch — design: NOT a subagent). Still STUBBED:
-// guardrails / executor / reviewer / fix / recheck + the gate ask + the open-PR.
-// See TODO(phase-4/…). The architect's own seams (token mint, octokit, sandbox
-// ops, session runner) are injectable so the default impl is tested OFFLINE too.
+// beta.3 SHAPE: there is ONE bound coordinator agent (`buildAgent`) whose harness
+// owns a self-terminating Docker sandbox (`dockerSandbox()`). The per-phase agents
+// are SUBAGENT PROFILES on that coordinator (architect / executor / guardrails /
+// build-reviewer / build-fix). Each phase delegates via
+// `session.task(prompt, { agent: '<profile>', tools })` — the per-run READ tools are
+// injected per call (the security spine), and the shared `/workspace` checkout (cloned
+// ONCE per invocation by `ensureBuildCheckout`) persists across phases.
 
-export type BuildInput = {
+// ── Coordinator agent + input schema ──────────────────────────────────────────
+
+/** The issue-context shape the architect/guardrails prompts wrap as UNTRUSTED. */
+const IssueContextSchema = v.object({
+  title: v.optional(v.string()),
+  body: v.optional(v.string()),
+  comment: v.optional(v.string()),
+  sender: v.optional(v.string()),
+  labels: v.optional(v.array(v.string())),
+});
+
+/** The `build` workflow input — validated at admission (`defineWorkflow({ input })`). */
+export const BuildInputSchema = v.object({
   /** APP run id — stable caller-owned key (issue/thread), distinct from Flue's runId. */
-  runId: string;
-  owner: string;
-  repo: string;
-  issue: number;
-  branch?: string;
-  taskId?: string;
+  runId: v.string(),
+  owner: v.string(),
+  repo: v.string(),
+  issue: v.number(),
+  branch: v.optional(v.string()),
+  taskId: v.optional(v.string()),
   /** User-provided issue text (UNTRUSTED) for the architect contextSnapshot. */
-  issueContext?: ArchitectIssueContext;
+  issueContext: v.optional(IssueContextSchema),
   /**
    * The CHANNEL conversation key (issue/PR thread) this run was triggered from — the
    * SAME `conversationKey` the channel computes from an event. Recorded on the run
    * record at a gate pause (Phase 6 gate correlation) so a channel approve/reject on
    * that conversation resolves THIS run. Absent on a CLI run.
    */
-  conversationKey?: string;
+  conversationKey: v.optional(v.string()),
   /**
    * Per-gate re-entry token set by resume(): the gate this re-invoke is approved
    * past (`post_architect` or `post_reviewer:<cycle>`). Absent on a fresh invoke.
    */
-  resumedGate?: string;
+  resumedGate: v.optional(v.string()),
   /** Trigger provenance ("cli" | "webhook" | "cron" | "boot"). */
-  triggerType?: string;
-};
+  triggerType: v.optional(v.string()),
+});
+export type BuildInput = v.InferOutput<typeof BuildInputSchema>;
+
+// (Backstop so the inferred type keeps the documented `issueContext` field name.)
+const _issueContextTypecheck: ArchitectIssueContext | undefined = undefined as
+  | BuildInput['issueContext']
+  | undefined;
+void _issueContextTypecheck;
+
+/**
+ * The `build` COORDINATOR agent (beta.3). It owns a fresh self-terminating Docker
+ * sandbox (`dockerSandbox()`) + `cwd: /workspace`; every build phase is a SUBAGENT
+ * PROFILE delegated via `session.task({ agent })`. The coordinator declares NO tools
+ * (the per-run READ tools are injected per task call) — the security spine.
+ */
+export const buildAgent = defineAgent(() => ({
+  sandbox: dockerSandbox(),
+  cwd: BUILD_WORKSPACE,
+  subagents: [
+    guardrailsProfile,
+    architectProfile,
+    executorProfile,
+    buildReviewerProfile,
+    buildFixProfile,
+  ],
+}));
+
+/**
+ * The action-context surface the build phase bodies + the testable core need: the
+ * supplied `harness` (initialized from `buildAgent`, sandbox attached), the validated
+ * `input`, and `log`. Replaces beta.2 `FlueContext<BuildInput>` (no `ctx.id`/`env`/`req`).
+ */
+export interface BuildRunCtx {
+  harness: FlueHarness;
+  input: BuildInput;
+  log: { info(msg: string, meta?: unknown): void; warn(msg: string, meta?: unknown): void; error(msg: string, meta?: unknown): void };
+}
+
+export type { BuildRun } from '../build-run-store.ts';
 
 /** The structured result of a build invocation. */
 export type BuildResult = {
@@ -114,17 +185,17 @@ export interface PhaseResult {
 }
 
 /**
- * Injectable phase bodies + side effects. Production wires real agent sessions +
+ * Injectable phase bodies + side effects. Production wires real subagent tasks +
  * the deterministic PR open; tests pass fakes that record calls.
  */
 export interface BuildDeps {
   /**
-   * Run a named build phase (opens its own top-level harness session in prod).
-   * `name` is the session/phase name (`guardrails`, `architect`, `executor`,
-   * `reviewer:0`, `fix:0`, `recheck:0`, …). Returns the agent's marker text.
+   * Run a named build phase (delegates to a subagent profile on the coordinator
+   * harness in prod). `name` is the phase name (`guardrails`, `architect`,
+   * `executor`, `reviewer:0`, `fix:0`, `recheck:0`, …). Returns the agent's marker text.
    */
   runPhase(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     run: BuildRun,
     name: string,
   ): Promise<PhaseResult>;
@@ -134,7 +205,7 @@ export interface BuildDeps {
    * (recorded in the run record for audit); a fake may return void.
    */
   postGateComment(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     run: BuildRun,
     gate: string,
   ): Promise<{ commentId: number } | void>;
@@ -143,13 +214,27 @@ export interface BuildDeps {
    * NOT a model tool). Idempotent: reuses an already-open PR for the branch.
    */
   openPullRequest(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     run: BuildRun,
   ): Promise<{ html_url: string; number?: number }>;
   /** Whether a gate fires (positive-enable config). Disabled → no pause. */
   gateEnabled(gate: 'post_architect' | 'post_reviewer'): boolean;
   /** Parse the reviewer verdict marker (the prompt↔code contract). */
   parseVerdict(text: string): { verdict: ReviewerVerdict; viaFallback: boolean };
+  /**
+   * Phase 8 egress — build, SEED (start), and return the in-place progress
+   * reporter for this run: a {@link ProgressReporter} fanning the per-phase
+   * checklist to the originating GitHub issue (+ a Slack thread when the run
+   * carries a Slack conversationKey). `save` persists the in-place-update
+   * handles into the run record so a RESUMED run re-attaches to the SAME
+   * surface. Optional + best-effort: omitted (tests / CLI) → the control flow
+   * uses {@link NULL_REPORTER} and the durable spine is unchanged.
+   */
+  makeReporter?(
+    ctx: BuildRunCtx,
+    run: BuildRun,
+    save: (patch: NotifierState) => void,
+  ): Promise<ProgressReporter>;
 }
 
 /** Reviewer fix/recheck cap (build.yaml `loop.max_cycles: 2`). */
@@ -199,168 +284,101 @@ export function cycleFromPhaseName(name: string): number {
   return Number(m[1]);
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// GUARDRAILS phase — the pre-flight screen (runs FIRST, before the architect).
-//
-// Emits READY / BLOCKED (the prompt↔code marker). The workflow parses
-// `^\s*BLOCKED` and fails the build — UNLESS the issue is a BOOTSTRAP task
-// (`lastlight:bootstrap` label / a `guardrails:` title prefix), in which case the
-// BLOCK is bypassed so the executor can establish the missing tooling (parity with
-// build.yaml `contains_BLOCKED.unless_label` / `unless_title_matches`).
-// ───────────────────────────────────────────────────────────────────────────
+// ── Shared sandbox/session plumbing ────────────────────────────────────────────
 
-/** The bootstrap label name (build.yaml `unless_label`). Mirrors config.bootstrapLabel. */
-export const BOOTSTRAP_LABEL = 'lastlight:bootstrap';
+/** The coordinator session name build phases delegate their subagent tasks from. */
+const BUILD_SESSION = 'build';
 
-/** The `unless_title_matches` regex (build.yaml): a `guardrails:`/`[guardrails]` prefix. */
-const GUARDRAILS_TITLE_RE = /^\s*(guardrails:|\[guardrails\])/i;
+/** Harnesses whose /workspace already holds the cloned checkout (clone-once-per-invocation). */
+const clonedBuildHarnesses = new WeakSet<FlueHarness>();
 
 /**
- * BLOCKED-bypass parity (design Q4.5 / build.yaml `contains_BLOCKED.unless_*`): a
- * guardrails BLOCKED is bypassed (the build proceeds so the executor can ADD the
- * missing tooling) when the issue is itself a bootstrap task — detected by the
- * `lastlight:bootstrap` label OR a `guardrails:` / `[guardrails]` title prefix. The
- * issue metadata comes from the run input's `issueContext` (trigger metadata, NOT
- * model output). With no issue context, there is no bypass (a normal feature build
- * BLOCKED stops, as in the reference).
+ * Clone the repo into the coordinator harness's `/workspace` ONCE per invocation
+ * (guarded by harness identity — phases share one harness, so the checkout persists
+ * across `session.task` calls). The token-bearing origin is LEFT IN PLACE (no scrub)
+ * so the executor/fix push authenticates. On a resumed run a FRESH harness re-clones,
+ * continuing the pushed branch tip (`cloneRepoIntoHarness` reuses the remote branch).
  */
-export function bootstrapBypass(ic?: ArchitectIssueContext): boolean {
-  if (!ic) return false;
-  const label = (ic.labels ?? []).some((l) => l === BOOTSTRAP_LABEL);
-  const title = !!ic.title && GUARDRAILS_TITLE_RE.test(ic.title);
-  return label || title;
+export async function ensureBuildCheckout(
+  harness: FlueHarness,
+  run: BuildRun,
+  token: string,
+): Promise<void> {
+  if (clonedBuildHarnesses.has(harness)) return;
+  await cloneRepoIntoHarness(
+    harness,
+    { owner: run.owner, repo: run.repo, branch: run.branch },
+    token,
+  );
+  clonedBuildHarnesses.add(harness);
+}
+
+/** Drop the clone-once registry — test isolation only. */
+export function resetBuildCheckoutsForTests(): void {
+  // WeakSet has no clear(); a fresh module is loaded per test process. Provided as a
+  // no-op marker so tests can document intent; the WeakSet is GC'd with its harnesses.
 }
 
 /**
- * Injectable seams for the guardrails phase, mirroring the architect's seams so the
- * default `runPhase('guardrails')` is testable OFFLINE (no live model / GitHub /
- * Docker). The screen runs WITH the sandbox (it inspects the pre-cloned repo).
+ * Run a build phase as a delegated SUBAGENT TASK on the coordinator session, recording
+ * its usage (NON-FATAL + TEST-INERT — see record-execution.ts). The per-run READ tools
+ * are injected for THIS call only — owner/repo/token never model-selectable.
  */
-export interface GuardrailsPhaseDeps {
-  mintToken(run: BuildRun): Promise<string>;
-  makeOctokit(token: string): Octokit;
-  sandboxOps: BuildSandboxOps;
-  /**
-   * Run the guardrails agent session against the pre-cloned repo + rendered prompt,
-   * returning its raw text (ending in the READY / BLOCKED marker). The agent
-   * commits a guardrails-report.md in-sandbox but does NOT push.
-   */
-  runGuardrailsSession(
-    ctx: FlueContext<BuildInput>,
-    ref: RepoRef,
-    octokit: Octokit,
-    sandbox: SandboxFactory,
-    prompt: string,
-  ): Promise<string>;
-}
-
-/** The real guardrails run: init the agent, open the named session, prompt it. */
-async function runGuardrailsSession(
-  ctx: FlueContext<BuildInput>,
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
+async function runPhaseTask(
+  ctx: BuildRunCtx,
+  profileName: string,
+  phase: string,
   prompt: string,
+  tools: ToolDefinition[],
 ): Promise<string> {
-  const agent = createGuardrailsAgent(ref, octokit, sandbox);
-  // Distinct harness NAME per phase. Flue allows each harness name to be
-  // initialized ONCE per workflow invocation (api/agent-api: "Each harness name
-  // may be initialized once per context"). A gateless `flue run` executes
-  // several phases in one invocation, so each must init a differently-named
-  // harness — the default 'default' would collide on the 2nd phase with
-  // "init() has already been called with name 'default'". Each phase keeps its
-  // own scoped agent (distinct tools/token), so we cannot share one harness.
-  const harness = await ctx.init(agent, { name: 'guardrails' });
-  const session = await harness.session('guardrails');
-  // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
-  // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
-  const res = await runPhasePrompt(session, prompt, {
-    runId: ctx.payload.runId,
+  const session = await ctx.harness.session(BUILD_SESSION);
+  // Adapt `session.task({ agent })` to the `runPhasePrompt` recorder seam (it calls
+  // `.prompt(text, opts)`); the profile selection + injected tools ride on the task opts.
+  const taskRunner = {
+    prompt: (text: string, opts?: unknown) =>
+      session.task(text, { ...((opts as object | undefined) ?? {}), agent: profileName }),
+  };
+  const res = await runPhaseTaskRecorded(taskRunner, prompt, {
+    runId: ctx.input.runId,
     workflow: 'build',
-    phase: 'guardrails',
-  });
+    phase,
+  }, { tools });
   return res.text;
 }
 
-/** Default guardrails-phase deps: real token mint + Octokit + Docker + session. */
-export function defaultGuardrailsPhaseDeps(): GuardrailsPhaseDeps {
-  return {
-    mintToken: mintRepoWriteToken,
-    makeOctokit: (token) => new Octokit({ auth: token }),
-    sandboxOps: defaultBuildSandboxOps(),
-    runGuardrailsSession,
-  };
+/** Thin wrapper so the `runPhasePrompt` generic resolves against the task runner. */
+function runPhaseTaskRecorded(
+  runner: { prompt(text: string, opts?: unknown): Promise<{ text: string }> },
+  prompt: string,
+  rec: { runId: string; workflow: string; phase: string },
+  opts: unknown,
+) {
+  return runPhasePrompt(runner as never, prompt, rec, opts);
+}
+
+/** Read the branch HEAD sha over the shared checkout (deterministic, not a model tool). */
+async function readHeadSha(harness: FlueHarness): Promise<string> {
+  const r = await harness.shell('git rev-parse HEAD', { cwd: BUILD_WORKSPACE });
+  return r.stdout.trim();
 }
 
 /**
- * Run the GUARDRAILS phase (the FIRST build phase): mint a repo-write token, build
- * an Octokit, create a Docker sandbox with the repo pre-cloned at the working
- * branch (CALLER owns the container lifetime, torn down in `withBuildSandbox`'s
- * finally), build the guardrails agent on that sandbox (cwd /workspace), render the
- * prompt (issue text wrapped UNTRUSTED so the bootstrap escape hatch is judged from
- * data, not instructions), run the session, and return its text (ending in the
- * READY / BLOCKED marker the workflow parses). Records the guardrails-report
- * pointer in scratch (NOT the report blob — spec/10).
+ * Push the working branch to origin (the LIVE side effect). Runs in-sandbox over the
+ * token-bearing origin the clone left in place. The branch ref is BOUND (closed over
+ * the run), never model-chosen. In tests this seam is mocked → NO real push happens.
  */
-export async function runGuardrailsPhase(
-  ctx: FlueContext<BuildInput>,
-  run: BuildRun,
-  deps: GuardrailsPhaseDeps = defaultGuardrailsPhaseDeps(),
-): Promise<PhaseResult> {
-  const ref: RepoRef = { owner: run.owner, repo: run.repo };
-  const token = await deps.mintToken(run);
-  const octokit = deps.makeOctokit(token);
-
-  const prompt = renderGuardrailsPrompt({
-    owner: run.owner,
-    repo: run.repo,
-    issue: run.issue,
-    branch: run.branch,
-    bootstrapLabel: BOOTSTRAP_LABEL,
-    issue_context: ctx.payload.issueContext,
+async function pushBranch(harness: FlueHarness, branch: string): Promise<void> {
+  const r = await harness.shell(`git push origin ${shellArgInline(branch)}`, {
+    cwd: BUILD_WORKSPACE,
   });
-
-  const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
-    token,
-    (sandbox) => deps.runGuardrailsSession(ctx, ref, octokit, sandbox, prompt),
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
-
-  return {
-    text,
-    scratch: { [GUARDRAILS_REPORT_SCRATCH_KEY]: guardrailsReportPath(run.issue) },
-  };
+  if (r.exitCode !== 0) {
+    throw new Error(`build: git push failed (${r.exitCode}): ${r.stderr.trim()}`);
+  }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// ARCHITECT phase — the first real build phase body.
-// ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Injectable seams for the architect phase, so the default `runPhase('architect')`
- * is testable OFFLINE (no live model / GitHub / Docker). Production wires the real
- * token mint + Octokit + Docker sandbox ops + the agent-session runner.
- */
-export interface ArchitectPhaseDeps {
-  /** Mint a `repo-write` scoped installation token for this repo (PEM wall). */
-  mintToken(run: BuildRun): Promise<string>;
-  /** Build an Octokit authenticated with the scoped token. */
-  makeOctokit(token: string): Octokit;
-  /** Container lifecycle ops for the build sandbox (real Docker by default). */
-  sandboxOps: BuildSandboxOps;
-  /**
-   * Run the architect agent session against the pre-cloned repo + rendered prompt,
-   * returning its raw text output. Wraps agent-init + session.prompt so tests can
-   * return a canned plan summary with no live model.
-   */
-  runArchitectSession(
-    ctx: FlueContext<BuildInput>,
-    ref: RepoRef,
-    octokit: Octokit,
-    sandbox: SandboxFactory,
-    prompt: string,
-  ): Promise<string>;
+/** Single-quote for safe `sh -c` interpolation (the branch is workflow-derived). */
+function shellArgInline(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Mint a repo-write token downscoped to the target repo via the ported git-auth. */
@@ -368,7 +386,7 @@ async function mintRepoWriteToken(run: BuildRun): Promise<string> {
   const cfg = loadConfig();
   if (!cfg.githubApp) {
     throw new Error(
-      'build/architect: GitHub App not configured ' +
+      'build: GitHub App not configured ' +
         '(GITHUB_APP_ID / _PRIVATE_KEY_PATH / _INSTALLATION_ID). Cannot mint a repo-write token.',
     );
   }
@@ -383,71 +401,188 @@ async function mintRepoWriteToken(run: BuildRun): Promise<string> {
   return token;
 }
 
-/** The real architect run: init the agent, open the named session, prompt it. */
-async function runArchitectSession(
-  ctx: FlueContext<BuildInput>,
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-  prompt: string,
-): Promise<string> {
-  const agent = createArchitectAgent(ref, octokit, sandbox);
-  // Distinct harness name per phase (see runGuardrailsSession).
-  const harness = await ctx.init(agent, { name: 'architect' });
-  // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
-  // re-open exactly the architect conversation.
-  const session = await harness.session('architect');
-  const res = await runPhasePrompt(session, prompt, {
-    runId: ctx.payload.runId,
-    workflow: 'build',
-    phase: 'architect',
-  });
-  return res.text;
+// ───────────────────────────────────────────────────────────────────────────
+// GUARDRAILS phase — the pre-flight screen (runs FIRST, before the architect).
+// ───────────────────────────────────────────────────────────────────────────
+
+/** The bootstrap label name (build.yaml `unless_label`). Mirrors config.bootstrapLabel. */
+export const BOOTSTRAP_LABEL = 'lastlight:bootstrap';
+
+/** The `unless_title_matches` regex (build.yaml): a `guardrails:`/`[guardrails]` prefix. */
+const GUARDRAILS_TITLE_RE = /^\s*(guardrails:|\[guardrails\])/i;
+
+/**
+ * BLOCKED-bypass parity (design Q4.5 / build.yaml `contains_BLOCKED.unless_*`): a
+ * guardrails BLOCKED is bypassed (the build proceeds so the executor can ADD the
+ * missing tooling) when the issue is itself a bootstrap task — detected by the
+ * `lastlight:bootstrap` label OR a `guardrails:` / `[guardrails]` title prefix.
+ */
+export function bootstrapBypass(ic?: ArchitectIssueContext): boolean {
+  if (!ic) return false;
+  const label = (ic.labels ?? []).some((l) => l === BOOTSTRAP_LABEL);
+  const title = !!ic.title && GUARDRAILS_TITLE_RE.test(ic.title);
+  return label || title;
 }
 
-/** Default architect-phase deps: real token mint + Octokit + Docker + session. */
+/**
+ * Injectable seams for the guardrails phase, so the default `runPhase('guardrails')`
+ * is testable OFFLINE (no live model / GitHub / Docker). The screen runs WITH the
+ * shared checkout (it inspects the pre-cloned repo).
+ */
+export interface GuardrailsPhaseDeps {
+  mintToken(run: BuildRun): Promise<string>;
+  makeOctokit(token: string): Octokit;
+  /** Clone the repo into the coordinator harness's /workspace (once per invocation). */
+  ensureCheckout(harness: FlueHarness, run: BuildRun, token: string): Promise<void>;
+  /**
+   * Delegate the guardrails subagent task against the shared checkout + rendered
+   * prompt, returning its raw text (ending in the READY / BLOCKED marker).
+   */
+  runGuardrailsSession(
+    ctx: BuildRunCtx,
+    ref: RepoRef,
+    octokit: Octokit,
+    prompt: string,
+  ): Promise<string>;
+}
+
+/** The real guardrails run: delegate to the guardrails subagent profile. */
+async function runGuardrailsSession(
+  ctx: BuildRunCtx,
+  ref: RepoRef,
+  octokit: Octokit,
+  prompt: string,
+): Promise<string> {
+  return runPhaseTask(
+    ctx,
+    GUARDRAILS_PROFILE_NAME,
+    'guardrails',
+    prompt,
+    githubReadTools(ref, octokit),
+  );
+}
+
+/** Default guardrails-phase deps: real token mint + Octokit + clone + subagent task. */
+export function defaultGuardrailsPhaseDeps(): GuardrailsPhaseDeps {
+  return {
+    mintToken: mintRepoWriteToken,
+    makeOctokit: (token) => new Octokit({ auth: token }),
+    ensureCheckout: ensureBuildCheckout,
+    runGuardrailsSession,
+  };
+}
+
+/**
+ * Run the GUARDRAILS phase (the FIRST build phase): mint a repo-write token, build an
+ * Octokit, ensure the repo is cloned into the coordinator harness's /workspace, render
+ * the prompt (issue text wrapped UNTRUSTED), delegate the guardrails subagent task, and
+ * return its text (ending in the READY / BLOCKED marker the workflow parses). Records
+ * the guardrails-report pointer in scratch (NOT the report blob — spec/10).
+ */
+export async function runGuardrailsPhase(
+  ctx: BuildRunCtx,
+  run: BuildRun,
+  deps: GuardrailsPhaseDeps = defaultGuardrailsPhaseDeps(),
+): Promise<PhaseResult> {
+  const ref: RepoRef = { owner: run.owner, repo: run.repo };
+  const token = await deps.mintToken(run);
+  const octokit = deps.makeOctokit(token);
+  await deps.ensureCheckout(ctx.harness, run, token);
+
+  const prompt = renderGuardrailsPrompt({
+    owner: run.owner,
+    repo: run.repo,
+    issue: run.issue,
+    branch: run.branch,
+    bootstrapLabel: BOOTSTRAP_LABEL,
+    issue_context: ctx.input.issueContext,
+  });
+
+  const text = await deps.runGuardrailsSession(ctx, ref, octokit, prompt);
+
+  return {
+    text,
+    scratch: { [GUARDRAILS_REPORT_SCRATCH_KEY]: guardrailsReportPath(run.issue) },
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ARCHITECT phase — the first plan-writing build phase body.
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Injectable seams for the architect phase, so the default `runPhase('architect')`
+ * is testable OFFLINE (no live model / GitHub / Docker).
+ */
+export interface ArchitectPhaseDeps {
+  mintToken(run: BuildRun): Promise<string>;
+  makeOctokit(token: string): Octokit;
+  ensureCheckout(harness: FlueHarness, run: BuildRun, token: string): Promise<void>;
+  /**
+   * Delegate the architect subagent task against the shared checkout + rendered
+   * prompt, returning its raw text. The agent writes + commits the plan in-sandbox.
+   */
+  runArchitectSession(
+    ctx: BuildRunCtx,
+    ref: RepoRef,
+    octokit: Octokit,
+    prompt: string,
+  ): Promise<string>;
+}
+
+/** The real architect run: delegate to the architect subagent profile. */
+async function runArchitectSession(
+  ctx: BuildRunCtx,
+  ref: RepoRef,
+  octokit: Octokit,
+  prompt: string,
+): Promise<string> {
+  return runPhaseTask(
+    ctx,
+    ARCHITECT_PROFILE_NAME,
+    'architect',
+    prompt,
+    githubReadTools(ref, octokit),
+  );
+}
+
+/** Default architect-phase deps: real token mint + Octokit + clone + subagent task. */
 export function defaultArchitectPhaseDeps(): ArchitectPhaseDeps {
   return {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
-    sandboxOps: defaultBuildSandboxOps(),
+    ensureCheckout: ensureBuildCheckout,
     runArchitectSession,
   };
 }
 
 /**
- * Run the ARCHITECT phase: mint a repo-write token, build an Octokit, create a
- * Docker sandbox with the repo pre-cloned at the working branch (CALLER owns the
- * container lifetime — created here, torn down in `withBuildSandbox`'s finally),
- * build the architect agent on that sandbox (cwd /workspace), render the prompt
- * (issue text wrapped UNTRUSTED), run the session, and return its text. The agent
- * writes + commits `.lastlight/issue-<N>/architect-plan.md` in the workspace (the
+ * Run the ARCHITECT phase: mint a repo-write token, build an Octokit, ensure the repo
+ * is cloned into the coordinator harness's /workspace, render the prompt (issue text
+ * wrapped UNTRUSTED), delegate the architect subagent task, and return its text. The
+ * agent writes + commits `.lastlight/issue-<N>/architect-plan.md` in the workspace (the
  * durable handoff). The plan path is the run-record scratch pointer the workflow
- * persists (it is NOT inlined — spec/10 split rule).
+ * persists (NOT the plan blob — spec/10 split rule).
  */
 export async function runArchitectPhase(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   run: BuildRun,
   deps: ArchitectPhaseDeps = defaultArchitectPhaseDeps(),
 ): Promise<PhaseResult> {
   const ref: RepoRef = { owner: run.owner, repo: run.repo };
   const token = await deps.mintToken(run);
   const octokit = deps.makeOctokit(token);
+  await deps.ensureCheckout(ctx.harness, run, token);
 
   const prompt = renderArchitectPrompt({
     owner: run.owner,
     repo: run.repo,
     issue: run.issue,
     branch: run.branch,
-    issue_context: ctx.payload.issueContext,
+    issue_context: ctx.input.issueContext,
   });
 
-  const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
-    token,
-    (sandbox) => deps.runArchitectSession(ctx, ref, octokit, sandbox, prompt),
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  const text = await deps.runArchitectSession(ctx, ref, octokit, prompt);
 
   return { text };
 }
@@ -458,107 +593,62 @@ export async function runArchitectPhase(
 
 /** The result of the executor phase: the agent's text + the post-commit sha. */
 export interface ExecutorRunResult {
-  /** The agent's raw text output (file list / test results / commit hash). */
   text: string;
   /** The branch HEAD sha after the executor committed (the reviewer/PR anchor). */
   sha: string;
 }
 
 /**
- * Injectable seams for the executor phase, so the default `runPhase('executor')`
- * is testable OFFLINE (no live model / GitHub / Docker / push). Production wires
- * the real token mint + Octokit + Docker sandbox ops + the agent-session runner +
- * the deterministic branch push.
+ * Injectable seams for the executor phase, so the default `runPhase('executor')` is
+ * testable OFFLINE (no live model / GitHub / Docker / push).
  */
 export interface ExecutorPhaseDeps {
-  /** Mint a `repo-write` scoped installation token for this repo (PEM wall). */
   mintToken(run: BuildRun): Promise<string>;
-  /** Build an Octokit authenticated with the scoped token. */
   makeOctokit(token: string): Octokit;
-  /** Container lifecycle ops for the build sandbox (real Docker by default). */
-  sandboxOps: BuildSandboxOps;
+  ensureCheckout(harness: FlueHarness, run: BuildRun, token: string): Promise<void>;
   /**
-   * Run the executor agent session against the pre-cloned repo (with the
-   * architect plan on the branch) + rendered prompt; returns its raw text output.
-   * The agent COMMITS its changes in-sandbox via the git CLI but does NOT push.
+   * Delegate the executor subagent task against the shared checkout (architect plan on
+   * the branch) + rendered prompt; returns its raw text. The agent COMMITS in-sandbox
+   * via the git CLI but does NOT push.
    */
   runExecutorSession(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     ref: RepoRef,
     octokit: Octokit,
-    sandbox: SandboxFactory,
     prompt: string,
   ): Promise<string>;
+  /** Read the branch HEAD sha after the executor committed (the reviewer/PR anchor). */
+  readHeadSha(harness: FlueHarness): Promise<string>;
   /**
-   * Read the branch HEAD sha after the executor committed (over the same checkout).
-   * Recorded in the run-record scratch as the reviewer/PR anchor.
+   * Push the working branch to origin over the token-bearing origin (the controlled,
+   * workflow-owned side effect — a SEAM so tests assert it WOULD push the BOUND branch
+   * WITHOUT a real push). LIVE form runs `git push origin <branch>` in-sandbox.
    */
-  readHeadSha(container: BuildContainer): Promise<string>;
-  /**
-   * Push the working branch to origin over the repo-write token (the controlled,
-   * workflow-owned side effect — a SEAM so tests assert it WOULD push, with the
-   * bound branch ref, WITHOUT a real push). LIVE form runs `git push` in-sandbox.
-   */
-  pushBranch(container: BuildContainer, branch: string): Promise<void>;
+  pushBranch(harness: FlueHarness, branch: string): Promise<void>;
 }
 
-/** The real executor run: init the agent, open the named session, prompt it. */
+/** The real executor run: delegate to the executor subagent profile. */
 async function runExecutorSession(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   ref: RepoRef,
   octokit: Octokit,
-  sandbox: SandboxFactory,
   prompt: string,
 ): Promise<string> {
-  const agent = createExecutorAgent(ref, octokit, sandbox);
-  // Distinct harness name per phase (see runGuardrailsSession).
-  const harness = await ctx.init(agent, { name: 'executor' });
-  // Top-level NAMED session (design: NOT a subagent) so a post-gate resume can
-  // re-open exactly the executor conversation.
-  const session = await harness.session('executor');
-  const res = await runPhasePrompt(session, prompt, {
-    runId: ctx.payload.runId,
-    workflow: 'build',
-    phase: 'executor',
-  });
-  return res.text;
-}
-
-/** Read the branch HEAD sha over the same checkout (deterministic, not a model tool). */
-async function readHeadSha(container: BuildContainer): Promise<string> {
-  const r = await container.exec('git rev-parse HEAD', {
-    cwd: '/workspace',
-    timeoutMs: 30_000,
-  });
-  return r.stdout.trim();
-}
-
-/**
- * Push the working branch to origin (the LIVE side effect). Runs in-sandbox over
- * the baked repo-write token. The branch ref is BOUND (closed over the run), never
- * model-chosen. In tests this whole seam is mocked → NO real push happens.
- */
-async function pushBranch(container: BuildContainer, branch: string): Promise<void> {
-  const r = await container.exec(
-    `git push origin ${shellArgInline(branch)}`,
-    { cwd: '/workspace', timeoutMs: 5 * 60_000 },
+  return runPhaseTask(
+    ctx,
+    EXECUTOR_PROFILE_NAME,
+    'executor',
+    prompt,
+    githubReadTools(ref, octokit),
   );
-  if (r.exitCode !== 0) {
-    throw new Error(`build/executor: git push failed (${r.exitCode}): ${r.stderr.trim()}`);
-  }
 }
 
-/** Single-quote for safe `sh -c` interpolation (the branch is workflow-derived). */
-function shellArgInline(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Default executor-phase deps: real token mint + Octokit + Docker + session + push. */
+/** Default executor-phase deps: real token mint + Octokit + clone + task + sha + push. */
 export function defaultExecutorPhaseDeps(): ExecutorPhaseDeps {
   return {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
-    sandboxOps: defaultBuildSandboxOps(),
+    ensureCheckout: ensureBuildCheckout,
     runExecutorSession,
     readHeadSha,
     pushBranch,
@@ -567,142 +657,105 @@ export function defaultExecutorPhaseDeps(): ExecutorPhaseDeps {
 
 /**
  * Run the EXECUTOR phase (runs AFTER the post_architect gate is approved): mint a
- * repo-write token, build an Octokit, create a Docker sandbox with the repo
- * pre-cloned at the working branch (the architect's plan is committed on it — the
- * CALLER owns the container lifetime, torn down in `withBuildSandbox`'s finally),
- * build the executor agent on that sandbox (cwd /workspace), render the prompt (it
- * names the plan path so the agent reads `.lastlight/issue-<N>/architect-plan.md`;
- * any user issue text wrapped UNTRUSTED), run the session (the agent implements +
- * COMMITS in-sandbox via the git CLI), read the committed HEAD sha, then PUSH the
- * branch over the deterministic seam (mocked in tests). Returns the agent text;
- * the workflow persists the executor-summary pointer + the commit sha to the
- * run-record scratch (the reviewer/PR anchors — NOT the diff blob; spec/10 split).
+ * repo-write token, build an Octokit, ensure the repo is cloned into the coordinator
+ * harness's /workspace (the architect's plan is committed on the branch), render the
+ * prompt (any user issue text wrapped UNTRUSTED), delegate the executor subagent task
+ * (the agent implements + COMMITS in-sandbox via the git CLI), read the committed HEAD
+ * sha, then PUSH the branch over the deterministic seam (mocked in tests). Returns the
+ * agent text; the workflow persists the executor-summary pointer + the commit sha
+ * (the reviewer/PR anchors — NOT the diff blob; spec/10 split).
  */
 export async function runExecutorPhase(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   run: BuildRun,
   deps: ExecutorPhaseDeps = defaultExecutorPhaseDeps(),
 ): Promise<ExecutorRunResult> {
   const ref: RepoRef = { owner: run.owner, repo: run.repo };
   const token = await deps.mintToken(run);
   const octokit = deps.makeOctokit(token);
+  await deps.ensureCheckout(ctx.harness, run, token);
 
   const prompt = renderExecutorPrompt({
     owner: run.owner,
     repo: run.repo,
     issue: run.issue,
     branch: run.branch,
-    issue_context: ctx.payload.issueContext,
+    issue_context: ctx.input.issueContext,
   });
 
-  return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
-    token,
-    async (sandbox, container) => {
-      const text = await deps.runExecutorSession(ctx, ref, octokit, sandbox, prompt);
-      const sha = await deps.readHeadSha(container);
-      // The CONTROLLED repo-write side effect: push the branch the workflow bound
-      // (mocked in tests → asserts it WOULD push, no real push). Live push is
-      // gated + run later with the user.
-      await deps.pushBranch(container, run.branch);
-      return { text, sha };
-    },
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  const text = await deps.runExecutorSession(ctx, ref, octokit, prompt);
+  const sha = await deps.readHeadSha(ctx.harness);
+  // The CONTROLLED repo-write side effect: push the branch the workflow bound (mocked
+  // in tests → asserts it WOULD push, no real push).
+  await deps.pushBranch(ctx.harness, run.branch);
+  return { text, sha };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // REVIEWER LOOP — reviewer:N → [post_reviewer gate] → fix:N → recheck:N.
-//
-// reviewer:N  — review the executor's COMMITTED changes in the checkout, emit a
-//               VERDICT marker (parsed → the durable loop); the reviewer commits
-//               reviewer-verdict.md in-sandbox, NO GitHub post (internal review).
-// fix:N       — address the reviewer notes (read from the committed verdict file),
-//               run the gate, COMMIT in-sandbox, then PUSH the branch (mocked seam).
-// recheck:N   — the SAME reviewer agent re-prompted with re-reviewer.md re-reviews
-//               the fix → new VERDICT → the loop breaks (APPROVED) or runs another
-//               cycle (build.ts owns max_cycles + the break-on-APPROVED).
-//
-// NO live model / GitHub / Docker / push in tests — every seam is injectable.
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
  * Injectable seams for the reviewer/recheck phases, so the default
- * `runPhase('reviewer:N'|'recheck:N')` is testable OFFLINE. Production wires the
- * real token mint + Octokit + Docker sandbox ops + the reviewer agent-session
- * runner. A re-review re-prompts the SAME reviewer agent with re-reviewer.md.
+ * `runPhase('reviewer:N'|'recheck:N')` is testable OFFLINE. A re-review re-prompts the
+ * reviewer profile with re-reviewer.md.
  */
 export interface ReviewerPhaseDeps {
-  /** Mint a `repo-write` scoped installation token for this repo (PEM wall). */
   mintToken(run: BuildRun): Promise<string>;
-  /** Build an Octokit authenticated with the scoped token. */
   makeOctokit(token: string): Octokit;
-  /** Container lifecycle ops for the build sandbox (real Docker by default). */
-  sandboxOps: BuildSandboxOps;
+  ensureCheckout(harness: FlueHarness, run: BuildRun, token: string): Promise<void>;
   /**
-   * Run the build reviewer agent session against the pre-cloned checkout (carrying
+   * Delegate the build reviewer subagent task against the shared checkout (carrying
    * the executor's committed changes) + the rendered reviewer / re-reviewer prompt;
-   * returns its raw text (ending in the VERDICT marker). The reviewer commits the
-   * verdict artifact in-sandbox via the git CLI but does NOT push.
+   * returns its raw text (ending in the VERDICT marker).
    */
   runReviewerSession(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     ref: RepoRef,
     octokit: Octokit,
-    sandbox: SandboxFactory,
     prompt: string,
-    sessionName: string,
+    phase: string,
   ): Promise<string>;
 }
 
-/** The real reviewer run: init the agent, open the named session, prompt it. */
+/** The real reviewer run: delegate to the build-reviewer subagent profile. */
 async function runReviewerSession(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   ref: RepoRef,
   octokit: Octokit,
-  sandbox: SandboxFactory,
   prompt: string,
-  sessionName: string,
+  phase: string,
 ): Promise<string> {
-  const agent = createBuildReviewerAgent(ref, octokit, sandbox);
-  // Distinct harness name per phase (see runGuardrailsSession). The per-cycle
-  // sessionName (`reviewer:0` / `recheck:0` / …) is unique within an invocation,
-  // so it also disambiguates the harness across reviewer-loop iterations.
-  const harness = await ctx.init(agent, { name: sessionName });
-  // Top-level NAMED per-cycle session (`reviewer:0` / `recheck:0` — NOT a subagent)
-  // so a post-gate resume re-opens exactly the right cycle's conversation.
-  const session = await harness.session(sessionName);
-  const res = await runPhasePrompt(session, prompt, {
-    runId: ctx.payload.runId,
-    workflow: 'build',
-    phase: sessionName,
-  });
-  return res.text;
+  return runPhaseTask(
+    ctx,
+    BUILD_REVIEWER_PROFILE_NAME,
+    phase,
+    prompt,
+    githubReadTools(ref, octokit),
+  );
 }
 
-/** Default reviewer-phase deps: real token mint + Octokit + Docker + session. */
+/** Default reviewer-phase deps: real token mint + Octokit + clone + subagent task. */
 export function defaultReviewerPhaseDeps(): ReviewerPhaseDeps {
   return {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
-    sandboxOps: defaultBuildSandboxOps(),
+    ensureCheckout: ensureBuildCheckout,
     runReviewerSession,
   };
 }
 
 /**
- * Run a REVIEWER phase (`reviewer:N` is the first review; `recheck:N` re-reviews
- * after fix cycle N): mint a repo-write token, build an Octokit, create a Docker
- * sandbox with the repo pre-cloned at the working branch (carrying the executor's
- * committed changes + any prior verdict/fix commits — CALLER owns the container
- * lifetime, torn down in `withBuildSandbox`'s finally), build the reviewer agent on
- * that sandbox (cwd /workspace), render the prompt (reviewer.md for the first
- * review, re-reviewer.md for a recheck), run the session, and return its text
- * (ending in the VERDICT marker the loop parses). NO GitHub post — this is an
- * internal build review; the verdict drives the loop + the gate surfaces it.
+ * Run a REVIEWER phase (`reviewer:N` is the first review; `recheck:N` re-reviews after
+ * fix cycle N): mint a repo-write token, build an Octokit, ensure the repo is cloned
+ * into the coordinator harness's /workspace (carrying the executor's committed changes
+ * + any prior verdict/fix commits), render the prompt (reviewer.md for the first
+ * review, re-reviewer.md for a recheck), delegate the reviewer subagent task, and
+ * return its text (ending in the VERDICT marker the loop parses). NO GitHub post — this
+ * is an internal build review.
  */
 export async function runReviewerPhase(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   run: BuildRun,
   cycle: number,
   isRecheck: boolean,
@@ -711,6 +764,7 @@ export async function runReviewerPhase(
   const ref: RepoRef = { owner: run.owner, repo: run.repo };
   const token = await deps.mintToken(run);
   const octokit = deps.makeOctokit(token);
+  await deps.ensureCheckout(ctx.harness, run, token);
 
   const promptCtx = {
     owner: run.owner,
@@ -721,15 +775,9 @@ export async function runReviewerPhase(
   const prompt = isRecheck
     ? renderReReviewerPrompt(promptCtx, cycle)
     : renderReviewerPrompt(promptCtx);
-  const sessionName = `${isRecheck ? 'recheck' : 'reviewer'}:${cycle}`;
+  const phase = `${isRecheck ? 'recheck' : 'reviewer'}:${cycle}`;
 
-  const text = await withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
-    token,
-    (sandbox) =>
-      deps.runReviewerSession(ctx, ref, octokit, sandbox, prompt, sessionName),
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  const text = await deps.runReviewerSession(ctx, ref, octokit, prompt, phase);
 
   return {
     text,
@@ -749,65 +797,54 @@ export interface FixRunResult {
 }
 
 /**
- * Injectable seams for the fix phase, so the default `runPhase('fix:N')` is
- * testable OFFLINE. Mirrors the executor's seams (mint + octokit + sandbox ops +
- * session + sha read + the MOCKED push) — the fix is just a scoped re-implementation.
+ * Injectable seams for the fix phase, so the default `runPhase('fix:N')` is testable
+ * OFFLINE. Mirrors the executor's seams (mint + octokit + clone + task + sha + push).
  */
 export interface FixPhaseDeps {
   mintToken(run: BuildRun): Promise<string>;
   makeOctokit(token: string): Octokit;
-  sandboxOps: BuildSandboxOps;
+  ensureCheckout(harness: FlueHarness, run: BuildRun, token: string): Promise<void>;
   /**
-   * Run the fix agent session against the pre-cloned checkout (carrying the
+   * Delegate the fix subagent task against the shared checkout (carrying the
    * reviewer-verdict.md the agent reads) + the rendered fix prompt; returns its raw
    * text. The agent COMMITS its fixes in-sandbox via the git CLI but does NOT push.
    */
   runFixSession(
-    ctx: FlueContext<BuildInput>,
+    ctx: BuildRunCtx,
     ref: RepoRef,
     octokit: Octokit,
-    sandbox: SandboxFactory,
     prompt: string,
-    sessionName: string,
+    phase: string,
   ): Promise<string>;
   /** Read the branch HEAD sha after the fix committed (the recheck/PR anchor). */
-  readHeadSha(container: BuildContainer): Promise<string>;
-  /**
-   * Push the working branch to origin over the repo-write token (the controlled,
-   * workflow-owned side effect — a SEAM so tests assert it WOULD push, with the
-   * bound branch ref, WITHOUT a real push). Shares the executor's push contract.
-   */
-  pushBranch(container: BuildContainer, branch: string): Promise<void>;
+  readHeadSha(harness: FlueHarness): Promise<string>;
+  /** Push the working branch to origin (shares the executor's push contract). */
+  pushBranch(harness: FlueHarness, branch: string): Promise<void>;
 }
 
-/** The real fix run: init the agent, open the per-cycle named session, prompt it. */
+/** The real fix run: delegate to the build-fix subagent profile. */
 async function runFixSession(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   ref: RepoRef,
   octokit: Octokit,
-  sandbox: SandboxFactory,
   prompt: string,
-  sessionName: string,
+  phase: string,
 ): Promise<string> {
-  const agent = createFixAgent(ref, octokit, sandbox);
-  // Distinct harness name per phase (see runGuardrailsSession); the per-cycle
-  // `fix:N` sessionName is unique within an invocation.
-  const harness = await ctx.init(agent, { name: sessionName });
-  const session = await harness.session(sessionName);
-  const res = await runPhasePrompt(session, prompt, {
-    runId: ctx.payload.runId,
-    workflow: 'build',
-    phase: sessionName,
-  });
-  return res.text;
+  return runPhaseTask(
+    ctx,
+    BUILD_FIX_PROFILE_NAME,
+    phase,
+    prompt,
+    githubReadTools(ref, octokit),
+  );
 }
 
-/** Default fix-phase deps: real token mint + Octokit + Docker + session + sha + push. */
+/** Default fix-phase deps: real token mint + Octokit + clone + task + sha + push. */
 export function defaultFixPhaseDeps(): FixPhaseDeps {
   return {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
-    sandboxOps: defaultBuildSandboxOps(),
+    ensureCheckout: ensureBuildCheckout,
     runFixSession,
     readHeadSha,
     pushBranch,
@@ -815,18 +852,16 @@ export function defaultFixPhaseDeps(): FixPhaseDeps {
 }
 
 /**
- * Run a FIX phase (`fix:N`): mint a repo-write token, build an Octokit, create a
- * Docker sandbox with the repo pre-cloned at the working branch (carrying the
- * reviewer-verdict.md the agent reads — CALLER owns the container lifetime, torn
- * down in `withBuildSandbox`'s finally), build the fix agent on that sandbox (cwd
- * /workspace), render the fix prompt (it names the reviewer-verdict path so the
- * agent fixes ONLY the reported issues), run the session (the agent addresses the
- * notes + COMMITS in-sandbox via the git CLI), read the committed HEAD sha, then
- * PUSH the branch over the deterministic seam (mocked in tests). Returns the agent
- * text + the new sha (the recheck/PR anchor).
+ * Run a FIX phase (`fix:N`): mint a repo-write token, build an Octokit, ensure the repo
+ * is cloned into the coordinator harness's /workspace (carrying the reviewer-verdict.md
+ * the agent reads), render the fix prompt (it names the reviewer-verdict path so the
+ * agent fixes ONLY the reported issues), delegate the fix subagent task (the agent
+ * addresses the notes + COMMITS in-sandbox via the git CLI), read the committed HEAD
+ * sha, then PUSH the branch over the deterministic seam (mocked in tests). Returns the
+ * agent text + the new sha (the recheck/PR anchor).
  */
 export async function runFixPhase(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   run: BuildRun,
   cycle: number,
   deps: FixPhaseDeps = defaultFixPhaseDeps(),
@@ -834,26 +869,19 @@ export async function runFixPhase(
   const ref: RepoRef = { owner: run.owner, repo: run.repo };
   const token = await deps.mintToken(run);
   const octokit = deps.makeOctokit(token);
+  await deps.ensureCheckout(ctx.harness, run, token);
 
   const prompt = renderFixPrompt(
     { owner: run.owner, repo: run.repo, issue: run.issue, branch: run.branch },
     cycle,
   );
-  const sessionName = `fix:${cycle}`;
+  const phase = `fix:${cycle}`;
 
-  return withBuildSandbox(
-    { owner: run.owner, repo: run.repo, branch: run.branch, taskId: run.taskId },
-    token,
-    async (sandbox, container) => {
-      const text = await deps.runFixSession(ctx, ref, octokit, sandbox, prompt, sessionName);
-      const sha = await deps.readHeadSha(container);
-      // The CONTROLLED repo-write side effect: push the bound branch (mocked in
-      // tests). Live push is gated + run later with the user.
-      await deps.pushBranch(container, run.branch);
-      return { text, sha };
-    },
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  const text = await deps.runFixSession(ctx, ref, octokit, prompt, phase);
+  const sha = await deps.readHeadSha(ctx.harness);
+  // The CONTROLLED repo-write side effect: push the bound branch (mocked in tests).
+  await deps.pushBranch(ctx.harness, run.branch);
+  return { text, sha };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -883,13 +911,11 @@ function gateArtifactPath(run: BuildRun, gate: string): string {
 /**
  * Deterministically post the approval-gate ask (a GitHub ISSUE COMMENT) over the
  * scoped repo-write token. The owner/repo/issue are CLOSED OVER the bound run, NOT
- * model-chosen (mirrors github-post.ts). The body surfaces the artifact (plan /
- * verdict) + the approve/reject instructions the human resumes with. The workflow
- * guards the call (it posts once per gate hit via the run record's `pendingGate`);
- * the returned comment id is recorded for audit.
+ * model-chosen (mirrors github-post.ts). The workflow guards the call (it posts once
+ * per gate hit via the run record's `pendingGate`); the returned comment id is recorded.
  */
 export async function runPostGateComment(
-  ctx: FlueContext<BuildInput>,
+  _ctx: BuildRunCtx,
   run: BuildRun,
   gate: string,
   deps: GatePostDeps = defaultGatePostDeps(),
@@ -937,18 +963,12 @@ const PR_ARTIFACT_FILES = [
 ];
 
 /**
- * Deterministically open the PR (the finalize step) over the scoped repo-write
- * token. IDEMPOTENT: reuses an already-open PR for the working branch (a resumed /
- * retried run must NOT double-open). owner/repo/head/base come from the bound run +
- * the repo's default branch, NEVER the model. Renders the PR title/body
- * deterministically (the agent does NOT write the PR — design/phase-4 P3 rule).
- *
- * The reviewer-loop outcome is read from the run record: the loop ended APPROVED
- * iff the last cycle's recorded verdict was APPROVED (otherwise the body notes the
- * unresolved issues + the fix-cycle count).
+ * Deterministically open the PR (the finalize step) over the scoped repo-write token.
+ * IDEMPOTENT: reuses an already-open PR for the working branch. owner/repo/head/base
+ * come from the bound run + the repo's default branch, NEVER the model.
  */
 export async function runOpenPullRequest(
-  ctx: FlueContext<BuildInput>,
+  _ctx: BuildRunCtx,
   run: BuildRun,
   deps: OpenPrDeps = defaultOpenPrDeps(),
 ): Promise<{ html_url: string; number: number }> {
@@ -985,12 +1005,82 @@ export async function runOpenPullRequest(
   return { html_url: pr.html_url, number: pr.number };
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// PROGRESS REPORTER — the Phase 8 in-place egress notifier (best-effort).
+// ───────────────────────────────────────────────────────────────────────────
+
 /**
- * Default production deps. ALL build-workflow phase bodies + side effects are now
- * WIRED: guardrails / architect / executor / reviewer-loop (reviewer / fix /
- * recheck), the deterministic gate ask, and the deterministic open-PR. Each is
- * driven OFFLINE in tests via injected sub-deps; production uses the real token
- * mint + Octokit + Docker sandbox. Gate enablement is positive-enable from config.
+ * Build + seed the live progress reporter for a build run. Posts (and edits in
+ * place) ONE GitHub status comment on the originating issue, and mirrors to ONE
+ * Slack message when the run carries a Slack `conversationKey` + a bot token is
+ * configured. The in-place-update handles are read from / persisted to the run
+ * record's scratch (via `save`) so a RESUMED run re-attaches to the SAME
+ * surfaces instead of creating duplicates. Egress is best-effort: a failed
+ * token mint or transport degrades to {@link NULL_REPORTER}, never the spine.
+ */
+export async function makeBuildReporter(
+  ctx: BuildRunCtx,
+  run: BuildRun,
+  save: (patch: NotifierState) => void,
+): Promise<ProgressReporter> {
+  const cfg = loadConfig();
+  const transports: NotifierTransport[] = [];
+  const state = readNotifierState(run.scratch);
+
+  // GitHub surface — a build always has an originating issue. A token-mint
+  // failure must not break the build, so it just drops the GitHub transport.
+  try {
+    const token = await mintRepoWriteToken(run);
+    const octokit = new Octokit({ auth: token });
+    transports.push(
+      new GitHubTransport({
+        octokit,
+        owner: run.owner,
+        repo: run.repo,
+        issueNumber: run.issue,
+        commentId: state.githubCommentId,
+        save: (commentId) => save({ githubCommentId: commentId }),
+      }),
+    );
+  } catch (err: unknown) {
+    ctx.log.warn('build: notifier GitHub transport unavailable (continuing)', {
+      runId: run.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // Slack mirror — only when the run carries a Slack conversation AND a bot
+  // token is set (slackPosterFromConfig → undefined → no Slack egress). The run
+  // record's conversationKey isn't written until the first gate pause, so fall
+  // back to the input's (a Slack-triggered build mirrors from the first pass).
+  const slackKey = run.conversationKey ?? ctx.input.conversationKey;
+  const loc = slackKey ? parseSlackConversationKey(slackKey) : undefined;
+  const poster = loc ? slackPosterFromConfig() : undefined;
+  if (loc && poster) {
+    transports.push(
+      new SlackTransport({
+        poster,
+        channel: loc.channelId,
+        thread: loc.threadTs,
+        ts: state.slackTs,
+        save: (ts) => save({ slackTs: ts, slackChannel: loc.channelId, slackThread: loc.threadTs }),
+      }),
+    );
+  }
+
+  if (transports.length === 0) return NULL_REPORTER;
+  const reporter = new ProgressNotifier(transports);
+  const runUrl = runDashboardUrl(cfg.publicUrl, run.id, 'build');
+  await reporter.start(buildBuildModel(run, { runUrl }));
+  return reporter;
+}
+
+/**
+ * Default production deps. ALL build-workflow phase bodies + side effects are WIRED:
+ * guardrails / architect / executor / reviewer-loop (reviewer / fix / recheck), the
+ * deterministic gate ask, and the deterministic open-PR. Each is driven OFFLINE in
+ * tests via injected sub-deps; production delegates to the coordinator's subagent
+ * profiles. Gate enablement is positive-enable from config.
  */
 export function defaultBuildDeps(
   architectDeps: ArchitectPhaseDeps = defaultArchitectPhaseDeps(),
@@ -1019,7 +1109,6 @@ export function defaultBuildDeps(
           },
         };
       }
-      // The reviewer loop is keyed per-cycle (`reviewer:N` / `fix:N` / `recheck:N`).
       if (name.startsWith('reviewer:')) {
         return runReviewerPhase(ctx, run, cycleFromPhaseName(name), false, reviewerDeps);
       }
@@ -1043,9 +1132,8 @@ export function defaultBuildDeps(
     async openPullRequest(ctx, run): Promise<{ html_url: string; number: number }> {
       return runOpenPullRequest(ctx, run, openPrDeps);
     },
-    // Positive-enable from config: a gate fires only if `approval[gate] === true`
-    // (build.yaml parity — a disabled/absent gate falls through with no pause).
     gateEnabled: (gate) => loadConfig().approval?.[gate] === true,
     parseVerdict: (text) => parseReviewerVerdict(text),
+    makeReporter: makeBuildReporter,
   };
 }

@@ -31,9 +31,7 @@
  * reference's secondary accept-risk / false-positive branch clones the repo to edit
  * SECURITY.md and open a PR; that path is deferred — see src/security-feedback-post.ts.)
  */
-import { createAgent } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import securityFeedback from "../skills/security-feedback/SKILL.md" with { type: "skill" };
@@ -48,19 +46,22 @@ export const description =
 export const SECURITY_FEEDBACK_TASK_KEY = "security" as const;
 
 /**
- * Build the security-feedback agent bound to the scan issue's repo ref + read-scoped
- * Octokit. `ref`/`octokit` are closed over the read-tool factories (the model cannot widen
- * scope to another repo). No write tool is bound — the sub-issue creation / parent rewrite /
- * summary comment are done deterministically by the workflow. No sandbox: the create-issues
- * flow is tool-only.
+ * The security-feedback agent definition (beta.3: a static `defineAgent`, bound on the
+ * `security-feedback` workflow). Model/thinking/persona/skills are resolved in the
+ * initializer (env-dependent policy belongs here per the beta.3 contract — the
+ * initializer cannot see workflow input).
+ *
+ * SECURITY SPINE (unchanged): the agent carries NO write tools. The per-run READ-only
+ * GitHub tools are bound to (ref, scoped-token Octokit) in trusted workflow code and
+ * injected per-call via `session.prompt(prompt, { tools })`, so `owner`/`repo`/token are
+ * closed over and never model-selectable. No write tool is bound — the sub-issue creation /
+ * parent rewrite / summary comment are done deterministically by the workflow. No sandbox:
+ * the create-issues flow is tool-only.
  */
-export function createSecurityFeedbackAgent(ref: RepoRef, octokit: Octokit) {
-  return createAgent(() => ({
-    model: resolveModel(SECURITY_FEEDBACK_TASK_KEY),
-    thinkingLevel: resolveThinking(SECURITY_FEEDBACK_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [securityFeedback],
-    // NO sandbox / cwd — tool-only (classifies the comment against the parsed scan).
-  }));
-}
+export const securityFeedbackAgent = defineAgent(() => ({
+  model: resolveModel(SECURITY_FEEDBACK_TASK_KEY),
+  thinkingLevel: resolveThinking(SECURITY_FEEDBACK_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [securityFeedback],
+  // NO sandbox / cwd — tool-only. NO static tools — read tools injected per-call.
+}));

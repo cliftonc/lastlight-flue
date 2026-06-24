@@ -1,10 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runIssueTriage,
   type IssueTriageDeps,
   type IssueTriageInput,
+  type TriageRunCtx,
   type IssueContext,
 } from "../issue-triage.ts";
 import {
@@ -13,17 +13,17 @@ import {
   type TriageApplied,
 } from "../../triage-post.ts";
 
-function fakeCtx(payload: IssueTriageInput): FlueContext<IssueTriageInput> {
+function fakeCtx(payload: IssueTriageInput): TriageRunCtx {
   return {
     id: "test-run",
-    payload,
+    input: payload,
     env: {},
     req: undefined,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     init: vi.fn(async () => {
       throw new Error("init must not be called — runTriage is injected in tests");
     }),
-  } as unknown as FlueContext<IssueTriageInput>;
+  } as unknown as TriageRunCtx;
 }
 
 const ISSUE: IssueContext = {
@@ -41,7 +41,7 @@ function fakeDeps(opts: { output: string; issue?: IssueContext }) {
   let issueSeen: IssueContext | undefined;
   const runTriage = vi.fn(
     async (
-      _ctx: FlueContext<IssueTriageInput>,
+      _ctx: TriageRunCtx,
       _ref: IssueRef,
       _octokit: Octokit,
       issue: IssueContext,

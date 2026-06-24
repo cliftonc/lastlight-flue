@@ -29,6 +29,7 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { defineTool, type ToolDefinition } from "@flue/runtime";
+import * as v from "valibot";
 import { INTERNAL_HOSTNAMES, isPrivateOrInternalIp } from "../engine/egress-allowlist.ts";
 
 // ---------------------------------------------------------------------------
@@ -219,28 +220,25 @@ export function webSearch(opts: WebToolsOptions = {}): ToolDefinition {
     name: "web_search",
     description:
       "Search the public web for up-to-date information. Returns a ranked list of titles, URLs, and snippets. Use web_fetch to read a result's full page.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", minLength: 1, description: "The search query." },
-        count: {
-          type: "integer",
-          minimum: 1,
-          maximum: MAX_RESULT_COUNT,
-          description: `Number of results to return (default ${DEFAULT_RESULT_COUNT}).`,
-        },
-      },
-      required: ["query"],
-      additionalProperties: false,
-    },
-    async execute(args, signal) {
+    input: v.object({
+      query: v.pipe(v.string(), v.minLength(1), v.description("The search query.")),
+      count: v.optional(
+        v.pipe(
+          v.number(),
+          v.integer(),
+          v.minValue(1),
+          v.maxValue(MAX_RESULT_COUNT),
+          v.description(`Number of results to return (default ${DEFAULT_RESULT_COUNT}).`),
+        ),
+      ),
+    }),
+    async run({ input, signal }) {
       if (!selected) {
         return "web search unavailable (no provider key configured). Set TAVILY_API_KEY (or EXA_API_KEY / BRAVE_API_KEY) to enable it.";
       }
-      const query = String((args as { query: string }).query);
-      const rawCount = (args as { count?: number }).count;
+      const query = input.query;
       const count = Math.min(
-        Math.max(typeof rawCount === "number" ? rawCount : DEFAULT_RESULT_COUNT, 1),
+        Math.max(typeof input.count === "number" ? input.count : DEFAULT_RESULT_COUNT, 1),
         MAX_RESULT_COUNT,
       );
       try {
@@ -365,16 +363,11 @@ export function webFetch(opts: WebToolsOptions = {}): ToolDefinition {
     name: "web_fetch",
     description:
       "Fetch the text content of a public http(s) URL and return it (HTML cleaned to text, truncated). Refuses private/internal/metadata addresses.",
-    parameters: {
-      type: "object",
-      properties: {
-        url: { type: "string", minLength: 1, description: "The http(s) URL to fetch." },
-      },
-      required: ["url"],
-      additionalProperties: false,
-    },
-    async execute(args, signal) {
-      const raw = String((args as { url: string }).url);
+    input: v.object({
+      url: v.pipe(v.string(), v.minLength(1), v.description("The http(s) URL to fetch.")),
+    }),
+    async run({ input, signal }) {
+      const raw = input.url;
       const guard = await guardFetchUrl(raw, { resolveHost });
       if (!guard.ok) {
         return `web_fetch refused: ${guard.reason}. URL: ${raw}`;

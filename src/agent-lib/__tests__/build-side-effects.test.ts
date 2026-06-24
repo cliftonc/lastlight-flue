@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Octokit } from "octokit";
-import type { FlueContext } from "@flue/runtime";
+import type { FlueHarness } from "@flue/runtime";
 import {
   runPostGateComment,
   runOpenPullRequest,
   type GatePostDeps,
   type OpenPrDeps,
-  type BuildInput,
+  type BuildRunCtx,
 } from "../build-phases.ts";
 import type { BuildRun } from "../../build-run-store.ts";
 
@@ -31,11 +31,12 @@ const RUN: BuildRun = {
   failReason: null,
 };
 
-function ctx(): FlueContext<BuildInput> {
+function ctx(): BuildRunCtx {
   return {
-    payload: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
+    harness: { name: "default" } as unknown as FlueHarness,
+    input: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
     log: { info() {}, warn() {}, error() {} },
-  } as unknown as FlueContext<BuildInput>;
+  };
 }
 
 describe("runPostGateComment — mint → render → post the bound issue comment", () => {

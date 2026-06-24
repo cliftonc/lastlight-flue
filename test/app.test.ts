@@ -144,10 +144,10 @@ describe('admin reads with injected RunsReader (offline)', () => {
     workflowName: 'build',
     status: 'active',
     startedAt: '2026-06-21T10:00:00.000Z',
-    payload: { repo: 'owner/repo', issue: 7 },
+    input: { repo: 'owner/repo', issue: 7 },
   };
   const sampleAgents: AgentManifestEntry[] = [
-    { name: 'hello', transports: { http: true }, created: true },
+    { name: 'hello', transports: { http: true }, defined: true },
   ];
 
   function makeApp(overrides: Partial<RunsReader> = {}) {

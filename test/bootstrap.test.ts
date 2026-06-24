@@ -1,25 +1,24 @@
 import { describe, it, expect } from 'vitest';
 
-// Bootstrap smoke test: pins the *installed* @flue/runtime 1.0.0-beta.2 API
-// surface so the drift recorded in spec/flue-reference.md §0 is an executable
-// regression guard. The design docs were researched against `withastro/flue@main`
-// (ahead of the pinned package) and assumed `defineAgent` / `defineWorkflow` /
-// top-level `invoke`; the installed beta.2 uses `createAgent`, a file-based
-// `run()` workflow form, and `defineConfig` from `@flue/cli/config`. If a future
-// `pnpm update` flips these, this test fails loudly instead of silently.
+// Bootstrap smoke test: pins the *installed* @flue/runtime 1.0.0-beta.3 API
+// surface as an executable regression guard. beta.3 landed the primitives the
+// design docs always assumed — `defineAgent`, `defineAgentProfile`,
+// `defineWorkflow`, and a top-level `invoke` — alongside the still-present
+// `createAgent` (now a deprecated alias) / `dispatch` / `defineTool`. If a future
+// `pnpm update` regresses these, this test fails loudly instead of silently.
 
-describe('installed @flue/runtime beta.2 API surface', () => {
-  it('exports createAgent (not defineAgent) from the main entry', async () => {
+describe('installed @flue/runtime beta.3 API surface', () => {
+  it('exports the beta.3 define* primitives + invoke from the main entry', async () => {
     const runtime = await import('@flue/runtime');
+    // Still present (createAgent is now a deprecated alias for defineAgent).
     expect(runtime).toHaveProperty('createAgent');
     expect(runtime).toHaveProperty('dispatch');
     expect(runtime).toHaveProperty('defineTool');
+    // beta.3 primitives the migration relies on.
+    expect(runtime).toHaveProperty('defineAgent');
     expect(runtime).toHaveProperty('defineAgentProfile');
-    // Drift markers: these were assumed present by the design docs but are NOT
-    // in the installed beta.2 main export.
-    expect(runtime).not.toHaveProperty('defineAgent');
-    expect(runtime).not.toHaveProperty('defineWorkflow');
-    expect(runtime).not.toHaveProperty('invoke');
+    expect(runtime).toHaveProperty('defineWorkflow');
+    expect(runtime).toHaveProperty('invoke');
   });
 
   it('exports defineConfig from @flue/cli/config', async () => {

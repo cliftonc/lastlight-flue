@@ -121,10 +121,12 @@ export async function routeEvent(
   }
 
   // Default — chat. The per-thread conversation key IS the durable session id.
+  // `messageTs` (the triggering message ts) rides along so the admit step can put a
+  // 👀 reaction on the user's actual message when the Assistant status isn't available.
   return {
     action: "chat",
     id: ev.conversationKey,
-    input: { text: body, sender: ev.sender, source: "slack" },
+    input: { text: body, sender: ev.sender, source: "slack", messageTs: ev.id },
   };
 }
 

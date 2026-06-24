@@ -50,6 +50,8 @@ import { screenEvent, SlackEventDedupe } from "../agent-lib/slack-screener.ts";
 import { toLastLightEvent } from "../agent-lib/slack-mapper.ts";
 import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
 import { recordThreadActivity } from "../agent-lib/record-thread.ts";
+import { slackPosterFromConfig } from "../slack-client.ts";
+import { showSlackThinking } from "../agent-lib/slack-thinking.ts";
 import {
   routeEvent,
   routeCommand,
@@ -157,6 +159,16 @@ function defaultDispatchDeps(): SlackDispatchDeps {
       // recorder seam): a write failure never blocks the dispatch, and it's a no-op
       // under tests unless a fake recorder is injected.
       recordThreadActivity(id);
+      // Show the "Thinking…" indicator the instant the turn is admitted: the
+      // Assistant-pane status (anchored on the thread root = `id`'s thread ts), or
+      // a 👀 reaction on the user's actual message when the Assistant API isn't
+      // available (a regular channel). Fire-and-forget + best-effort so it never
+      // delays dispatch / the <3s ack. The relay clears it when the turn finishes.
+      const poster = slackPosterFromConfig();
+      if (poster) {
+        const messageTs = typeof input.messageTs === "string" ? input.messageTs : undefined;
+        void showSlackThinking(poster, id, messageTs);
+      }
       // The chat agent's instance == the thread; `id` IS the durable session key.
       await dispatch(chatAgent, { id, input });
     },

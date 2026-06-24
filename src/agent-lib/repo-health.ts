@@ -31,9 +31,7 @@
  * per-repo tracking issue — the create/update side effect is deliberately NOT a model
  * tool, mirroring the answer/triage/issue-comment deterministic-post splits.
  */
-import { createAgent } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import repoHealth from "../skills/repo-health/SKILL.md" with { type: "skill" };
@@ -45,21 +43,20 @@ export const description =
 export const HEALTH_TASK_KEY = "health" as const;
 
 /**
- * Build the repo-health agent bound to a specific repo ref + read-scoped Octokit.
+ * The repo-health agent definition (beta.3: a static `defineAgent`, bound on the
+ * `repo-health` workflow). Model/thinking/persona/skills resolved in the
+ * initializer. The AGENT only ever calls READ tools — the tracking-issue
+ * create/update happens deterministically in the workflow.
  *
- * The Octokit is authenticated with the run's scoped token; the AGENT only ever calls
- * READ tools — the tracking-issue create/update happens deterministically in the
- * workflow. Both `ref` and `octokit` are closed over the tool factories, so the model
- * cannot widen scope to another repo. No sandbox (tool-only — the skill gathers metrics
- * entirely via `github_*` reads).
+ * SECURITY SPINE (unchanged): the per-run READ-only GitHub tools are bound to
+ * (ref, scoped-token Octokit) in trusted workflow code and injected per-call via
+ * `session.prompt(_, { tools })`, so owner/repo/token are never model-selectable.
+ * No sandbox (tool-only — the skill gathers metrics entirely via `github_*` reads).
  */
-export function createHealthAgent(ref: RepoRef, octokit: Octokit) {
-  return createAgent(() => ({
-    model: resolveModel(HEALTH_TASK_KEY),
-    thinkingLevel: resolveThinking(HEALTH_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [repoHealth],
-    // NO sandbox / cwd — tool-only (reads repo state via bound github tools).
-  }));
-}
+export const healthAgent = defineAgent(() => ({
+  model: resolveModel(HEALTH_TASK_KEY),
+  thinkingLevel: resolveThinking(HEALTH_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [repoHealth],
+  // NO sandbox / cwd — tool-only. NO static tools — read tools injected per-call.
+}));

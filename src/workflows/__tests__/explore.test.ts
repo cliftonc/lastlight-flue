@@ -2,16 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FlueContext } from "@flue/runtime";
 import { runExplore } from "../explore.ts";
 import { ExploreRunStore } from "../../explore-run-store.ts";
 import { resumeExplore, recoverOrphanExploreRuns } from "../../resume-explore.ts";
 import {
   type ExploreInput,
+  type ExploreRunCtx,
   type ExploreDeps,
   type ExploreResult,
   isReadyMarker,
 } from "../../agent-lib/explore-phases.ts";
+import { NULL_REPORTER } from "../../notify/state.ts";
+import type { NotifierState, ProgressReporter } from "../../notify/types.ts";
 
 // Phase 5 — explore Socratic-loop CONTROL FLOW tests (offline; NO live model / web /
 // GitHub). Mirrors build.test.ts: a real ExploreRunStore on a TEMP sqlite db + a fake
@@ -43,12 +45,14 @@ const INPUT: Omit<ExploreInput, "resumedGate"> = {
   issueBody: "We need to throttle the API.",
 };
 
-function ctx(input: ExploreInput): FlueContext<ExploreInput> {
+function ctx(input: ExploreInput): ExploreRunCtx {
+  // Control-flow tests use the top-level ExploreDeps fake (runPhase ignores the
+  // harness), so a stub harness is sufficient here.
   return {
-    payload: input,
-    init: async () => ({}),
+    harness: { name: "default" } as unknown as ExploreRunCtx["harness"],
+    input,
     log: { info() {}, warn() {}, error() {} },
-  } as unknown as FlueContext<ExploreInput>;
+  };
 }
 
 /**
@@ -306,6 +310,73 @@ describe("explore — boot orphan recovery", () => {
     });
     expect(recovered).toEqual(["active-run"]);
     expect(reinvoked).toEqual(["active-run"]);
+  });
+});
+
+describe("explore — Phase 8 progress reporter wiring", () => {
+  function recordingReporter() {
+    const calls: string[] = [];
+    const reporter: ProgressReporter = {
+      async start() { calls.push("start"); },
+      async step(key, status) { calls.push(`step:${key}:${status}`); },
+      async insertStep(s) { calls.push(`insert:${s.key}:${s.status}`); },
+      async note() { calls.push("note"); },
+      async noteTerminal() { calls.push("noteTerminal"); },
+    };
+    return { reporter, calls };
+  }
+
+  it("drives read→ask→synthesize→publish on a READY-first run, pinging on completion", async () => {
+    // ask:0 returns READY → no reply gate → straight through to publish.
+    const t = recordingDeps({ askOutputs: { 0: "Enough signal.\nREADY" } });
+    const r = recordingReporter();
+    const res = await runExplore(ctx({ ...INPUT }), store, {
+      ...t.deps,
+      makeReporter: async () => r.reporter,
+    });
+    expect(res.status).toBe("complete");
+    expect(r.calls).toEqual([
+      "step:read:running",
+      "step:read:done",
+      "insert:ask:0:running",
+      "step:ask:0:done",
+      "step:synthesize:running",
+      "step:synthesize:done",
+      "step:publish:running",
+      "step:publish:done",
+      "noteTerminal",
+    ]);
+  });
+
+  it("marks the ask round awaiting + pings on a reply-gate pause", async () => {
+    const t = recordingDeps(); // ask:0 poses a question → pause @ reply:0
+    const r = recordingReporter();
+    const res = await runExplore(ctx({ ...INPUT }), store, {
+      ...t.deps,
+      makeReporter: async () => r.reporter,
+    });
+    expect(res.status).toBe("paused");
+    expect(r.calls).toEqual([
+      "step:read:running",
+      "step:read:done",
+      "insert:ask:0:running",
+      "step:ask:0:awaiting",
+      "noteTerminal",
+    ]);
+  });
+
+  it("persists the NotifierState handles to scratch so a resume re-attaches the surface", async () => {
+    const t = recordingDeps();
+    const makeReporter = async (
+      _c: ExploreRunCtx,
+      _r: unknown,
+      save: (patch: NotifierState) => void,
+    ): Promise<ProgressReporter> => {
+      save({ githubCommentId: 7373 });
+      return NULL_REPORTER;
+    };
+    await runExplore(ctx({ ...INPUT }), store, { ...t.deps, makeReporter });
+    expect(store.get(INPUT.runId)!.scratch["notifier:githubCommentId"]).toBe("7373");
   });
 });
 

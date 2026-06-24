@@ -27,14 +27,20 @@
  * STUBBED by default. Real builder-agent sessions + live PR creation are LATER
  * Phase-4 slices — see TODO(phase-4/…). NO live model / GitHub / repo writes here.
  *
- * Beta.2 form: `export async function run(ctx)` (NO defineWorkflow; flue-reference §0).
+ * Beta.3 form: `export default defineWorkflow({ agent: buildAgent, input, run })`. The
+ * bound coordinator agent owns a self-terminating Docker sandbox; the phases delegate
+ * to its subagent profiles via `session.task`. `ctx.payload`→`input`; `ctx.init`→the
+ * supplied `harness`. The app-owned `BuildRunStore` gate/durability is UNCHANGED.
  */
-import type { FlueContext } from '@flue/runtime';
+import { defineWorkflow, type JsonValue } from '@flue/runtime';
 import { BuildRunStore, MAX_RESTART_RESUMES, type GateName } from '../build-run-store.ts';
 import {
   type BuildInput,
   type BuildResult,
+  type BuildRunCtx,
   type BuildDeps,
+  BuildInputSchema,
+  buildAgent,
   MAX_CYCLES,
   ARCHITECT_PLAN_SCRATCH_KEY,
   PR_NUMBER_SCRATCH_KEY,
@@ -43,7 +49,10 @@ import {
   bootstrapBypass,
 } from '../agent-lib/build-phases.ts';
 import { architectPlanPath } from '../agent-lib/architect-prompt.ts';
-import { closeBuildWorkspace } from '../agent-lib/build-sandbox.ts';
+import { reviewerLoopRow } from '../agent-lib/build-notify.ts';
+import { NULL_REPORTER, notifierStatePatch } from '../notify/state.ts';
+import type { NotifierState, ProgressReporter } from '../notify/types.ts';
+import type { BuildRun } from '../build-run-store.ts';
 
 export type { BuildInput, BuildResult } from '../agent-lib/build-phases.ts';
 
@@ -62,16 +71,50 @@ function seedFrom(input: BuildInput) {
 }
 
 /**
+ * Build the Phase-8 progress reporter for this run, best-effort: any failure
+ * (missing dep, token mint, transport) degrades to {@link NULL_REPORTER} so the
+ * egress notifier can NEVER break the durable control-flow spine.
+ */
+async function makeReporterSafe(
+  deps: BuildDeps,
+  ctx: BuildRunCtx,
+  run: BuildRun,
+  save: (patch: NotifierState) => void,
+): Promise<ProgressReporter> {
+  if (!deps.makeReporter) return NULL_REPORTER;
+  try {
+    return await deps.makeReporter(ctx, run, save);
+  } catch (err: unknown) {
+    ctx.log.warn('build: progress reporter unavailable (continuing)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return NULL_REPORTER;
+  }
+}
+
+/**
+ * A short approval-gate ping. Routed via `reporter.noteTerminal` so it reaches
+ * ONLY surfaces that have no other signal (Slack) — GitHub already gets the
+ * deterministic gate comment (`postGateComment`), so this never double-posts there.
+ */
+function gatePing(gate: string, run: BuildRun): string {
+  return (
+    `⏸️ Approval needed for **build #${run.issue}** at \`${gate}\` — ` +
+    'reply `@last-light approve` or `@last-light reject [reason]`.'
+  );
+}
+
+/**
  * The testable core. Drives the full durable control flow over an injected
  * `BuildRunStore` + `BuildDeps`. Production wraps this in `run()` with the default
  * store + stubbed deps; tests pass a temp-sqlite store + fake phase bodies.
  */
 export async function runBuild(
-  ctx: FlueContext<BuildInput>,
+  ctx: BuildRunCtx,
   store: BuildRunStore,
   deps: BuildDeps = defaultBuildDeps(),
 ): Promise<BuildResult> {
-  const input = ctx.payload;
+  const input = ctx.input;
   const id = input.runId;
   let run = store.getOrCreate(id, seedFrom(input));
 
@@ -92,17 +135,29 @@ export async function runBuild(
   }
   run = store.get(id)!;
 
+  // ── progress notifier (Phase 8 egress, best-effort) ──────────────────────────
+  // Build + SEED the in-place checklist surface(s) for this run. Constructed AFTER
+  // the breaker/clear so the seed reflects the current phasesDone (a RESUME re-
+  // attaches to the SAME comment/message via the handles persisted in scratch, and
+  // re-seeds completed rows). Strictly best-effort — never the durable spine.
+  const reporter = await makeReporterSafe(deps, ctx, run, (patch) =>
+    store.recordScratch(id, notifierStatePatch(patch)),
+  );
+
   // ── guardrails (skipped if done) ─────────────────────────────────────────────
   // The screen emits READY / BLOCKED. A BLOCKED stops the build UNLESS the issue is
   // a bootstrap task (the `lastlight:bootstrap` label / a `guardrails:` title prefix)
   // — then the BLOCK is bypassed so the executor can ESTABLISH the missing tooling
   // (parity with build.yaml `contains_BLOCKED.unless_label`/`unless_title_matches`).
   if (store.shouldRunPhase(run, 'guardrails')) {
+    await reporter.step('guardrails', 'running');
     const g = await deps.runPhase(ctx, run, 'guardrails');
     if (/^\s*BLOCKED/im.test(g.text) && !bootstrapBypass(input.issueContext)) {
+      await reporter.step('guardrails', 'failed', 'BLOCKED');
       store.fail(id, 'guardrails-blocked');
       return { status: 'failed', reason: 'guardrails-blocked' };
     }
+    await reporter.step('guardrails', 'done');
     store.markPhaseDone(id, 'guardrails', g.scratch);
     run = store.get(id)!;
   }
@@ -113,7 +168,9 @@ export async function runBuild(
   // split rule — never the plan blob), so the executor reads it from the checkout
   // and the post_architect gate can surface it to the human.
   if (store.shouldRunPhase(run, 'architect')) {
+    await reporter.step('architect', 'running');
     await deps.runPhase(ctx, run, 'architect');
+    await reporter.step('architect', 'done');
     store.markPhaseDone(id, 'architect', {
       [ARCHITECT_PLAN_SCRATCH_KEY]: architectPlanPath(run.issue),
     });
@@ -134,6 +191,8 @@ export async function runBuild(
       if (posted?.commentId !== undefined) {
         store.recordScratch(id, { [gateCommentScratchKey('post_architect')]: String(posted.commentId) });
       }
+      // Ping the silent surfaces (Slack) — GitHub already has the gate comment.
+      await reporter.noteTerminal(gatePing('post_architect', run));
     }
     return { status: 'paused', gate: 'post_architect' };
   }
@@ -144,7 +203,9 @@ export async function runBuild(
   // result carries scratch POINTERS (the executor-summary file path + the commit
   // sha — never the diff blob; spec/10) that anchor the reviewer/PR phases.
   if (store.shouldRunPhase(run, 'executor')) {
+    await reporter.step('executor', 'running');
     const ex = await deps.runPhase(ctx, run, 'executor');
+    await reporter.step('executor', 'done');
     store.markPhaseDone(id, 'executor', ex.scratch);
     run = store.get(id)!;
   }
@@ -157,7 +218,9 @@ export async function runBuild(
     const reviewerPhase = `reviewer:${cycle}`;
     let verdictText: string;
     if (store.shouldRunPhase(run, reviewerPhase)) {
+      await reporter.insertStep(reviewerLoopRow(reviewerPhase, 'running'), 'pr');
       const rv = await deps.runPhase(ctx, run, reviewerPhase);
+      await reporter.step(reviewerPhase, 'done');
       verdictText = rv.text;
       // Record the verdict text (→ the gate + recovered on a re-invoke) alongside
       // any scratch POINTER the phase produced (the reviewer-verdict.md path; spec/10).
@@ -185,6 +248,7 @@ export async function runBuild(
         if (posted?.commentId !== undefined) {
           store.recordScratch(id, { [gateCommentScratchKey(reviewerGate)]: String(posted.commentId) });
         }
+        await reporter.noteTerminal(gatePing(reviewerGate, run));
       }
       return { status: 'paused', gate: reviewerGate };
     }
@@ -196,13 +260,17 @@ export async function runBuild(
     // as scratch context only — it does NOT pre-seed the next cycle's verdict.
     const fixPhase = `fix:${cycle}`;
     if (store.shouldRunPhase(run, fixPhase)) {
+      await reporter.insertStep(reviewerLoopRow(fixPhase, 'running'), 'pr');
       const fx = await deps.runPhase(ctx, run, fixPhase);
+      await reporter.step(fixPhase, 'done');
       store.markPhaseDone(id, fixPhase, fx.scratch);
       run = store.get(id)!;
     }
     const recheckPhase = `recheck:${cycle}`;
     if (store.shouldRunPhase(run, recheckPhase)) {
+      await reporter.insertStep(reviewerLoopRow(recheckPhase, 'running'), 'pr');
       const rc = await deps.runPhase(ctx, run, recheckPhase);
+      await reporter.step(recheckPhase, 'done');
       store.markPhaseDone(id, recheckPhase, {
         ...rc.scratch,
         [`recheckVerdict:${cycle}`]: rc.text,
@@ -218,11 +286,15 @@ export async function runBuild(
   // already opened the PR, and `openPullRequest` itself reuses an already-open PR
   // for the branch (so even a re-invoke that lost the `pr` flag won't double-open).
   if (store.shouldRunPhase(run, 'pr')) {
+    await reporter.step('pr', 'running');
     const pr = await deps.openPullRequest(ctx, run);
     const prScratch: Record<string, string> = { prUrl: pr.html_url };
     if (pr.number !== undefined) prScratch[PR_NUMBER_SCRATCH_KEY] = String(pr.number);
     store.markPhaseDone(id, 'pr', prScratch);
     store.complete(id);
+    const prRef = pr.number !== undefined ? `#${pr.number}` : 'opened';
+    await reporter.step('pr', 'done', `[${prRef}](${pr.html_url})`);
+    await reporter.noteTerminal(`✅ build #${run.issue} complete — PR: ${pr.html_url}`);
     return { status: 'complete', prUrl: pr.html_url };
   }
 
@@ -230,16 +302,20 @@ export async function runBuild(
   return { status: 'complete', prUrl: run.scratch.prUrl };
 }
 
-/** Flue workflow entry — discovered as the `build` workflow. */
-export async function run(ctx: FlueContext<BuildInput>): Promise<BuildResult> {
-  const store = new BuildRunStore(storePath());
-  const { taskId } = seedFrom(ctx.payload);
-  try {
-    return await runBuild(ctx, store);
-  } finally {
-    store.close();
-    // Tear down the shared per-run workspace container (created lazily by the
-    // first phase; one per taskId, reused across phases). Best-effort.
-    await closeBuildWorkspace(taskId, ctx.log);
-  }
-}
+/**
+ * Flue workflow — discovered as the `build` workflow. The coordinator's
+ * `dockerSandbox()` self-terminates (`--rm` + ttl), so there is NO container teardown
+ * here (beta.3 offers no sandbox teardown hook); only the run-store is closed.
+ */
+export default defineWorkflow({
+  agent: buildAgent,
+  input: BuildInputSchema,
+  async run({ harness, input, log }): Promise<JsonValue> {
+    const store = new BuildRunStore(storePath());
+    try {
+      return (await runBuild({ harness, input, log }, store)) as unknown as JsonValue;
+    } finally {
+      store.close();
+    }
+  },
+});

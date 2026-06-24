@@ -9,10 +9,10 @@
  *
  * SECURITY MODEL (non-negotiable, spec/09-sandbox.md + design):
  *   - The scoped token, owner, repo, and any GitHub IDs are baked into each
- *     tool's `execute` closure. They are NEVER model-selectable `parameters`.
+ *     tool's `run` closure. They are NEVER model-selectable `input` fields.
  *   - The model only supplies safe payload fields: a comment `body`, a reaction
- *     `content` enum, a review event/body, an issue title/body. Every schema is
- *     `additionalProperties: false` and exposes only those fields.
+ *     `content` enum, a review event/body, an issue title/body. Every schema
+ *     exposes only those fields.
  *   - Profile gating is DEFENSE IN DEPTH beside the token scope: write tools are
  *     only constructed when the `GitAccessProfile` permits them, so a read-scoped
  *     agent literally has no mutating tool to call (matching the downscoped
@@ -22,6 +22,7 @@
  * sandbox git CLI under container isolation (spec/09), not a model-callable tool.
  */
 import { defineTool, type ToolDefinition } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import type { GitAccessProfile } from "../engine/profiles.ts";
 import { githubReadTools, type RepoRef } from "./github-read.ts";
@@ -41,9 +42,7 @@ const REACTION_CONTENTS = [
 ] as const;
 type ReactionContent = (typeof REACTION_CONTENTS)[number];
 
-function ok(value: unknown): string {
-  return JSON.stringify(value, null, 2);
-}
+const issueNumber = v.pipe(v.number(), v.integer(), v.minValue(1));
 
 // ---------------------------------------------------------------------------
 // Write tool factories. Each closes over (ref, octokit) — owner/repo/token are
@@ -55,23 +54,18 @@ export function commentOnIssue(ref: RepoRef, octokit: Octokit): ToolDefinition {
   return defineTool({
     name: "github_comment_on_issue",
     description: "Post a new comment on an issue or pull request in the bound repository.",
-    parameters: {
-      type: "object",
-      properties: {
-        issue_number: { type: "integer", minimum: 1 },
-        body: { type: "string", minLength: 1 },
-      },
-      required: ["issue_number", "body"],
-      additionalProperties: false,
-    },
-    async execute(args) {
+    input: v.object({
+      issue_number: issueNumber,
+      body: v.pipe(v.string(), v.minLength(1)),
+    }),
+    async run({ input }) {
       const { data } = await octokit.rest.issues.createComment({
         owner: ref.owner,
         repo: ref.repo,
-        issue_number: args.issue_number as number,
-        body: args.body as string,
+        issue_number: input.issue_number,
+        body: input.body,
       });
-      return ok({ id: data.id, html_url: data.html_url });
+      return { id: data.id, html_url: data.html_url };
     },
   });
 }
@@ -81,23 +75,18 @@ export function reactToComment(ref: RepoRef, octokit: Octokit): ToolDefinition {
   return defineTool({
     name: "github_react_to_comment",
     description: "Add an emoji reaction to an issue/PR comment in the bound repository.",
-    parameters: {
-      type: "object",
-      properties: {
-        comment_id: { type: "integer", minimum: 1 },
-        content: { type: "string", enum: [...REACTION_CONTENTS] },
-      },
-      required: ["comment_id", "content"],
-      additionalProperties: false,
-    },
-    async execute(args) {
+    input: v.object({
+      comment_id: v.pipe(v.number(), v.integer(), v.minValue(1)),
+      content: v.picklist(REACTION_CONTENTS),
+    }),
+    async run({ input }) {
       const { data } = await octokit.rest.reactions.createForIssueComment({
         owner: ref.owner,
         repo: ref.repo,
-        comment_id: args.comment_id as number,
-        content: args.content as ReactionContent,
+        comment_id: input.comment_id,
+        content: input.content as ReactionContent,
       });
-      return ok({ id: data.id, content: data.content });
+      return { id: data.id, content: data.content };
     },
   });
 }
@@ -107,23 +96,18 @@ export function reactToIssue(ref: RepoRef, octokit: Octokit): ToolDefinition {
   return defineTool({
     name: "github_react_to_issue",
     description: "Add an emoji reaction to an issue or pull request in the bound repository.",
-    parameters: {
-      type: "object",
-      properties: {
-        issue_number: { type: "integer", minimum: 1 },
-        content: { type: "string", enum: [...REACTION_CONTENTS] },
-      },
-      required: ["issue_number", "content"],
-      additionalProperties: false,
-    },
-    async execute(args) {
+    input: v.object({
+      issue_number: issueNumber,
+      content: v.picklist(REACTION_CONTENTS),
+    }),
+    async run({ input }) {
       const { data } = await octokit.rest.reactions.createForIssue({
         owner: ref.owner,
         repo: ref.repo,
-        issue_number: args.issue_number as number,
-        content: args.content as ReactionContent,
+        issue_number: input.issue_number,
+        content: input.content as ReactionContent,
       });
-      return ok({ id: data.id, content: data.content });
+      return { id: data.id, content: data.content };
     },
   });
 }
@@ -133,25 +117,20 @@ export function createIssue(ref: RepoRef, octokit: Octokit): ToolDefinition {
   return defineTool({
     name: "github_create_issue",
     description: "Open a new issue in the bound repository.",
-    parameters: {
-      type: "object",
-      properties: {
-        title: { type: "string", minLength: 1 },
-        body: { type: "string" },
-        labels: { type: "array", items: { type: "string" } },
-      },
-      required: ["title"],
-      additionalProperties: false,
-    },
-    async execute(args) {
+    input: v.object({
+      title: v.pipe(v.string(), v.minLength(1)),
+      body: v.optional(v.string()),
+      labels: v.optional(v.array(v.string())),
+    }),
+    async run({ input }) {
       const { data } = await octokit.rest.issues.create({
         owner: ref.owner,
         repo: ref.repo,
-        title: args.title as string,
-        body: args.body as string | undefined,
-        labels: args.labels as string[] | undefined,
+        title: input.title,
+        body: input.body,
+        labels: input.labels,
       });
-      return ok({ number: data.number, html_url: data.html_url });
+      return { number: data.number, html_url: data.html_url };
     },
   });
 }
@@ -162,25 +141,20 @@ export function createReview(ref: RepoRef, octokit: Octokit): ToolDefinition {
     name: "github_create_review",
     description:
       "Submit a review on a pull request in the bound repository (APPROVE / REQUEST_CHANGES / COMMENT).",
-    parameters: {
-      type: "object",
-      properties: {
-        pull_number: { type: "integer", minimum: 1 },
-        event: { type: "string", enum: ["APPROVE", "REQUEST_CHANGES", "COMMENT"] },
-        body: { type: "string" },
-      },
-      required: ["pull_number", "event"],
-      additionalProperties: false,
-    },
-    async execute(args) {
+    input: v.object({
+      pull_number: v.pipe(v.number(), v.integer(), v.minValue(1)),
+      event: v.picklist(["APPROVE", "REQUEST_CHANGES", "COMMENT"]),
+      body: v.optional(v.string()),
+    }),
+    async run({ input }) {
       const { data } = await octokit.rest.pulls.createReview({
         owner: ref.owner,
         repo: ref.repo,
-        pull_number: args.pull_number as number,
-        event: args.event as "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
-        body: args.body as string | undefined,
+        pull_number: input.pull_number,
+        event: input.event as "APPROVE" | "REQUEST_CHANGES" | "COMMENT",
+        body: input.body,
       });
-      return ok({ id: data.id, state: data.state, html_url: data.html_url });
+      return { id: data.id, state: data.state, html_url: data.html_url };
     },
   });
 }

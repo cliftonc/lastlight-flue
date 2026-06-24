@@ -43,7 +43,7 @@ const defaultStorePath = () =>
 /** Default production re-invoker: spawn a fresh `flue run explore` with the gate token. */
 function defaultReinvoke(input: ExploreInput): ExploreReinvoker {
   return async () => {
-    await exec("pnpm", ["exec", "flue", "run", "explore", "--payload", JSON.stringify(input)], {
+    await exec("pnpm", ["exec", "flue", "run", "explore", "--input", JSON.stringify(input)], {
       timeout: 600_000,
     });
   };

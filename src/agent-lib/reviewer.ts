@@ -33,10 +33,7 @@
  * clone reaches github.com over the open network). Do NOT run untrusted input
  * through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import prReview from "../skills/pr-review/SKILL.md" with { type: "skill" };
@@ -49,32 +46,24 @@ export const description =
 /** The task key both `resolveModel` and `resolveThinking` read for this phase. */
 export const REVIEW_TASK_KEY = "review" as const;
 
-/** The working directory the PR is pre-cloned into (matches docker.ts WORKSPACE). */
-export const REVIEWER_CWD = "/workspace" as const;
-
 /**
- * Build the reviewer agent bound to a specific PR's repo ref + read-scoped Octokit.
+ * The PR-review reviewer agent (beta.3: a static `defineAgent`, bound on the
+ * `pr-review` workflow). Reviews the PR via the bound READ tools (injected
+ * per-call in the workflow) + the PR diff; emits a `VERDICT:` marker. The
+ * WORKFLOW posts the review deterministically — the review-submit action is
+ * deliberately NOT a model tool.
  *
- * The Octokit is authenticated with the run's scoped token (review-write profile,
- * but the agent only ever calls READ tools); both `ref` and `octokit` are closed
- * over the tool factories, so the model cannot widen scope.
+ * SECURITY SPINE (unchanged): per-run read tools are bound to (ref, scoped-token
+ * Octokit) in workflow code and injected via `session.prompt(_, { tools })`.
  *
- * When `sandbox` is supplied (a `docker(container)` factory whose container the
- * CALLER created + pre-cloned the PR into), the agent also gets `cwd: /workspace`
- * so its bash/file tools operate on the checked-out code. When omitted, the agent
- * is tool-only (the proven path) — both forms are valid.
+ * SANDBOX: this migration runs the reviewer TOOL-ONLY (the beta.2 additive Docker
+ * checkout is dropped for now; the tool-only path was already the proven fallback).
+ * TODO(phase-F/sandbox): optionally re-add `sandbox: dockerSandbox()` + a PR-head
+ * clone in the workflow `run()` so the reviewer can inspect checked-out files.
  */
-export function createReviewerAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox?: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(REVIEW_TASK_KEY),
-    thinkingLevel: resolveThinking(REVIEW_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [prReview, building, codeReview],
-    ...(sandbox ? { sandbox, cwd: REVIEWER_CWD } : {}),
-  }));
-}
+export const reviewerAgent = defineAgent(() => ({
+  model: resolveModel(REVIEW_TASK_KEY),
+  thinkingLevel: resolveThinking(REVIEW_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [prReview, building, codeReview],
+}));

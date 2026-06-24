@@ -49,7 +49,8 @@
  * The default deps wire the real implementations; tests pass fakes so the whole flow runs
  * with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -57,7 +58,7 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createSecurityFeedbackAgent } from "../agent-lib/security-feedback.ts";
+import { securityFeedbackAgent } from "../agent-lib/security-feedback.ts";
 import {
   renderSecurityFeedbackPrompt,
   type SecurityFeedbackPromptContext,
@@ -77,20 +78,35 @@ import {
   postFeedbackReply,
   type FeedbackCreateResult,
 } from "../security-feedback-post.ts";
-import type { RepoRef } from "../tools/github-read.ts";
+import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
 
 /** The workflow input payload (identifies the scan issue + the triggering comment). */
-export interface SecurityFeedbackInput {
-  owner: string;
-  repo: string;
+export const SecurityFeedbackInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
   /** The security scan-summary (parent) issue number. */
-  issueNumber: number;
+  issueNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** The triggering comment body — the maintainer's request. */
-  commentBody: string;
+  commentBody: v.string(),
   /** Who wrote the triggering comment (the @{sender} in sub-issue bodies / summaries). */
-  sender?: string;
+  sender: v.optional(v.string()),
   /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type SecurityFeedbackInput = v.InferOutput<typeof SecurityFeedbackInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (already initialized from the bound `securityFeedbackAgent`), the validated `input`,
+ * and the run-stream `log`. Mirrors Flue's `ActionContext` so the inline `run` passes
+ * straight through.
+ */
+export interface SecurityFeedbackRunCtx {
+  harness: FlueHarness;
+  input: SecurityFeedbackInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -128,7 +144,7 @@ export interface SecurityFeedbackDeps {
   fetchParent(octokit: Octokit, ref: RepoRef, issueNumber: number): Promise<ParentIssue>;
   /** Run the feedback agent and return its raw text output (FEEDBACK marker + optional reply). */
   runFeedback(
-    ctx: FlueContext<SecurityFeedbackInput>,
+    ctx: SecurityFeedbackRunCtx,
     ref: RepoRef,
     octokit: Octokit,
     parsed: ParsedScan,
@@ -173,28 +189,30 @@ async function fetchParentIssue(
   return { body: data.body ?? "" };
 }
 
-/** The real run: init the agent, open a session, prompt with the parsed scan + comment. */
+/** The real run: open a session on the bound harness, prompt with the parsed scan + comment. */
 async function runFeedbackSession(
-  ctx: FlueContext<SecurityFeedbackInput>,
+  ctx: SecurityFeedbackRunCtx,
   ref: RepoRef,
   octokit: Octokit,
   parsed: ParsedScan,
   parentBody: string,
 ): Promise<string> {
-  const agent = createSecurityFeedbackAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("security-feedback");
+  const session = await ctx.harness.session("security-feedback");
   const promptCtx: SecurityFeedbackPromptContext = {
     owner: ref.owner,
     repo: ref.repo,
-    parentIssueNumber: ctx.payload.issueNumber,
-    sender: ctx.payload.sender,
-    commentBody: ctx.payload.commentBody,
+    parentIssueNumber: ctx.input.issueNumber,
+    sender: ctx.input.sender,
+    commentBody: ctx.input.commentBody,
     parentBody,
     findings: parsed.findings,
-    triggerType: ctx.payload.triggerType,
+    triggerType: ctx.input.triggerType,
   };
-  const res = await session.prompt(renderSecurityFeedbackPrompt(promptCtx));
+  // The per-run READ tools (closed over ref + scoped-token Octokit) are injected
+  // for THIS call only — owner/repo/token are never model-selectable.
+  const res = await session.prompt(renderSecurityFeedbackPrompt(promptCtx), {
+    tools: githubReadTools(ref, octokit),
+  });
   return res.text;
 }
 
@@ -231,16 +249,16 @@ function todayUTC(): string {
  * so tests pin the sub-issue body date deterministically.
  */
 export async function runSecurityFeedback(
-  ctx: FlueContext<SecurityFeedbackInput>,
+  ctx: SecurityFeedbackRunCtx,
   deps: SecurityFeedbackDeps = defaultDeps(),
   today: string = todayUTC(),
 ): Promise<SecurityFeedbackResult> {
-  const { owner, repo, issueNumber } = ctx.payload;
-  const sender = ctx.payload.sender ?? "maintainer";
+  const { owner, repo, issueNumber } = ctx.input;
+  const sender = ctx.input.sender ?? "maintainer";
   const ref: RepoRef = { owner, repo };
 
   // 1. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Fetch the parent scan issue body deterministically.
@@ -338,9 +356,16 @@ export async function runSecurityFeedback(
   };
 }
 
-/** Flue workflow entry — discovered as the `security-feedback` workflow. */
-export async function run(
-  ctx: FlueContext<SecurityFeedbackInput>,
-): Promise<SecurityFeedbackResult> {
-  return runSecurityFeedback(ctx);
-}
+/**
+ * Flue workflow — discovered as the `security-feedback` workflow. The runner owns root
+ * harness init from `securityFeedbackAgent`; the inline `run` defers to the testable core.
+ */
+export default defineWorkflow({
+  agent: securityFeedbackAgent,
+  input: SecurityFeedbackInputSchema,
+  async run({ harness, input, log }) {
+    // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
+    // The typed `SecurityFeedbackResult` is preserved on the testable core for tests.
+    return (await runSecurityFeedback({ harness, input, log })) as unknown as JsonValue;
+  },
+});

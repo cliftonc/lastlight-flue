@@ -26,15 +26,22 @@
  * NO SANDBOX: triage is tool-only (reads the issue + searches duplicates via bound
  * read tools — no checkout needed). Cheaper + lower-latency than build/review.
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The bound
+ * `triageAgent` is the root harness/policy; the per-run READ tools (closed over
+ * ref + scoped-token Octokit) are injected per-call via `session.prompt(_, {
+ * tools })`, so the security spine is unchanged. `ctx.payload`→`input`,
+ * `ctx.init(agent)`→the supplied `harness`, `ctx.id`→`harness.name`.
  *
- * TESTABILITY: `run` defers to `runIssueTriage(ctx, deps)` with an injectable `deps`
- * seam (token minter, octokit factory, context fetcher, agent runner, applier). The
- * default deps wire the real implementations; tests pass fakes so the whole flow
- * runs with NO live model and NO live GitHub.
+ * TESTABILITY: the inline `run` defers to `runIssueTriage(ctx, deps)` with an
+ * injectable `deps` seam (token minter, octokit factory, context fetcher, agent
+ * runner, applier). The default deps wire the real implementations; tests pass
+ * fakes so the whole flow runs with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
+import { triageAgent } from "../agent-lib/triage.ts";
+import { githubReadTools } from "../tools/github-read.ts";
 import { runPhasePrompt } from "../agent-lib/record-execution.ts";
 import {
   parseTriageClassification,
@@ -48,7 +55,6 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createTriageAgent } from "../agent-lib/triage.ts";
 import {
   renderTriagePrompt,
   type TriagePromptContext,
@@ -60,12 +66,27 @@ import {
 } from "../triage-post.ts";
 
 /** The workflow input payload (identifies the issue + trigger). */
-export interface IssueTriageInput {
-  owner: string;
-  repo: string;
-  issueNumber: number;
+export const IssueTriageInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
+  issueNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type IssueTriageInput = v.InferOutput<typeof IssueTriageInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (already initialized from the bound `triageAgent`), the validated `input`, and
+ * the run-stream `log`. Mirrors Flue's `ActionContext` so the inline `run` passes
+ * straight through.
+ */
+export interface TriageRunCtx {
+  harness: FlueHarness;
+  input: IssueTriageInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -104,11 +125,12 @@ export interface IssueTriageDeps {
   /** Fetch the issue context (title/body/labels/comments) over the bound octokit. */
   fetchIssue(octokit: Octokit, ref: IssueRef): Promise<IssueContext>;
   /**
-   * Run the triage agent for this issue and return its raw text output. Wraps
-   * agent-init + session.prompt so tests can return canned CLASSIFICATION output.
+   * Run the triage agent for this issue and return its raw text output. Opens a
+   * session on the supplied harness and prompts it, injecting the per-run READ
+   * tools so tests can return canned CLASSIFICATION output.
    */
   runTriage(
-    ctx: FlueContext<IssueTriageInput>,
+    ctx: TriageRunCtx,
     ref: IssueRef,
     octokit: Octokit,
     issue: IssueContext,
@@ -162,16 +184,14 @@ async function fetchIssueContext(octokit: Octokit, ref: IssueRef): Promise<Issue
   };
 }
 
-/** The real triage run: init the agent, open a session, prompt with the issue context. */
+/** The real triage run: open a session on the bound harness, prompt with the issue context. */
 async function runTriageSession(
-  ctx: FlueContext<IssueTriageInput>,
+  ctx: TriageRunCtx,
   ref: IssueRef,
   octokit: Octokit,
   issue: IssueContext,
 ): Promise<string> {
-  const agent = createTriageAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("triage");
+  const session = await ctx.harness.session("triage");
   const promptCtx: TriagePromptContext = {
     owner: ref.owner,
     repo: ref.repo,
@@ -181,15 +201,22 @@ async function runTriageSession(
     author: issue.author,
     labels: issue.labels,
     comments: issue.comments,
-    triggerType: ctx.payload.triggerType,
+    triggerType: ctx.input.triggerType,
   };
   // Shared phase-prompt seam: records per-phase usage (cost/tokens) into the
   // app-owned `executions` stats table — NON-FATAL + TEST-INERT (record-execution.ts).
-  const res = await runPhasePrompt(session, renderTriagePrompt(promptCtx), {
-    runId: ctx.id,
-    workflow: 'issue-triage',
-    phase: 'triage',
-  });
+  // The per-run READ tools (closed over ref + scoped-token Octokit) are injected
+  // for THIS call only — owner/repo/token are never model-selectable.
+  const res = await runPhasePrompt(
+    session,
+    renderTriagePrompt(promptCtx),
+    {
+      runId: ctx.input.runId ?? ctx.harness.name,
+      workflow: 'issue-triage',
+      phase: 'triage',
+    },
+    { tools: githubReadTools(ref, octokit) },
+  );
   return res.text;
 }
 
@@ -209,14 +236,14 @@ export function defaultDeps(): IssueTriageDeps {
  * uses `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
  */
 export async function runIssueTriage(
-  ctx: FlueContext<IssueTriageInput>,
+  ctx: TriageRunCtx,
   deps: IssueTriageDeps = defaultDeps(),
 ): Promise<IssueTriageResult> {
-  const { owner, repo, issueNumber } = ctx.payload;
+  const { owner, repo, issueNumber } = ctx.input;
   const ref: IssueRef = { owner, repo, issue_number: issueNumber };
 
   // 1. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Fetch the issue context deterministically (workflow code, not a model tool).
@@ -255,9 +282,16 @@ export async function runIssueTriage(
   };
 }
 
-/** Flue workflow entry — discovered as the `issue-triage` workflow. */
-export async function run(
-  ctx: FlueContext<IssueTriageInput>,
-): Promise<IssueTriageResult> {
-  return runIssueTriage(ctx);
-}
+/**
+ * Flue workflow — discovered as the `issue-triage` workflow. The runner owns root
+ * harness init from `triageAgent`; the inline `run` defers to the testable core.
+ */
+export default defineWorkflow({
+  agent: triageAgent,
+  input: IssueTriageInputSchema,
+  async run({ harness, input, log }) {
+    // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
+    // The typed `IssueTriageResult` is preserved on the testable core for tests.
+    return (await runIssueTriage({ harness, input, log })) as unknown as JsonValue;
+  },
+});

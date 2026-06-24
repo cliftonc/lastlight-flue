@@ -25,9 +25,7 @@
  * the scoped token (src/triage-post.ts) — the label/close side effects are
  * deliberately NOT model tools here, mirroring the pr-review verdict→post split.
  */
-import { createAgent } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import issueTriage from "../skills/issue-triage/SKILL.md" with { type: "skill" };
@@ -39,20 +37,21 @@ export const description =
 export const TRIAGE_TASK_KEY = "triage" as const;
 
 /**
- * Build the triage agent bound to a specific issue's repo ref + read-scoped Octokit.
+ * The triage agent definition (beta.3: a static `defineAgent`, bound on the
+ * `issue-triage` workflow). Model/thinking/persona/skills are resolved in the
+ * initializer (env-dependent policy belongs here per the beta.3 contract — the
+ * initializer cannot see workflow input).
  *
- * The Octokit is authenticated with the run's scoped token (issues-write profile,
- * but the AGENT only ever calls READ tools — the writes happen deterministically in
- * the workflow); both `ref` and `octokit` are closed over the tool factories, so the
- * model cannot widen scope. No sandbox: triage is tool-only (design phase-5).
+ * SECURITY SPINE (unchanged): the agent carries NO write tools. The per-run
+ * READ-only GitHub tools are bound to (ref, scoped-token Octokit) in trusted
+ * workflow code and injected per-call via `session.prompt(prompt, { tools })`,
+ * so `owner`/`repo`/token are closed over and never model-selectable. No sandbox:
+ * triage is tool-only (design phase-5).
  */
-export function createTriageAgent(ref: RepoRef, octokit: Octokit) {
-  return createAgent(() => ({
-    model: resolveModel(TRIAGE_TASK_KEY),
-    thinkingLevel: resolveThinking(TRIAGE_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [issueTriage],
-    // NO sandbox / cwd — tool-only.
-  }));
-}
+export const triageAgent = defineAgent(() => ({
+  model: resolveModel(TRIAGE_TASK_KEY),
+  thinkingLevel: resolveThinking(TRIAGE_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [issueTriage],
+  // NO sandbox / cwd — tool-only. NO static tools — read tools injected per-call.
+}));

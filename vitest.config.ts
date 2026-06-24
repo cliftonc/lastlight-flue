@@ -18,7 +18,9 @@ import { defineConfig, type Plugin } from 'vitest/config';
 //     REAL file contents inlined as a default-exported string, matching what
 //     Flue inlines at build time, so persona tests can assert real content.
 function stubMarkdown(): Plugin {
-  const SKILL_STUB_ID = '\0flue-skill-md-stub';
+  // Marker prefix so a SKILL.md resolves to a UNIQUE-per-skill stub (the parent
+  // directory name) — beta.3 `defineAgentProfile` rejects duplicate skill names.
+  const SKILL_STUB_PREFIX = '\0flue-skill-md-stub:';
   // Marker suffix so resolved markdown ids round-trip the real file path into
   // the `load` hook (vite namespaces it via the leading NUL).
   const MD_PREFIX = '\0flue-markdown:';
@@ -26,7 +28,13 @@ function stubMarkdown(): Plugin {
     name: 'stub-markdown',
     enforce: 'pre',
     resolveId(source, importer) {
-      if (source.endsWith('/SKILL.md')) return SKILL_STUB_ID;
+      if (source.endsWith('/SKILL.md')) {
+        // Derive a stable skill name from the parent dir
+        // (…/skills/building/SKILL.md → "building"), so distinct skills get
+        // distinct stub names within a single agent profile.
+        const m = source.match(/([^/]+)\/SKILL\.md$/);
+        return SKILL_STUB_PREFIX + (m ? m[1] : 'stub-skill');
+      }
       if (source.endsWith('.md')) {
         // Resolve relative to the importer so we can read the real file in load().
         const abs = new URL(source, new URL(`file://${importer}`)).pathname;
@@ -35,8 +43,12 @@ function stubMarkdown(): Plugin {
       return null;
     },
     load(id) {
-      if (id === SKILL_STUB_ID) {
-        return `export default { name: 'stub-skill', __stub: true };`;
+      if (id.startsWith(SKILL_STUB_PREFIX)) {
+        // beta.3 `defineAgentProfile` validates skills EAGERLY at definition time and
+        // requires a non-empty `description` + UNIQUE names (beta.2's lazy
+        // `createAgent` initializer never tripped this). The stub carries both.
+        const name = id.slice(SKILL_STUB_PREFIX.length);
+        return `export default { name: ${JSON.stringify(name)}, description: 'stub skill (vitest)', __stub: true };`;
       }
       if (id.startsWith(MD_PREFIX)) {
         const path = id.slice(MD_PREFIX.length);

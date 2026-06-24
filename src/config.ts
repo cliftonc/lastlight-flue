@@ -31,7 +31,12 @@ function loadDotEnv(path: string): void {
 
 export interface SlackConfig {
   botToken: string;
-  appToken: string;
+  /**
+   * Socket-Mode app-level token (`xapp-…`). UNUSED in the HTTP Events-API model
+   * (ingress is verified via the signing secret; egress posts over the bot token),
+   * so it is OPTIONAL — kept only for parity / a future Socket-Mode path.
+   */
+  appToken?: string;
   allowedUsers: string[];
   deliveryChannel?: string;
 }
@@ -316,7 +321,8 @@ export function loadConfig(): LastLightConfig {
   const slack = process.env.SLACK_BOT_TOKEN
     ? {
         botToken: process.env.SLACK_BOT_TOKEN,
-        appToken: requireEnv("SLACK_APP_TOKEN"),
+        // OPTIONAL: Socket-Mode app token is unused by the HTTP Events-API path.
+        appToken: process.env.SLACK_APP_TOKEN || undefined,
         allowedUsers: (process.env.SLACK_ALLOWED_USERS || "").split(",").filter(Boolean),
         deliveryChannel: process.env.SLACK_DELIVERY_CHANNEL || process.env.SLACK_HOME_CHANNEL || undefined,
       }

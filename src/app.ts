@@ -77,6 +77,8 @@ import { recoverOrphanExploreRuns } from './resume-explore.ts';
 import { reapStaleBuildContainers } from './agent-lib/build-sandbox.ts';
 import { startCrons, stopCrons } from './crons.ts';
 import { startOtel } from './otel.ts';
+import { startSlackChatRelay } from './agent-lib/slack-chat-relay.ts';
+import { slackPosterFromConfig, parseSlackConversationKey } from './slack-client.ts';
 
 // ── Last Light on Flue · server composition (Phase 2) ────────────────────────
 //
@@ -910,6 +912,52 @@ startOtel();
 // run-once, non-blocking (croner schedules its own timers), non-fatal, and
 // SKIPPED under VITEST/LASTLIGHT_SKIP_CRONS (see startCrons). See src/crons.ts.
 startCrons();
+
+// ── Slack chat-reply relay (egress) ───────────────────────────────────────────
+// The Slack channel ADMITS a DM/mention via `dispatch(chatAgent, …)` (fire-and-
+// forget) — `dispatch` returns no reply, so the answer was never posted back. This
+// relay subscribes to Flue's `observe(...)` stream and posts the finished chat turn's
+// assistant text to the originating thread over the egress `SlackPoster`, WITHOUT
+// giving the read-only chat agent any write tool (deterministic egress). Run-once,
+// non-fatal, and INERT under VITEST or when no `SLACK_BOT_TOKEN` is configured.
+// HMR-safe: `observe(...)` registers into a PROCESS-GLOBAL subscriber set that
+// survives Vite's module re-eval, so a naive re-subscribe on every dev reload would
+// stack duplicate relays (→ duplicate replies). We stash the unsubscribe on
+// `globalThis` and tear down the prior subscription before re-arming.
+const SLACK_RELAY_KEY = Symbol.for('lastlight.slackChatRelay.unsubscribe');
+type GlobalWithRelay = typeof globalThis & { [SLACK_RELAY_KEY]?: () => void };
+function startSlackRelay(): void {
+  if (process.env.VITEST) return;
+  const g = globalThis as GlobalWithRelay;
+  // Tear down a prior subscription (a previous module instance after an HMR reload).
+  try {
+    g[SLACK_RELAY_KEY]?.();
+  } catch {
+    /* best-effort */
+  }
+  g[SLACK_RELAY_KEY] = undefined;
+
+  try {
+    const poster = slackPosterFromConfig();
+    if (!poster) {
+      // No bot token → egress inactive; ingress (verify/dispatch) still works.
+      return;
+    }
+    g[SLACK_RELAY_KEY] = startSlackChatRelay({
+      parseKey: (id) => parseSlackConversationKey(id),
+      post: (channelId, text, threadTs) =>
+        poster.postMessage(channelId, text, threadTs).then(() => undefined),
+      // Clear the "is thinking…" assistant status once the turn ends (best-effort).
+      clearStatus: (channelId, threadTs) =>
+        poster.setStatus(channelId, threadTs, '').catch(() => undefined),
+      log: console,
+    });
+    console.log('[slack-relay] chat-reply egress armed');
+  } catch (err) {
+    console.error('[slack-relay] failed to arm (non-fatal):', err);
+  }
+}
+startSlackRelay();
 
 // GRACEFUL SHUTDOWN — FINALIZED DECISION (flue-reference §0 + the slice-2/5
 // leaning): an ADDITIVE `process.on('SIGTERM'|'SIGINT', …)` handler that stops

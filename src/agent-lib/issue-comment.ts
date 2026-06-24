@@ -29,9 +29,7 @@
  * createComment side effect is deliberately NOT a model tool, mirroring the pr-review
  * verdict→post and issue-triage classification→apply splits.
  */
-import { createAgent } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import issueComment from "../skills/issue-comment/SKILL.md" with { type: "skill" };
@@ -43,21 +41,21 @@ export const description =
 export const COMMENT_TASK_KEY = "comment" as const;
 
 /**
- * Build the issue-comment agent bound to a specific issue/PR's repo ref + read-scoped
- * Octokit.
+ * The issue-comment agent definition (beta.3: a static `defineAgent`, bound on the
+ * `issue-comment` workflow). Model/thinking/persona/skills are resolved in the
+ * initializer (env-dependent policy belongs here per the beta.3 contract — the
+ * initializer cannot see workflow input).
  *
- * The Octokit is authenticated with the run's scoped token (issues-write profile, but
- * the AGENT only ever calls READ tools — the reply post happens deterministically in
- * the workflow); both `ref` and `octokit` are closed over the tool factories, so the
- * model cannot widen scope. No sandbox: issue-comment is tool-only (design phase-5).
+ * SECURITY SPINE (unchanged): the agent carries NO write tools. The per-run
+ * READ-only GitHub tools are bound to (ref, scoped-token Octokit) in trusted
+ * workflow code and injected per-call via `session.prompt(prompt, { tools })`,
+ * so `owner`/`repo`/token are closed over and never model-selectable. No sandbox:
+ * issue-comment is tool-only (design phase-5).
  */
-export function createIssueCommentAgent(ref: RepoRef, octokit: Octokit) {
-  return createAgent(() => ({
-    model: resolveModel(COMMENT_TASK_KEY),
-    thinkingLevel: resolveThinking(COMMENT_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [issueComment],
-    // NO sandbox / cwd — tool-only.
-  }));
-}
+export const issueCommentAgent = defineAgent(() => ({
+  model: resolveModel(COMMENT_TASK_KEY),
+  thinkingLevel: resolveThinking(COMMENT_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [issueComment],
+  // NO sandbox / cwd — tool-only. NO static tools — read tools injected per-call.
+}));

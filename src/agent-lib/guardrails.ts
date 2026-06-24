@@ -32,10 +32,7 @@
  * ⚠ EGRESS DEFERRED: the container runs with full network + no SSRF floor. Do NOT
  * run untrusted input through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgentProfile } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import building from "../skills/building/SKILL.md" with { type: "skill" };
@@ -49,24 +46,22 @@ export const GUARDRAILS_TASK_KEY = "guardrails" as const;
 /** The working directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
 export const GUARDRAILS_CWD = "/workspace" as const;
 
+/** The subagent-profile name the build coordinator delegates the guardrails phase to. */
+export const GUARDRAILS_PROFILE_NAME = "guardrails" as const;
+
 /**
- * Build the guardrails agent bound to a repo ref + scoped Octokit + the build
- * sandbox. `ref`/`octokit` are closed over the read-tool factories (the model
- * cannot widen scope); `cwd: /workspace` points the agent's bash/file tools at the
- * pre-cloned checkout where it runs the baseline checks + commits the report.
+ * The guardrails SUBAGENT PROFILE on the `build` coordinator (beta.3). NO tools (per-run
+ * READ tools injected per `session.task(_, { tools })`) and NO sandbox/cwd (inherited
+ * from the coordinator harness — the shared `/workspace` checkout it screens). The
+ * persona carries security.md so the untrusted issue text in the prompt is treated as
+ * data; the `building` skill is the install/test-gate discipline it checks for. Model +
+ * thinkingLevel from the `guardrails` task key.
  */
-export function createGuardrailsAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(GUARDRAILS_TASK_KEY),
-    thinkingLevel: resolveThinking(GUARDRAILS_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [building],
-    sandbox,
-    cwd: GUARDRAILS_CWD,
-  }));
-}
+export const guardrailsProfile = defineAgentProfile({
+  name: GUARDRAILS_PROFILE_NAME,
+  description,
+  model: resolveModel(GUARDRAILS_TASK_KEY),
+  thinkingLevel: resolveThinking(GUARDRAILS_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});

@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runAnswer,
   type AnswerDeps,
+  type AnswerAgentArgs,
   type AnswerInput,
   type AnswerContext,
+  type AnswerRunCtx,
 } from "../answer.ts";
 import {
   postAnswerDeterministically,
@@ -17,20 +18,22 @@ import {
   type PostedAnswer,
 } from "../../answer-post.ts";
 import { renderAnswerPrompt } from "../../agent-lib/answer-prompt.ts";
+import type { GitAccessProfile } from "../../engine/profiles.ts";
+import type { SlackPoster } from "../../slack-client.ts";
 
 const BOT = "last-light[bot]";
 
-function fakeCtx(payload: AnswerInput): FlueContext<AnswerInput> {
+function fakeCtx(payload: AnswerInput): AnswerRunCtx {
   return {
-    id: "test-run",
-    payload,
-    env: {},
-    req: undefined,
+    input: payload,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-    init: vi.fn(async () => {
-      throw new Error("init must not be called — runAnswerAgent is injected in tests");
-    }),
-  } as unknown as FlueContext<AnswerInput>;
+    harness: {
+      name: "default",
+      async session() {
+        throw new Error("session must not be called — runAnswerAgent is injected in tests");
+      },
+    },
+  } as unknown as AnswerRunCtx;
 }
 
 const ISSUE: AnswerContext = {
@@ -41,26 +44,36 @@ const ISSUE: AnswerContext = {
   comments: [],
 };
 
+/** A fake Slack egress poster recording posts. */
+function fakePoster() {
+  const posts: Array<{ channel: string; text: string; threadTs?: string }> = [];
+  const poster: SlackPoster = {
+    async postMessage(channel, text, threadTs) {
+      posts.push({ channel, text, threadTs });
+      return { ts: "1700000000.000100" };
+    },
+    async updateMessage() {},
+    async setStatus() {},
+  };
+  return { poster, posts };
+}
+
 function fakeDeps(opts: {
   answer: string;
   issue?: AnswerContext;
   postResult?: PostedAnswer;
+  poster?: SlackPoster;
+  managedRepos?: string[];
+  fallbackRepo?: string;
 }) {
-  const mintToken = vi.fn(async () => "ghs_fake_issues_write_token");
+  const mintToken = vi.fn(async (_repo: string, _profile: GitAccessProfile) => "ghs_fake_scoped_token");
   const makeOctokit = vi.fn(() => ({}) as unknown as Octokit);
   const fetchIssue = vi.fn(async () => opts.issue ?? ISSUE);
-  let promptSeen: { ref: AnswerRef; issue: AnswerContext } | undefined;
-  const runAnswerAgent = vi.fn(
-    async (
-      _ctx: FlueContext<AnswerInput>,
-      ref: AnswerRef,
-      _octokit: Octokit,
-      issue: AnswerContext,
-    ) => {
-      promptSeen = { ref, issue };
-      return opts.answer;
-    },
-  );
+  let argsSeen: AnswerAgentArgs | undefined;
+  const runAnswerAgent = vi.fn(async (_ctx: AnswerRunCtx, args: AnswerAgentArgs) => {
+    argsSeen = args;
+    return opts.answer;
+  });
   const post = vi.fn(
     async (): Promise<PostedAnswer> =>
       opts.postResult ?? {
@@ -76,9 +89,12 @@ function fakeDeps(opts: {
     fetchIssue,
     runAnswerAgent,
     post,
+    poster: opts.poster,
     botLogin: BOT,
+    managedRepos: opts.managedRepos ?? ["cliftonc/drizzle-cube"],
+    fallbackRepo: opts.fallbackRepo ?? "cliftonc/drizzle-cube",
   };
-  return { deps, mintToken, makeOctokit, fetchIssue, runAnswerAgent, post, promptSeen: () => promptSeen };
+  return { deps, mintToken, makeOctokit, fetchIssue, runAnswerAgent, post, argsSeen: () => argsSeen };
 }
 
 const INPUT: AnswerInput = {
@@ -88,14 +104,15 @@ const INPUT: AnswerInput = {
   sender: "reporter",
 };
 
-describe("runAnswer — full flow over injected deps (no live model / GitHub)", () => {
+describe("runAnswer — GitHub origin (no live model / GitHub)", () => {
   it("mints issues-write token, runs the agent, posts the answer + labels via the deterministic poster", async () => {
     const { deps, mintToken, post } = fakeDeps({
       answer: "Drizzle is a lightweight SQL-first ORM; Prisma generates a client. Use Drizzle for...",
     });
     const res = await runAnswer(fakeCtx(INPUT), deps);
 
-    expect(mintToken).toHaveBeenCalledWith(INPUT);
+    expect(res.origin).toBe("github");
+    expect(mintToken).toHaveBeenCalledWith("drizzle-cube", "issues-write");
     expect(res.posted).toBe(true);
     expect(res.commentUrl).toBe("https://gh/comment/7");
     expect(res.labelled).toBe(true);
@@ -110,12 +127,13 @@ describe("runAnswer — full flow over injected deps (no live model / GitHub)", 
     );
   });
 
-  it("the agent receives the BOUND ref and the deterministically-fetched issue context", async () => {
+  it("the agent receives the BOUND repo + issue number and the deterministically-fetched issue context", async () => {
     const t = fakeDeps({ answer: "ok" });
     await runAnswer(fakeCtx(INPUT), t.deps);
     expect(t.fetchIssue).toHaveBeenCalled();
-    const seen = t.promptSeen();
-    expect(seen?.ref).toEqual({ owner: "cliftonc", repo: "drizzle-cube", issue_number: 42 });
+    const seen = t.argsSeen();
+    expect(seen?.repo).toEqual({ owner: "cliftonc", repo: "drizzle-cube" });
+    expect(seen?.issueNumber).toBe(42);
     expect(seen?.issue).toEqual(ISSUE);
   });
 
@@ -140,7 +158,81 @@ describe("runAnswer — full flow over injected deps (no live model / GitHub)", 
       .flat()
       .map((a) => JSON.stringify(a))
       .join(" ");
-    expect(logged).not.toContain("ghs_fake_issues_write_token");
+    expect(logged).not.toContain("ghs_fake_scoped_token");
+  });
+});
+
+describe("runAnswer — Slack origin (no GitHub issue; delivers to the thread)", () => {
+  const SLACK_INPUT: AnswerInput = {
+    source: "slack",
+    conversationKey: "slack:v1:T1:C123:1782271839.894679",
+    question: "how does cliftonc/drizzle-cube handle joins?",
+    sender: "u1",
+  };
+
+  it("resolves the named repo (read token), runs the agent, delivers the answer into the thread", async () => {
+    const fp = fakePoster();
+    const { deps, mintToken, post } = fakeDeps({ answer: "It compiles joins via the query builder.", poster: fp.poster });
+    const res = await runAnswer(fakeCtx(SLACK_INPUT), deps);
+
+    expect(res.origin).toBe("slack");
+    expect(res.posted).toBe(true);
+    expect(res.slackTs).toBe("1700000000.000100");
+    expect(res.labelled).toBe(false);
+    // READ token for the repo NAMED in the message (validated against the allowlist).
+    expect(mintToken).toHaveBeenCalledWith("drizzle-cube", "read");
+    // Delivered to the parsed channel + thread, NOT a GitHub comment.
+    expect(post).not.toHaveBeenCalled();
+    expect(fp.posts).toEqual([
+      { channel: "C123", text: "It compiles joins via the query builder.", threadTs: "1782271839.894679" },
+    ]);
+  });
+
+  it("the agent reads from the resolved repo (read tools bound to it)", async () => {
+    const fp = fakePoster();
+    const t = fakeDeps({ answer: "ok", poster: fp.poster });
+    await runAnswer(fakeCtx(SLACK_INPUT), t.deps);
+    expect(t.argsSeen()?.repo).toEqual({ owner: "cliftonc", repo: "drizzle-cube" });
+    expect(t.argsSeen()?.issue).toBeUndefined(); // no GitHub issue context for Slack
+  });
+
+  it("falls back to the default repo when the message names none", async () => {
+    const fp = fakePoster();
+    const t = fakeDeps({
+      answer: "general answer",
+      poster: fp.poster,
+      managedRepos: ["cliftonc/drizzle-cube"],
+      fallbackRepo: "cliftonc/drizzle-cube",
+    });
+    await runAnswer(fakeCtx({ ...SLACK_INPUT, question: "what is an ORM?" }), t.deps);
+    expect(t.argsSeen()?.repo).toEqual({ owner: "cliftonc", repo: "drizzle-cube" });
+  });
+
+  it("does NOT deliver when Slack egress is inactive (no poster) and warns", async () => {
+    const { deps } = fakeDeps({ answer: "an answer", poster: undefined });
+    const ctx = fakeCtx(SLACK_INPUT);
+    const res = await runAnswer(ctx, deps);
+    expect(res.posted).toBe(false);
+    expect(res.origin).toBe("slack");
+    expect(ctx.log.warn).toHaveBeenCalled();
+  });
+
+  it("an empty agent answer delivers nothing", async () => {
+    const fp = fakePoster();
+    const { deps } = fakeDeps({ answer: "   ", poster: fp.poster });
+    const res = await runAnswer(fakeCtx(SLACK_INPUT), deps);
+    expect(res.posted).toBe(false);
+    expect(fp.posts).toEqual([]);
+  });
+});
+
+describe("runAnswer — neither origin → no-op", () => {
+  it("skips when there is no GitHub issue and no Slack thread", async () => {
+    const { deps, post } = fakeDeps({ answer: "x" });
+    const res = await runAnswer(fakeCtx({ sender: "u1", question: "hi" }), deps);
+    expect(res.origin).toBe("none");
+    expect(res.posted).toBe(false);
+    expect(post).not.toHaveBeenCalled();
   });
 });
 

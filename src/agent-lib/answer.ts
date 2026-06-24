@@ -38,9 +38,7 @@
  * deliberately NOT model tools, mirroring the issue-comment reply→post and pr-review
  * verdict→post splits.
  */
-import { createAgent } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgent } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import issueAnswer from "../skills/issue-answer/SKILL.md" with { type: "skill" };
@@ -52,25 +50,25 @@ export const description =
 export const ANSWER_TASK_KEY = "answer" as const;
 
 /**
- * Build the answer agent bound to a specific issue's repo ref + read-scoped Octokit.
+ * The answer agent definition (beta.3: a static `defineAgent`, bound on the `answer`
+ * workflow). Model/thinking/persona/skills are resolved in the initializer
+ * (env-dependent policy belongs here per the beta.3 contract — the initializer cannot
+ * see workflow input).
  *
- * The Octokit is authenticated with the run's scoped token (issues-write profile, but
- * the AGENT only ever calls READ tools — the answer post + label happen
- * deterministically in the workflow); both `ref` and `octokit` are closed over the
- * tool factories, so the model cannot widen scope. No sandbox / web tools this slice
- * (see the module note: web-research is deferred to a later slice).
+ * SECURITY SPINE (unchanged): the agent carries NO write tools. The per-run READ-only
+ * GitHub tools are bound to (ref, scoped-token Octokit) in trusted workflow code and
+ * injected per-call via `session.prompt(prompt, { tools })`, so `owner`/`repo`/token
+ * are closed over and never model-selectable. No sandbox: answer is tool-only this
+ * slice (web-research deferred — see the module note).
  */
-export function createAnswerAgent(ref: RepoRef, octokit: Octokit) {
-  return createAgent(() => ({
-    model: resolveModel(ANSWER_TASK_KEY),
-    thinkingLevel: resolveThinking(ANSWER_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    // TODO(phase-5/web-tools): once `web_search`/`web_fetch` land as gated
-    // defineTools (design phase-5 §DRIFT), add them here + flip the answer phase
-    // to unrestricted-egress so the agent can cite external sources. Until then
-    // the agent answers from repo/GitHub context only and flags the unverified.
-    skills: [issueAnswer],
-    // NO sandbox / cwd — tool-only this slice.
-  }));
-}
+export const answerAgent = defineAgent(() => ({
+  model: resolveModel(ANSWER_TASK_KEY),
+  thinkingLevel: resolveThinking(ANSWER_TASK_KEY),
+  instructions: loadPersona(),
+  // TODO(phase-5/web-tools): once `web_search`/`web_fetch` land as gated
+  // defineTools (design phase-5 §DRIFT), add them here + flip the answer phase
+  // to unrestricted-egress so the agent can cite external sources. Until then
+  // the agent answers from repo/GitHub context only and flags the unverified.
+  skills: [issueAnswer],
+  // NO sandbox / cwd — tool-only this slice. NO static tools — read tools injected per-call.
+}));

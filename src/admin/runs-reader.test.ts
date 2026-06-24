@@ -93,7 +93,7 @@ describe('toRunDetail (RunRecord → detail)', () => {
     endedAt: '2026-06-21T10:02:00.000Z',
     durationMs: 120000,
     isError: true,
-    payload: { repo: 'owner/repo', issue: 7 },
+    input: { repo: 'owner/repo', issue: 7 },
     result: undefined,
     error: { message: 'boom' },
   };
@@ -114,7 +114,7 @@ describe('toAgentSummary (AgentManifestEntry)', () => {
     const entry: AgentManifestEntry = {
       name: 'hello',
       transports: { http: true },
-      created: true,
+      defined: true,
     };
     expect(toAgentSummary(entry)).toEqual({
       name: 'hello',
@@ -129,7 +129,7 @@ describe('toAgentSummary (AgentManifestEntry)', () => {
       name: 'internal',
       description: 'dispatch-only agent',
       transports: {},
-      created: true,
+      defined: true,
     };
     expect(toAgentSummary(entry)).toEqual({
       name: 'internal',

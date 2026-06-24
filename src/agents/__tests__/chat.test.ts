@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Octokit } from "octokit";
-import type { AgentCreateContext } from "@flue/runtime";
+import type { AgentInitializerContext } from "@flue/runtime";
 import {
   setRuntimeConfig,
   resetRuntimeConfigForTests,
@@ -17,7 +17,7 @@ vi.mock("../../agent-lib/chat-token.ts", () => ({
 
 const FAKE_OCTOKIT = { __fake: "octokit" } as unknown as Octokit;
 
-const ctx = (id: string) => ({ id }) as unknown as AgentCreateContext<{ text?: string }>;
+const ctx = (id: string) => ({ id }) as unknown as AgentInitializerContext<{ text?: string }>;
 
 beforeEach(() => {
   mintReadOctokitFor.mockReset();
@@ -31,7 +31,7 @@ afterEach(() => resetRuntimeConfigForTests());
 describe("src/agents/chat.ts — discovered agent shape", () => {
   it("exports a default createAgent, an open route, and a description", async () => {
     const mod = await import("../chat.ts");
-    expect((mod.default as { __flueCreatedAgent?: true }).__flueCreatedAgent).toBe(true);
+    expect((mod.default as { __flueAgentDefinition?: true }).__flueAgentDefinition).toBe(true);
     expect(typeof mod.route).toBe("function");
     expect(mod.description).toMatch(/read-only/i);
     // The route is open for now (Phase 6 channel auth) — it just calls next().

@@ -41,10 +41,7 @@
  * ⚠ EGRESS DEFERRED: the container runs with full network + no SSRF floor. Do NOT
  * run untrusted input through it. See PROGRESS.md / spec/09.
  */
-import { createAgent } from "@flue/runtime";
-import type { SandboxFactory } from "@flue/runtime";
-import type { Octokit } from "octokit";
-import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
+import { defineAgentProfile } from "@flue/runtime";
 import { loadPersona } from "./persona.ts";
 import { resolveModel, resolveThinking } from "../config.ts";
 import building from "../skills/building/SKILL.md" with { type: "skill" };
@@ -58,24 +55,22 @@ export const EXECUTOR_TASK_KEY = "executor" as const;
 /** The working directory the repo is pre-cloned into (matches docker.ts WORKSPACE). */
 export const EXECUTOR_CWD = "/workspace" as const;
 
+/** The subagent-profile name the build coordinator delegates the executor phase to. */
+export const EXECUTOR_PROFILE_NAME = "executor" as const;
+
 /**
- * Build the executor agent bound to a repo ref + scoped Octokit + the build
- * sandbox. `ref`/`octokit` are closed over the read-tool factories (the model
- * cannot widen scope); `cwd: /workspace` points the agent's bash/file tools at the
- * pre-cloned checkout where it reads the plan, implements, and commits.
+ * The executor SUBAGENT PROFILE on the `build` coordinator (beta.3). NO tools (per-run
+ * READ tools injected per `session.task(_, { tools })`) and NO sandbox/cwd (inherited
+ * from the coordinator harness — the shared `/workspace` checkout carrying the
+ * architect's committed plan). Code lands via the sandbox git CLI (model-directed
+ * shell), not a github write tool; the workflow pushes the branch deterministically
+ * after the session. Model + thinkingLevel from the `executor` task key.
  */
-export function createExecutorAgent(
-  ref: RepoRef,
-  octokit: Octokit,
-  sandbox: SandboxFactory,
-) {
-  return createAgent(() => ({
-    model: resolveModel(EXECUTOR_TASK_KEY),
-    thinkingLevel: resolveThinking(EXECUTOR_TASK_KEY),
-    instructions: loadPersona(),
-    tools: githubReadTools(ref, octokit),
-    skills: [building],
-    sandbox,
-    cwd: EXECUTOR_CWD,
-  }));
-}
+export const executorProfile = defineAgentProfile({
+  name: EXECUTOR_PROFILE_NAME,
+  description,
+  model: resolveModel(EXECUTOR_TASK_KEY),
+  thinkingLevel: resolveThinking(EXECUTOR_TASK_KEY),
+  instructions: loadPersona(),
+  skills: [building],
+});

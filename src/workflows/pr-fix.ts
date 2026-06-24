@@ -29,34 +29,34 @@
  * re-invokes the whole pass; the agent re-reads current state (idempotent enough). The
  * push targets the BOUND head branch; the ack/push refs are never model-selectable.
  *
- * SANDBOX REQUIRED (not additive): the fix needs the workspace, so a provisioning /
- * clone failure THROWS. ⚠ EGRESS DEFERRED — do NOT run untrusted input through it.
+ * SANDBOX REQUIRED (not additive): the fix needs the workspace, so a clone failure
+ * THROWS. ⚠ EGRESS DEFERRED — do NOT run untrusted input through it.
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The bound
+ * `fixAgent` declares `sandbox: dockerSandbox()` (the HARNESS owns a fresh
+ * self-terminating container); `run()` clones the PR HEAD branch into `/workspace`
+ * via `cloneRepoIntoHarness` (NO remote scrub — the token-bearing origin is needed
+ * for the push), then reads HEAD + pushes via `harness.shell`. `ctx.payload`→`input`,
+ * `ctx.init`→`harness`.
  *
- * TESTABILITY: `run` defers to `runPrFix(ctx, deps)` with an injectable `deps` seam
- * (token minter, octokit factory, head-ref resolver, fix-session runner, sandbox ops,
- * head-sha read, the MOCKED push, the ack poster). The default deps wire the real
- * implementations; tests pass fakes so the whole flow runs with NO live model / git /
- * GitHub / Docker.
+ * TESTABILITY: the inline `run` defers to `runPrFix(ctx, deps)` with an injectable
+ * `deps` seam (token minter, octokit factory, head-ref resolver, fix-session runner,
+ * head-sha read, the MOCKED push, the ack poster). Tests pass fakes so the whole flow
+ * runs with NO live model / git / GitHub / Docker.
  */
-import type { FlueContext, SandboxFactory } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
 import { Octokit } from "octokit";
+import * as v from "valibot";
 import {
   GITHUB_PERMISSION_PROFILES,
   type GitAccessProfile,
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createFixAgent } from "../agent-lib/build-reviewer.ts";
+import { fixAgent } from "../agent-lib/build-reviewer.ts";
 import { renderPrFixPrompt } from "../agent-lib/pr-fix-prompt.ts";
-import {
-  withPrFixSandbox,
-  defaultBuildSandboxOps,
-  type BuildSandboxOps,
-  type BuildContainer,
-} from "../agent-lib/build-sandbox.ts";
-import type { RepoRef } from "../tools/github-read.ts";
+import { cloneRepoIntoHarness } from "../agent-lib/build-sandbox.ts";
+import { githubReadTools, type RepoRef } from "../tools/github-read.ts";
 import {
   renderAckComment,
   postAckCommentDeterministically,
@@ -65,18 +65,28 @@ import {
 } from "../pr-fix-post.ts";
 
 /** The workflow input payload (identifies the PR + the fix request). */
-export interface PrFixInput {
-  owner: string;
-  repo: string;
-  prNumber: number;
+export const PrFixInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
+  prNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** The review comment / "fix that" instruction / failed-checks context (UNTRUSTED). */
-  fixRequest?: string;
+  fixRequest: v.optional(v.string()),
   /** Optional CI / failing-checks context (UNTRUSTED) when the trigger is failing CI. */
-  ciContext?: string;
+  ciContext: v.optional(v.string()),
   /** Trigger provenance: "review_comment" | "comment" | "ci" | "cli" (drives messaging). */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
   /** Who requested the fix (trigger metadata — stays outside the untrusted wrappers). */
-  requestedBy?: string;
+  requestedBy: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type PrFixInput = v.InferOutput<typeof PrFixInputSchema>;
+
+/** The action context surface the testable core needs (harness + input + log). */
+export interface PrFixRunCtx {
+  harness: FlueHarness;
+  input: PrFixInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -113,28 +123,25 @@ export interface PrFixDeps {
    * a model tool) — reads `pulls.get()` over the bound octokit.
    */
   getPrHead(octokit: Octokit, ref: PrFixRef): Promise<{ headRef: string; title: string }>;
-  /** Container lifecycle ops for the build sandbox (real Docker by default). */
-  sandboxOps: BuildSandboxOps;
   /**
-   * Run the fix agent session against the pre-cloned PR head checkout + the rendered
-   * prompt; returns its raw text. The agent COMMITS its fix in-sandbox via the git
-   * CLI but does NOT push.
+   * Run the fix agent session against the PR-head checkout (in the harness sandbox) +
+   * the rendered prompt; returns its raw text. The agent COMMITS its fix in-sandbox
+   * via the git CLI but does NOT push.
    */
   runFixSession(
-    ctx: FlueContext<PrFixInput>,
+    ctx: PrFixRunCtx,
     ref: RepoRef,
     octokit: Octokit,
-    sandbox: SandboxFactory,
     prompt: string,
   ): Promise<string>;
   /** Read the branch HEAD sha after the fix committed (the push anchor). */
-  readHeadSha(container: BuildContainer): Promise<string>;
+  readHeadSha(harness: FlueHarness): Promise<string>;
   /**
-   * Push the PR head branch to origin over the repo-write token (the controlled,
-   * workflow-owned side effect — a SEAM so tests assert it WOULD push the BOUND ref,
-   * WITHOUT a real push). LIVE form runs `git push origin <branch>` in-sandbox.
+   * Push the PR head branch to origin over the token-bearing origin URL (the
+   * controlled, workflow-owned side effect — a SEAM so tests assert it WOULD push the
+   * BOUND ref WITHOUT a real push). LIVE form runs `git push origin <branch>` in-sandbox.
    */
-  pushBranch(container: BuildContainer, branch: string): Promise<void>;
+  pushBranch(harness: FlueHarness, branch: string): Promise<void>;
   /** Deterministically post the ack comment (bound ref, not a model tool). */
   postAck(octokit: Octokit, ref: PrFixRef, branch: string, sha: string): Promise<PostedAck>;
 }
@@ -171,39 +178,34 @@ async function getPrHead(
   return { headRef: data.head.ref, title: data.title ?? "" };
 }
 
-/** The real fix run: init the fix agent, open the session, prompt with the request. */
+/** The real fix run: open the session on the bound harness, prompt with the request. */
 async function runFixSession(
-  ctx: FlueContext<PrFixInput>,
+  ctx: PrFixRunCtx,
   ref: RepoRef,
   octokit: Octokit,
-  sandbox: SandboxFactory,
   prompt: string,
 ): Promise<string> {
-  const agent = createFixAgent(ref, octokit, sandbox);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("pr-fix");
-  const res = await session.prompt(prompt);
+  const session = await ctx.harness.session("pr-fix");
+  // Per-run READ tools injected for THIS call only — owner/repo/token never model-selectable.
+  const res = await session.prompt(prompt, { tools: githubReadTools(ref, octokit) });
   return res.text;
 }
 
 /** Read the branch HEAD sha over the same checkout (deterministic, not a model tool). */
-async function readHeadSha(container: BuildContainer): Promise<string> {
-  const r = await container.exec("git rev-parse HEAD", {
-    cwd: PR_FIX_WORKSPACE,
-    timeoutMs: 30_000,
-  });
+async function readHeadSha(harness: FlueHarness): Promise<string> {
+  const r = await harness.shell("git rev-parse HEAD", { cwd: PR_FIX_WORKSPACE });
   return r.stdout.trim();
 }
 
 /**
  * Push the PR head branch to origin (the LIVE side effect). Runs in-sandbox over the
- * baked repo-write token. The branch ref is BOUND (the workflow-resolved head ref),
- * never model-chosen. In tests this whole seam is mocked → NO real push happens.
+ * token-bearing origin URL the clone left in place. The branch ref is BOUND (the
+ * workflow-resolved head ref), never model-chosen. In tests this seam is mocked → NO
+ * real push happens.
  */
-async function pushBranch(container: BuildContainer, branch: string): Promise<void> {
-  const r = await container.exec(`git push origin ${shellArgInline(branch)}`, {
+async function pushBranch(harness: FlueHarness, branch: string): Promise<void> {
+  const r = await harness.shell(`git push origin ${shellArgInline(branch)}`, {
     cwd: PR_FIX_WORKSPACE,
-    timeoutMs: 5 * 60_000,
   });
   if (r.exitCode !== 0) {
     throw new Error(`pr-fix: git push failed (${r.exitCode}): ${r.stderr.trim()}`);
@@ -221,7 +223,6 @@ export function defaultDeps(): PrFixDeps {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
     getPrHead,
-    sandboxOps: defaultBuildSandboxOps(),
     runFixSession,
     readHeadSha,
     pushBranch,
@@ -235,15 +236,15 @@ export function defaultDeps(): PrFixDeps {
  * `defaultDeps()`, tests pass fakes (no live model / git / GitHub / Docker).
  */
 export async function runPrFix(
-  ctx: FlueContext<PrFixInput>,
+  ctx: PrFixRunCtx,
   deps: PrFixDeps = defaultDeps(),
 ): Promise<PrFixResult> {
-  const { owner, repo, prNumber } = ctx.payload;
+  const { owner, repo, prNumber } = ctx.input;
   const ref: PrFixRef = { owner, repo, pull_number: prNumber };
   const repoRef: RepoRef = { owner, repo };
 
   // 1. Mint the repo-write scoped token (PEM wall) + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 2. Resolve the PR head ref DETERMINISTICALLY (workflow code, not a model tool) so
@@ -256,26 +257,21 @@ export async function runPrFix(
     branch: headRef,
     prNumber,
     prTitle: title,
-    fixRequest: ctx.payload.fixRequest,
-    ciContext: ctx.payload.ciContext,
-    requestedBy: ctx.payload.requestedBy,
+    fixRequest: ctx.input.fixRequest,
+    ciContext: ctx.input.ciContext,
+    requestedBy: ctx.input.requestedBy,
   });
 
-  // 3. Pre-clone + check out the PR HEAD branch (CALLER owns the container lifetime —
-  //    torn down in withPrFixSandbox's finally, even on throw). Run the fix agent,
-  //    read the committed HEAD sha, then PUSH the bound head branch over the
-  //    deterministic seam (mocked in tests → asserts it WOULD push, no real push).
-  const { text: _text, sha } = await withPrFixSandbox(
-    { owner, repo, headRef },
-    token,
-    async (sandbox, container) => {
-      const text = await deps.runFixSession(ctx, repoRef, octokit, sandbox, prompt);
-      const headSha = await deps.readHeadSha(container);
-      await deps.pushBranch(container, headRef);
-      return { text, sha: headSha };
-    },
-    { ops: deps.sandboxOps, log: ctx.log },
-  );
+  // 3. Clone + check out the PR HEAD branch into the harness sandbox (the agent's
+  //    `dockerSandbox()` stood the container up at init; it self-terminates). The
+  //    token-bearing origin is LEFT IN PLACE (no scrub) so the push authenticates.
+  //    Run the fix agent, read the committed HEAD sha, then PUSH the bound head branch
+  //    over the deterministic seam (mocked in tests → asserts it WOULD push).
+  await cloneRepoIntoHarness(ctx.harness, { owner, repo, branch: headRef }, token);
+  const text = await deps.runFixSession(ctx, repoRef, octokit, prompt);
+  void text;
+  const sha = await deps.readHeadSha(ctx.harness);
+  await deps.pushBranch(ctx.harness, headRef);
 
   // 4. OPTIONALLY post a deterministic ack comment on the PR (reference on_success).
   const posted = await deps.postAck(octokit, ref, headRef, sha);
@@ -289,7 +285,11 @@ export async function runPrFix(
   };
 }
 
-/** Flue workflow entry — discovered as the `pr-fix` workflow. */
-export async function run(ctx: FlueContext<PrFixInput>): Promise<PrFixResult> {
-  return runPrFix(ctx);
-}
+/** Flue workflow — discovered as the `pr-fix` workflow. */
+export default defineWorkflow({
+  agent: fixAgent,
+  input: PrFixInputSchema,
+  async run({ harness, input, log }) {
+    return (await runPrFix({ harness, input, log })) as unknown as JsonValue;
+  },
+});

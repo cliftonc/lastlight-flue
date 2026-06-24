@@ -1,11 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import type { FlueContext } from "@flue/runtime";
 import type { Octokit } from "octokit";
 import {
   runPrComment,
   PR_COMMENT_PROFILE,
   type PrCommentDeps,
   type PrCommentInput,
+  type PrCommentRunCtx,
   type PrCommentContext,
 } from "../pr-comment.ts";
 import { COMMENT_TASK_KEY } from "../../agent-lib/pr-comment.ts";
@@ -19,17 +19,17 @@ import { renderPrCommentPrompt } from "../../agent-lib/pr-comment-prompt.ts";
 
 const BOT = "last-light[bot]";
 
-function fakeCtx(payload: PrCommentInput): FlueContext<PrCommentInput> {
+function fakeCtx(payload: PrCommentInput): PrCommentRunCtx {
   return {
     id: "test-run",
-    payload,
+    input: payload,
     env: {},
     req: undefined,
     log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     init: vi.fn(async () => {
       throw new Error("init must not be called — runComment is injected in tests");
     }),
-  } as unknown as FlueContext<PrCommentInput>;
+  } as unknown as PrCommentRunCtx;
 }
 
 const PR: PrCommentContext = {
@@ -54,7 +54,7 @@ function fakeDeps(opts: {
   let promptSeen: { ref: IssueCommentRef; pr: PrCommentContext } | undefined;
   const runComment = vi.fn(
     async (
-      _ctx: FlueContext<PrCommentInput>,
+      _ctx: PrCommentRunCtx,
       ref: IssueCommentRef,
       _octokit: Octokit,
       pr: PrCommentContext,

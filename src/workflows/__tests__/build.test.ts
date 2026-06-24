@@ -2,16 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { FlueContext } from '@flue/runtime';
 import { runBuild } from '../build.ts';
 import { BuildRunStore } from '../../build-run-store.ts';
 import { resume, recoverOrphanRuns } from '../../resume.ts';
 import {
   type BuildInput,
+  type BuildRunCtx,
   type BuildDeps,
   type BuildResult,
   defaultBuildDeps,
 } from '../../agent-lib/build-phases.ts';
+import { NULL_REPORTER } from '../../notify/state.ts';
+import type { NotifierState, ProgressReporter } from '../../notify/types.ts';
 
 // Phase 4 — durable build CONTROL FLOW tests (offline; NO live model / GitHub).
 //
@@ -41,8 +43,14 @@ const INPUT: Omit<BuildInput, 'resumedGate'> = {
   issue: 42,
 };
 
-function ctx(input: BuildInput): FlueContext<BuildInput> {
-  return { payload: input, log: { info() {}, warn() {}, error() {} } } as unknown as FlueContext<BuildInput>;
+function ctx(input: BuildInput): BuildRunCtx {
+  // Control-flow tests use the top-level BuildDeps fake (runPhase ignores the harness),
+  // so a stub harness is sufficient here.
+  return {
+    harness: { name: 'default' } as unknown as BuildRunCtx['harness'],
+    input,
+    log: { info() {}, warn() {}, error() {} },
+  };
 }
 
 /**
@@ -430,6 +438,81 @@ describe('build — idempotency: phases run EXACTLY ONCE across many re-invokes'
     expect(count('recheck:0')).toBe(1);
     expect(count('reviewer:1')).toBe(1);
     expect(t.prOpens).toEqual([INPUT.runId]); // PR opened once
+  });
+});
+
+describe('build — Phase 8 progress reporter wiring', () => {
+  /** A reporter that records the ordered transition calls the control flow drives. */
+  function recordingReporter() {
+    const calls: string[] = [];
+    const reporter: ProgressReporter = {
+      async start() { calls.push('start'); },
+      async step(key, status) { calls.push(`step:${key}:${status}`); },
+      async insertStep(s) { calls.push(`insert:${s.key}:${s.status}`); },
+      async note() { calls.push('note'); },
+      async noteTerminal() { calls.push('noteTerminal'); },
+    };
+    return { reporter, calls };
+  }
+
+  it('drives running→done per phase, pings on gate + completion, across a resume', async () => {
+    const t = recordingDeps({ gates: { post_architect: true } });
+    const r1 = recordingReporter();
+    const paused = await runBuild(ctx({ ...INPUT }), store, {
+      ...t.deps,
+      makeReporter: async () => r1.reporter,
+    });
+    expect(paused.status).toBe('paused');
+    // guardrails + architect tracked; the gate pings the silent (Slack) surface.
+    expect(r1.calls).toEqual([
+      'step:guardrails:running',
+      'step:guardrails:done',
+      'step:architect:running',
+      'step:architect:done',
+      'noteTerminal',
+    ]);
+
+    // A resume constructs a FRESH reporter (re-attached in prod); the loop row is
+    // inserted before `pr`, and completion pings the silent surface.
+    const r2 = recordingReporter();
+    const done = await resume(INPUT.runId, 'approve', {
+      storePath: join(dir, 'build.db'),
+      reinvoke: (input) => runBuild(ctx(input), store, { ...t.deps, makeReporter: async () => r2.reporter }),
+    });
+    expect(done.status).toBe('complete');
+    expect(r2.calls).toEqual([
+      'step:executor:running',
+      'step:executor:done',
+      'insert:reviewer:0:running',
+      'step:reviewer:0:done',
+      'step:pr:running',
+      'step:pr:done',
+      'noteTerminal',
+    ]);
+  });
+
+  it('marks guardrails failed on a BLOCKED screen', async () => {
+    const t = recordingDeps({ guardrails: 'BLOCKED — no test framework.' });
+    const r = recordingReporter();
+    const res = await runBuild(ctx({ ...INPUT }), store, { ...t.deps, makeReporter: async () => r.reporter });
+    expect(res.status).toBe('failed');
+    expect(r.calls).toEqual(['step:guardrails:running', 'step:guardrails:failed']);
+  });
+
+  it('persists the NotifierState handles to scratch so a resume re-attaches the surface', async () => {
+    const t = recordingDeps({ gates: { post_architect: false } });
+    // A reporter factory that simulates the GitHub transport creating its comment
+    // (calls `save` with the new comment id), then no-ops the rest.
+    const makeReporter = async (
+      _c: BuildRunCtx,
+      _r: unknown,
+      save: (patch: NotifierState) => void,
+    ): Promise<ProgressReporter> => {
+      save({ githubCommentId: 4242 });
+      return NULL_REPORTER;
+    };
+    await runBuild(ctx({ ...INPUT }), store, { ...t.deps, makeReporter });
+    expect(store.get(INPUT.runId)!.scratch['notifier:githubCommentId']).toBe('4242');
   });
 });
 

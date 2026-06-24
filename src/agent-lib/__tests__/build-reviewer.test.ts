@@ -1,13 +1,13 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import type { SandboxFactory, AgentCreateContext } from "@flue/runtime";
+import { describe, it, expect, vi } from "vitest";
+import type { FlueHarness } from "@flue/runtime";
 import type { Octokit } from "octokit";
-import type { FlueContext } from "@flue/runtime";
 import {
-  createBuildReviewerAgent,
-  createFixAgent,
+  buildReviewerProfile,
+  buildFixProfile,
+  BUILD_REVIEWER_PROFILE_NAME,
+  BUILD_FIX_PROFILE_NAME,
   REVIEW_TASK_KEY,
   FIX_TASK_KEY,
-  BUILD_REVIEWER_CWD,
 } from "../build-reviewer.ts";
 import {
   runReviewerPhase,
@@ -21,27 +21,17 @@ import {
   type ArchitectPhaseDeps,
   type ExecutorPhaseDeps,
   type BuildInput,
+  type BuildRunCtx,
 } from "../build-phases.ts";
-import {
-  resolveModel,
-  resolveThinking,
-  setRuntimeConfig,
-  resetRuntimeConfigForTests,
-} from "../../config.ts";
+import { resolveModel, resolveThinking } from "../../config.ts";
 import { loadPersona } from "../persona.ts";
 import type { BuildRun } from "../../build-run-store.ts";
-import { closeBuildWorkspace, resetBuildWorkspacesForTests } from "../build-sandbox.ts";
-import type { BuildSandboxOps, BuildContainer } from "../build-sandbox.ts";
 
-afterEach(() => resetBuildWorkspacesForTests());
+// beta.3 — reviewer-loop (reviewer / fix / recheck) SUBAGENT-PROFILE config + phase
+// WIRING, all offline (no live model / GitHub / Docker / push). Profiles are STATIC
+// `defineAgentProfile`s; the phase wiring (token mint, clone-into-harness, subagent
+// task, verdict parse, fix sha read, the MOCKED push seam) is asserted over injected deps.
 
-// Phase 4 — reviewer-loop (reviewer / fix / recheck) agent CONFIG + phase WIRING,
-// all offline (no live model / GitHub / Docker / push). Config is asserted by
-// invoking each agent's `initialize` closure; the phase wiring (token mint,
-// pre-clone, session, verdict parse, fix sha read, the MOCKED push seam, teardown)
-// is asserted over injected deps.
-
-const SANDBOX = { __fake: true } as unknown as SandboxFactory;
 const FAKE_OCTOKIT = { __fake: "octokit" } as unknown as Octokit;
 const REF = { owner: "cliftonc", repo: "widget" };
 
@@ -61,17 +51,21 @@ const RUN: BuildRun = {
   failReason: null,
 };
 
-function ctx(payload: Partial<BuildInput> = {}): FlueContext<BuildInput> {
+/** A stub coordinator harness — the wiring tests fake every harness-touching dep. */
+const STUB_HARNESS = { name: "default" } as unknown as FlueHarness;
+
+function ctx(input: Partial<BuildInput> = {}): BuildRunCtx {
   return {
-    payload: {
+    harness: STUB_HARNESS,
+    input: {
       runId: RUN.id,
       owner: RUN.owner,
       repo: RUN.repo,
       issue: RUN.issue,
-      ...payload,
+      ...input,
     },
     log: { info() {}, warn() {}, error() {} },
-  } as unknown as FlueContext<BuildInput>;
+  };
 }
 
 describe("cycleFromPhaseName — per-cycle key parsing", () => {
@@ -85,97 +79,37 @@ describe("cycleFromPhaseName — per-cycle key parsing", () => {
   });
 });
 
-describe("createBuildReviewerAgent — config (review key / persona / skills / sandbox / cwd)", () => {
-  it("resolves model+thinking for the review task key, carries persona + 3 review skills + sandbox/cwd + read-only tools", async () => {
-    setRuntimeConfig({
-      models: { default: "openai/gpt-5.1", review: "openai/gpt-5.1-codex" },
-      variants: { review: "high" },
-    } as never);
-    try {
-      const cfg = await createBuildReviewerAgent(REF, FAKE_OCTOKIT, SANDBOX).initialize(
-        {} as AgentCreateContext<unknown>,
-      );
-      expect(cfg.model).toBe(resolveModel(REVIEW_TASK_KEY));
-      expect(cfg.model).toBe("openai/gpt-5.1-codex");
-      expect(cfg.thinkingLevel).toBe(resolveThinking(REVIEW_TASK_KEY));
-      expect(cfg.thinkingLevel).toBe("high");
-      expect(cfg.instructions).toBe(loadPersona());
-      // pr-review + building + code-review.
-      expect(cfg.skills?.length).toBe(3);
-      // The reviewer REQUIRES the sandbox (it inspects the checkout).
-      expect(cfg.sandbox).toBe(SANDBOX);
-      expect(cfg.cwd).toBe(BUILD_REVIEWER_CWD);
-      expect(cfg.cwd).toBe("/workspace");
-      expect((cfg.tools ?? []).length).toBeGreaterThan(0);
-    } finally {
-      resetRuntimeConfigForTests();
-    }
+describe("buildReviewerProfile — static subagent-profile config (review key / persona / 3 skills)", () => {
+  it("resolves the review task key, carries persona + 3 review skills, and NO tools/sandbox/cwd", () => {
+    expect(buildReviewerProfile.name).toBe(BUILD_REVIEWER_PROFILE_NAME);
+    expect(buildReviewerProfile.model).toBe(resolveModel(REVIEW_TASK_KEY));
+    expect(buildReviewerProfile.thinkingLevel).toBe(resolveThinking(REVIEW_TASK_KEY));
+    expect(buildReviewerProfile.instructions).toBe(loadPersona());
+    // pr-review + building + code-review.
+    expect(buildReviewerProfile.skills?.length).toBe(3);
+    expect(buildReviewerProfile.tools).toBeUndefined();
+    expect((buildReviewerProfile as { sandbox?: unknown }).sandbox).toBeUndefined();
   });
 });
 
-describe("createFixAgent — config (fix key / persona / building skill / sandbox / cwd)", () => {
-  it("resolves model+thinking for the fix task key, carries persona + the building skill + sandbox/cwd", async () => {
-    setRuntimeConfig({
-      models: { default: "openai/gpt-5.1", fix: "openai/gpt-5.1-codex" },
-      variants: { fix: "high" },
-    } as never);
-    try {
-      const cfg = await createFixAgent(REF, FAKE_OCTOKIT, SANDBOX).initialize(
-        {} as AgentCreateContext<unknown>,
-      );
-      expect(cfg.model).toBe(resolveModel(FIX_TASK_KEY));
-      expect(cfg.model).toBe("openai/gpt-5.1-codex");
-      expect(cfg.thinkingLevel).toBe("high");
-      expect(cfg.instructions).toBe(loadPersona());
-      expect(cfg.skills?.length).toBe(1); // building
-      expect(cfg.sandbox).toBe(SANDBOX);
-      expect(cfg.cwd).toBe("/workspace");
-    } finally {
-      resetRuntimeConfigForTests();
-    }
-  });
-
-  it("falls back to the default model when no explicit fix key is configured", async () => {
-    setRuntimeConfig({ models: { default: "openai/gpt-5.1" }, variants: {} } as never);
-    try {
-      const cfg = await createFixAgent(REF, FAKE_OCTOKIT, SANDBOX).initialize(
-        {} as AgentCreateContext<unknown>,
-      );
-      expect(cfg.model).toBe("openai/gpt-5.1");
-    } finally {
-      resetRuntimeConfigForTests();
-    }
+describe("buildFixProfile — static subagent-profile config (fix key / persona / building skill)", () => {
+  it("resolves the fix task key, carries persona + the building skill, and NO tools/sandbox/cwd", () => {
+    expect(buildFixProfile.name).toBe(BUILD_FIX_PROFILE_NAME);
+    expect(buildFixProfile.model).toBe(resolveModel(FIX_TASK_KEY));
+    expect(buildFixProfile.thinkingLevel).toBe(resolveThinking(FIX_TASK_KEY));
+    expect(buildFixProfile.instructions).toBe(loadPersona());
+    expect(buildFixProfile.skills?.length).toBe(1); // building
+    expect(buildFixProfile.tools).toBeUndefined();
   });
 });
-
-/** A fake build container recording exec calls (incl. push) + teardown. */
-function fakeContainer(opts: { sha?: string } = {}) {
-  const execCalls: string[] = [];
-  let removed = 0;
-  const container: BuildContainer = {
-    async exec(command) {
-      execCalls.push(command);
-      if (command.includes("git rev-parse HEAD")) {
-        return { stdout: `${opts.sha ?? "fixsha0000"}\n`, stderr: "", exitCode: 0 };
-      }
-      return { stdout: "", stderr: "", exitCode: 0 };
-    },
-    async remove() {
-      removed += 1;
-    },
-    sandbox: () => SANDBOX,
-  };
-  return { container, execCalls, removed: () => removed };
-}
 
 describe("runReviewerPhase — wiring (reviewer:N + recheck:N) over injected deps", () => {
   function makeDeps(opts: { verdict?: string } = {}) {
-    const fc = fakeContainer();
     const calls = {
       minted: 0,
+      cloned: 0,
       prompt: undefined as string | undefined,
-      sessionName: undefined as string | undefined,
-      sandboxSeen: undefined as SandboxFactory | undefined,
+      phaseSeen: undefined as string | undefined,
       refSeen: undefined as { owner: string; repo: string } | undefined,
     };
     const deps: ReviewerPhaseDeps = {
@@ -184,16 +118,17 @@ describe("runReviewerPhase — wiring (reviewer:N + recheck:N) over injected dep
         return "ghs_review_token";
       },
       makeOctokit: () => FAKE_OCTOKIT,
-      sandboxOps: { createContainer: vi.fn(async () => fc.container) } as BuildSandboxOps,
-      async runReviewerSession(_c, ref, _o, sandbox, prompt, sessionName) {
+      async ensureCheckout() {
+        calls.cloned += 1;
+      },
+      async runReviewerSession(_c, ref, _o, prompt, phase) {
         calls.prompt = prompt;
-        calls.sessionName = sessionName;
-        calls.sandboxSeen = sandbox;
+        calls.phaseSeen = phase;
         calls.refSeen = ref;
         return opts.verdict ?? "VERDICT: APPROVED\n\nLGTM.";
       },
     };
-    return { deps, calls, fc };
+    return { deps, calls };
   }
 
   it("reviewer:0 renders reviewer.md, runs the session, returns the verdict text + the verdict pointer", async () => {
@@ -205,43 +140,40 @@ describe("runReviewerPhase — wiring (reviewer:N + recheck:N) over injected dep
       ".lastlight/issue-42/reviewer-verdict.md",
     );
     expect(calls.minted).toBe(1);
-    expect(calls.sessionName).toBe("reviewer:0");
-    expect(calls.sandboxSeen).toBe(SANDBOX);
+    expect(calls.cloned).toBe(1);
+    expect(calls.phaseSeen).toBe("reviewer:0");
     expect(calls.refSeen).toEqual(REF);
     // reviewer.md (first review) names the architect plan + the diff command.
     expect(calls.prompt).toContain("git diff main...HEAD");
   });
 
-  it("recheck:1 renders re-reviewer.md naming the fix cycle in a recheck session", async () => {
+  it("recheck:1 renders re-reviewer.md naming the fix cycle in a recheck phase", async () => {
     const { deps, calls } = makeDeps({ verdict: "VERDICT: REQUEST_CHANGES\n\nStill broken." });
     const res = await runReviewerPhase(ctx(), RUN, 1, true, deps);
 
     expect(res.text).toContain("VERDICT: REQUEST_CHANGES");
-    expect(calls.sessionName).toBe("recheck:1");
+    expect(calls.phaseSeen).toBe("recheck:1");
     expect(calls.prompt).toContain("RE-REVIEW after fix cycle 1");
   });
 
-  it("tears the container down even when the reviewer session throws (finally)", async () => {
-    const { deps, fc } = makeDeps();
+  it("propagates a reviewer session throw (no swallow)", async () => {
+    const { deps } = makeDeps();
     deps.runReviewerSession = async () => {
       throw new Error("model exploded mid-review");
     };
     await expect(runReviewerPhase(ctx(), RUN, 0, false, deps)).rejects.toThrow(
       "model exploded mid-review",
     );
-    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
-    await closeBuildWorkspace(RUN.taskId);
-    expect(fc.removed()).toBe(1);
   });
 });
 
 describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no real push)", () => {
   function makeDeps(opts: { sessionText?: string; sha?: string } = {}) {
-    const fc = fakeContainer({ sha: opts.sha });
     const calls = {
       minted: 0,
+      cloned: 0,
       prompt: undefined as string | undefined,
-      sessionName: undefined as string | undefined,
+      phaseSeen: undefined as string | undefined,
       headRead: 0,
       pushed: [] as string[],
     };
@@ -251,10 +183,12 @@ describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no rea
         return "ghs_fix_token";
       },
       makeOctokit: () => FAKE_OCTOKIT,
-      sandboxOps: { createContainer: vi.fn(async () => fc.container) } as BuildSandboxOps,
-      async runFixSession(_c, _ref, _o, _sandbox, prompt, sessionName) {
+      async ensureCheckout() {
+        calls.cloned += 1;
+      },
+      async runFixSession(_c, _ref, _o, prompt, phase) {
         calls.prompt = prompt;
-        calls.sessionName = sessionName;
+        calls.phaseSeen = phase;
         return opts.sessionText ?? "Fixed the null deref; tests pass.";
       },
       async readHeadSha() {
@@ -262,11 +196,11 @@ describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no rea
         return opts.sha ?? "fixsha0000";
       },
       // The MOCKED push seam: records the branch it WOULD push — NO real push.
-      async pushBranch(_container, branch) {
+      async pushBranch(_harness, branch) {
         calls.pushed.push(branch);
       },
     };
-    return { deps, calls, fc };
+    return { deps, calls };
   }
 
   it("fix:0 renders fix.md (naming the reviewer-verdict handoff), commits, reads the sha, pushes the bound branch", async () => {
@@ -276,7 +210,8 @@ describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no rea
     expect(res.text).toBe("FIXED");
     expect(res.sha).toBe("fix0sha");
     expect(calls.minted).toBe(1);
-    expect(calls.sessionName).toBe("fix:0");
+    expect(calls.cloned).toBe(1);
+    expect(calls.phaseSeen).toBe("fix:0");
     expect(calls.headRead).toBe(1);
     // The fix reads the reviewer notes from the committed handoff file.
     expect(calls.prompt).toContain(".lastlight/issue-42/reviewer-verdict.md");
@@ -285,25 +220,23 @@ describe("runFixPhase — wiring (fix:N) over injected deps (mocked push, no rea
     expect(calls.pushed).toEqual(["lastlight/42"]);
   });
 
-  it("tears the container down even when the fix session throws (finally) — and does NOT push", async () => {
-    const { deps, fc, calls } = makeDeps();
+  it("does NOT push when the fix session throws (a failed fix never pushes)", async () => {
+    const { deps, calls } = makeDeps();
     deps.runFixSession = async () => {
       throw new Error("model exploded mid-fix");
     };
     await expect(runFixPhase(ctx(), RUN, 0, deps)).rejects.toThrow("model exploded mid-fix");
-    expect(fc.removed()).toBe(0); // shared workspace — NOT torn down per phase
-    await closeBuildWorkspace(RUN.taskId);
-    expect(fc.removed()).toBe(1);
     expect(calls.pushed).toEqual([]); // a failed fix never pushes
   });
 
   it("never leaks the token through the logger", async () => {
     const warn = vi.fn();
     const { deps } = makeDeps();
-    const c = {
-      payload: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
+    const c: BuildRunCtx = {
+      harness: STUB_HARNESS,
+      input: { runId: RUN.id, owner: RUN.owner, repo: RUN.repo, issue: RUN.issue },
       log: { info() {}, warn, error() {} },
-    } as unknown as FlueContext<BuildInput>;
+    };
     await runFixPhase(c, RUN, 0, deps);
     for (const call of warn.mock.calls) {
       expect(JSON.stringify(call)).not.toContain("ghs_fix_token");
@@ -317,13 +250,12 @@ describe("defaultBuildDeps.runPhase — per-cycle reviewer-loop routing (over in
   const noopExec = {} as ExecutorPhaseDeps;
 
   function reviewerDeps(verdict: string): ReviewerPhaseDeps {
-    const fc = fakeContainer();
     return {
       async mintToken() {
         return "ghs_review_token";
       },
       makeOctokit: () => FAKE_OCTOKIT,
-      sandboxOps: { createContainer: async () => fc.container } as BuildSandboxOps,
+      async ensureCheckout() {},
       async runReviewerSession() {
         return verdict;
       },
@@ -331,21 +263,20 @@ describe("defaultBuildDeps.runPhase — per-cycle reviewer-loop routing (over in
   }
 
   function fixDeps(): { deps: FixPhaseDeps; pushed: string[] } {
-    const fc = fakeContainer({ sha: "routed-fix-sha" });
     const pushed: string[] = [];
     const deps: FixPhaseDeps = {
       async mintToken() {
         return "ghs_fix_token";
       },
       makeOctokit: () => FAKE_OCTOKIT,
-      sandboxOps: { createContainer: async () => fc.container } as BuildSandboxOps,
+      async ensureCheckout() {},
       async runFixSession() {
         return "fixed";
       },
       async readHeadSha() {
         return "routed-fix-sha";
       },
-      async pushBranch(_c, branch) {
+      async pushBranch(_h, branch) {
         pushed.push(branch);
       },
     };

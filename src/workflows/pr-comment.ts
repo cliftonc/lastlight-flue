@@ -42,14 +42,19 @@
  * NO SANDBOX: pr-comment is tool-only (reads the PR + diff + thread via bound read
  * tools — the skill caps it at ≤8 file reads, no checkout). Cheaper + lower latency.
  *
- * Beta.2 form: `export async function run(ctx)` (no `defineWorkflow` — flue-ref §0).
+ * Beta.3 form: `export default defineWorkflow({ agent, input, run })`. The bound
+ * `prCommentAgent` is the root harness/policy; the per-run READ tools (closed over
+ * ref + scoped-token Octokit) are injected per-call via `session.prompt(_, {
+ * tools })`, so the security spine is unchanged. `ctx.payload`→`input`,
+ * `ctx.init(agent)`→the supplied `harness`, `ctx.id`→`harness.name`.
  *
  * TESTABILITY: `run` defers to `runPrComment(ctx, deps)` with an injectable `deps`
  * seam (token minter, octokit factory, context fetcher, agent runner, poster). The
  * default deps wire the real implementations; tests pass fakes so the whole flow runs
  * with NO live model and NO live GitHub.
  */
-import type { FlueContext } from "@flue/runtime";
+import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
   GITHUB_PERMISSION_PROFILES,
@@ -57,7 +62,8 @@ import {
 } from "../engine/profiles.ts";
 import { configureGitAuth } from "../engine/git-auth.ts";
 import { loadConfig } from "../config.ts";
-import { createPrCommentAgent } from "../agent-lib/pr-comment.ts";
+import { prCommentAgent } from "../agent-lib/pr-comment.ts";
+import { githubReadTools } from "../tools/github-read.ts";
 import {
   renderPrCommentPrompt,
   type PrCommentPromptContext,
@@ -70,19 +76,34 @@ import {
 } from "../issue-comment-post.ts";
 
 /** The workflow input payload (identifies the PR + the triggering comment). */
-export interface PrCommentInput {
-  owner: string;
-  repo: string;
+export const PrCommentInputSchema = v.object({
+  owner: v.string(),
+  repo: v.string(),
   /** The PR number the comment is on. */
-  prNumber: number;
+  prNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
   /** The body of the triggering comment — the question the agent answers. */
-  commentBody: string;
+  commentBody: v.string(),
   /** The triggering comment's id — the dedup key (re-invoke / duplicate-delivery safe). */
-  commentId: number | string;
+  commentId: v.union([v.number(), v.string()]),
   /** Who wrote the triggering comment — the bot-loop guard reads this. */
-  sender?: string;
+  sender: v.optional(v.string()),
   /** Optional trigger provenance: "webhook" | "cron" | "cli". */
-  triggerType?: string;
+  triggerType: v.optional(v.string()),
+  /** App run id for stats correlation; falls back to `harness.name` when absent. */
+  runId: v.optional(v.string()),
+});
+export type PrCommentInput = v.InferOutput<typeof PrCommentInputSchema>;
+
+/**
+ * The action context surface the testable core needs: the supplied `harness`
+ * (already initialized from the bound `prCommentAgent`), the validated `input`, and
+ * the run-stream `log`. Mirrors Flue's `ActionContext` so the inline `run` passes
+ * straight through.
+ */
+export interface PrCommentRunCtx {
+  harness: FlueHarness;
+  input: PrCommentInput;
+  log: FlueLogger;
 }
 
 /** The workflow result. */
@@ -128,7 +149,7 @@ export interface PrCommentDeps {
    * session.prompt so tests can return a canned reply.
    */
   runComment(
-    ctx: FlueContext<PrCommentInput>,
+    ctx: PrCommentRunCtx,
     ref: IssueCommentRef,
     octokit: Octokit,
     pr: PrCommentContext,
@@ -199,16 +220,14 @@ async function fetchPrContext(
   };
 }
 
-/** The real run: init the agent, open a session, prompt with the PR + diff + trigger. */
+/** The real run: open a session on the bound harness, prompt with the PR + diff + trigger. */
 async function runCommentSession(
-  ctx: FlueContext<PrCommentInput>,
+  ctx: PrCommentRunCtx,
   ref: IssueCommentRef,
   octokit: Octokit,
   pr: PrCommentContext,
 ): Promise<string> {
-  const agent = createPrCommentAgent(ref, octokit);
-  const harness = await ctx.init(agent);
-  const session = await harness.session("pr-comment");
+  const session = await ctx.harness.session("pr-comment");
   const promptCtx: PrCommentPromptContext = {
     owner: ref.owner,
     repo: ref.repo,
@@ -221,11 +240,15 @@ async function runCommentSession(
     labels: pr.labels,
     diff: pr.diff,
     comments: pr.comments,
-    sender: ctx.payload.sender,
-    commentBody: ctx.payload.commentBody,
-    triggerType: ctx.payload.triggerType,
+    sender: ctx.input.sender,
+    commentBody: ctx.input.commentBody,
+    triggerType: ctx.input.triggerType,
   };
-  const res = await session.prompt(renderPrCommentPrompt(promptCtx));
+  // The per-run READ tools (closed over ref + scoped-token Octokit) are injected
+  // for THIS call only — owner/repo/token are never model-selectable.
+  const res = await session.prompt(renderPrCommentPrompt(promptCtx), {
+    tools: githubReadTools(ref, octokit),
+  });
   return res.text;
 }
 
@@ -246,10 +269,10 @@ export function defaultDeps(): PrCommentDeps {
  * `defaultDeps()`, tests pass fakes (no live model, no live GitHub).
  */
 export async function runPrComment(
-  ctx: FlueContext<PrCommentInput>,
+  ctx: PrCommentRunCtx,
   deps: PrCommentDeps = defaultDeps(),
 ): Promise<PrCommentResult> {
-  const { owner, repo, prNumber, commentId, sender } = ctx.payload;
+  const { owner, repo, prNumber, commentId, sender } = ctx.input;
   // A PR is addressed as an issue for the comments API — `issue_number === prNumber`.
   const ref: IssueCommentRef = { owner, repo, issue_number: prNumber };
 
@@ -264,7 +287,7 @@ export async function runPrComment(
   }
 
   // 2. Mint the issues-write scoped token + an Octokit bound to it.
-  const token = await deps.mintToken(ctx.payload);
+  const token = await deps.mintToken(ctx.input);
   const octokit = deps.makeOctokit(token);
 
   // 3. Fetch the PR context + diff deterministically (workflow code, not a model tool).
@@ -298,9 +321,16 @@ export async function runPrComment(
   };
 }
 
-/** Flue workflow entry — discovered as the `pr-comment` workflow. */
-export async function run(
-  ctx: FlueContext<PrCommentInput>,
-): Promise<PrCommentResult> {
-  return runPrComment(ctx);
-}
+/**
+ * Flue workflow — discovered as the `pr-comment` workflow. The runner owns root
+ * harness init from `prCommentAgent`; the inline `run` defers to the testable core.
+ */
+export default defineWorkflow({
+  agent: prCommentAgent,
+  input: PrCommentInputSchema,
+  async run({ harness, input, log }) {
+    // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
+    // The typed `PrCommentResult` is preserved on the testable core for tests.
+    return (await runPrComment({ harness, input, log })) as unknown as JsonValue;
+  },
+});
