@@ -258,6 +258,11 @@ export async function routeEvent(
           action: "workflow",
           workflow: "build",
           payload: {
+            // The APP run id the BuildInputSchema REQUIRES (= correlationId =
+            // conversationKey): the stable resume/gate key. Omitting it crashed
+            // admission with `action_input_validation` (same class of drift the
+            // shared buildWorkflowInput fixed for the cross-channel workflows).
+            runId: ev.correlationId,
             owner: t.owner,
             repo: t.repo,
             issue: ev.issueNumber,

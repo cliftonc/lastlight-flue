@@ -31,6 +31,7 @@
  * so the whole flow runs with NO live model and NO live GitHub.
  */
 import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import { Octokit } from "octokit";
 import * as v from "valibot";
 import { runPhasePrompt } from "../agent-lib/record-execution.ts";
@@ -236,6 +237,6 @@ export default defineWorkflow({
   agent: reviewerAgent,
   input: PrReviewInputSchema,
   async run({ harness, input, log }) {
-    return (await runPrReview({ harness, input, log })) as unknown as JsonValue;
+    return jsonSafe(await runPrReview({ harness, input, log })) as unknown as JsonValue;
   },
 });

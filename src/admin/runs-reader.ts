@@ -258,8 +258,6 @@ export function createDefaultRunActionsReader(
   const buildPath = opts.buildRunStorePath ?? defaultBuildRunStorePath();
   return {
     listRunExecutions(runId) {
-      // Lazy import keeps the seam module free of a hard sqlite dep at import.
-      const { StatsStore } = require('../stats-store.ts') as typeof import('../stats-store.ts');
       const store = new StatsStore(statsPath);
       try {
         return store.executionsForRun(runId).map(toRunExecution);
@@ -268,7 +266,6 @@ export function createDefaultRunActionsReader(
       }
     },
     cancelRun(runId) {
-      const { BuildRunStore } = require('../build-run-store.ts') as typeof import('../build-run-store.ts');
       const store = new BuildRunStore(buildPath);
       try {
         const run = store.get(runId);

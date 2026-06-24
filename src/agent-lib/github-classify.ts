@@ -47,7 +47,7 @@ const CLASSIFIER_PROMPT = `You are a router for comments directed at a GitHub bo
 Classify the user's message into exactly one category.
 
 Categories:
-BUILD — The user is ASKING YOU (the bot) to make code changes NOW: implement a feature, fix a bug, send a PR, resolve an issue with code. A comment that merely REPORTS work the human ALREADY did (past-tense "fixed"/"done"/"pushed", thanking you, explaining a change they made) is NOT BUILD — classify it CHAT. Only BUILD when the human asks for NEW work (imperative: "fix X", "now also handle Y", "update Z").
+BUILD — The user is ASKING YOU (the bot) to make code changes NOW: implement a feature, fix a bug, send a PR, resolve an issue with code. This includes a GO-AHEAD to build the thing the issue/thread is about, phrased as a suggestion or first-person-plural, not only a bare imperative: "let's build this", "let's do it", "build this", "go build it", "can you implement this?", "ship it", "make it happen", "implement the above". A comment that merely REPORTS work the human ALREADY did (past-tense "fixed"/"done"/"pushed", thanking you, explaining a change they made) is NOT BUILD — classify it CHAT. Only BUILD when the human asks for NEW work (imperative OR a go-ahead: "fix X", "now also handle Y", "update Z", "let's build this").
 EXPLORE — The user wants help shaping an idea BEFORE writing code: "help me think through X", "brainstorm Y", "spec this out", "explore". A bare "explore"/"explore this" on an existing issue is EXPLORE.
 QUESTION — A substantive INFORMATIONAL question warranting research: "how does X work?", "what's the difference between X and Y?", "is it possible to Z?". The deliverable is an ANSWER, not code.
 SECURITY — The user wants a security scan/review: "security review", "scan for vulnerabilities".
@@ -56,7 +56,9 @@ REJECT — Rejecting a pending gate: "reject", "abort", "cancel this".
 CHAT — Anything else: conversation, thanks, status reports of work already done.
 
 When ambiguous between BUILD/EXPLORE/QUESTION and CHAT, prefer CHAT. A clear
-imperative command on an existing issue (ISSUE TITLE present) is NOT ambiguous.
+imperative command OR a go-ahead to build ("let's build this", "build this",
+"go ahead and implement it") on an existing issue (ISSUE TITLE present) is NOT
+ambiguous — it is BUILD.
 
 Respond in exactly this format (each on its own line, no extra text):
 INTENT: BUILD|EXPLORE|QUESTION|SECURITY|APPROVE|REJECT|CHAT`;

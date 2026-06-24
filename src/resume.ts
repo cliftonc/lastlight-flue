@@ -1,5 +1,4 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawnFlueRun } from './agent-lib/spawn-flue-run.ts';
 import { BuildRunStore } from './build-run-store.ts';
 import type { BuildInput, BuildResult } from './agent-lib/build-phases.ts';
 
@@ -30,8 +29,6 @@ import type { BuildInput, BuildResult } from './agent-lib/build-phases.ts';
 // which runs the STUBBED build deps — it does not touch a real repo/model/GitHub
 // unless the (later-slice) real deps are wired in.
 
-const exec = promisify(execFile);
-
 export type ResumeDecision = 'approve' | 'reject';
 
 /** Re-invoke the build workflow for an app runId, carrying the parked gate token. */
@@ -54,9 +51,7 @@ const defaultStorePath = () =>
  */
 function defaultReinvoke(input: BuildInput): Reinvoker {
   return async () => {
-    await exec('pnpm', ['exec', 'flue', 'run', 'build', '--input', JSON.stringify(input)], {
-      timeout: 600_000,
-    });
+    await spawnFlueRun('build', input);
   };
 }
 

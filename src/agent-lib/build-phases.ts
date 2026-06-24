@@ -138,7 +138,15 @@ void _issueContextTypecheck;
  * (the per-run READ tools are injected per task call) — the security spine.
  */
 export const buildAgent = defineAgent(() => ({
-  sandbox: dockerSandbox(),
+  // The coordinator NEVER reasons itself — every phase delegates via
+  // `session.task({ agent: <profile> })`, and each profile carries its own model.
+  // beta.3 `initializeRootHarness` REQUIRES the root agent to declare a model (or
+  // `model: false`); omitting it crashed a live `flue run` with "defineAgent()
+  // requires a model" (unit tests inject a fake harness, so it never surfaced there).
+  model: false,
+  // NODE_OPTIONS baked into the container env so the executor's build/test/typecheck
+  // gate (tsc / vite / flue build can be heap-heavy) doesn't OOM at the Node default.
+  sandbox: dockerSandbox({ env: { NODE_OPTIONS: '--max-old-space-size=4096' } }),
   cwd: BUILD_WORKSPACE,
   subagents: [
     guardrailsProfile,
@@ -217,6 +225,18 @@ export interface BuildDeps {
     ctx: BuildRunCtx,
     run: BuildRun,
   ): Promise<{ html_url: string; number?: number }>;
+  /**
+   * Post a one-off explanatory ISSUE COMMENT (deterministic, scoped token). Used when
+   * a user RE-TRIGGERS a build whose run is already terminal (complete/failed) — that
+   * path is otherwise a SILENT no-op, so from GitHub it looks like the bot ignored the
+   * request. Optional + best-effort: omitted (tests/CLI) or a throw never affects the
+   * durable return. NOT fired on boot/resume re-invokes (only a genuine user comment).
+   */
+  postNotice?(
+    ctx: BuildRunCtx,
+    run: BuildRun,
+    message: string,
+  ): Promise<void>;
   /** Whether a gate fires (positive-enable config). Disabled → no pause. */
   gateEnabled(gate: 'post_architect' | 'post_reviewer'): boolean;
   /** Parse the reviewer verdict marker (the prompt↔code contract). */
@@ -286,8 +306,19 @@ export function cycleFromPhaseName(name: string): number {
 
 // ── Shared sandbox/session plumbing ────────────────────────────────────────────
 
-/** The coordinator session name build phases delegate their subagent tasks from. */
-const BUILD_SESSION = 'build';
+/**
+ * Per-phase session name. Each phase delegates its subagent task from a session
+ * NAMED FOR THE PHASE (`guardrails`, `architect`, `executor`, `reviewer-0`, …) so the
+ * dashboard pipeline labels each node by phase instead of one opaque shared `build`
+ * session + anonymous `task:build:<uuid>` children. Colons (reviewer:0) → dashes so
+ * the derived task name `task:<session>:<uuid>` stays unambiguous. Phases share the
+ * coordinator harness (so the /workspace checkout persists); only the session thread
+ * differs — no cross-phase conversation state is relied upon (the reviewer is even
+ * prompted as having NO shared context), so distinct sessions are behavior-neutral.
+ */
+function phaseSession(phase: string): string {
+  return phase.replace(/:/g, '-');
+}
 
 /** Harnesses whose /workspace already holds the cloned checkout (clone-once-per-invocation). */
 const clonedBuildHarnesses = new WeakSet<FlueHarness>();
@@ -307,7 +338,9 @@ export async function ensureBuildCheckout(
   if (clonedBuildHarnesses.has(harness)) return;
   await cloneRepoIntoHarness(
     harness,
-    { owner: run.owner, repo: run.repo, branch: run.branch },
+    // installDeps: the executor runs the repo's build/test/typecheck gate, so it needs
+    // a populated node_modules/.bin (without it the executor hit `tsc: not found`).
+    { owner: run.owner, repo: run.repo, branch: run.branch, installDeps: true },
     token,
   );
   clonedBuildHarnesses.add(harness);
@@ -331,7 +364,7 @@ async function runPhaseTask(
   prompt: string,
   tools: ToolDefinition[],
 ): Promise<string> {
-  const session = await ctx.harness.session(BUILD_SESSION);
+  const session = await ctx.harness.session(phaseSession(phase));
   // Adapt `session.task({ agent })` to the `runPhasePrompt` recorder seam (it calls
   // `.prompt(text, opts)`); the profile selection + injected tools ride on the task opts.
   const taskRunner = {
@@ -935,6 +968,23 @@ export async function runPostGateComment(
   return { commentId: posted.id };
 }
 
+/**
+ * Deterministically post a one-off explanatory issue comment (the terminal-run
+ * RE-TRIGGER notice) over the scoped repo-write token. owner/repo/issue are CLOSED
+ * OVER the bound run, never model-chosen. Reuses the gate-post deps (token + Octokit).
+ */
+export async function runPostNotice(
+  _ctx: BuildRunCtx,
+  run: BuildRun,
+  message: string,
+  deps: GatePostDeps = defaultGatePostDeps(),
+): Promise<void> {
+  const ref: RepoRef = { owner: run.owner, repo: run.repo };
+  const token = await deps.mintToken(run);
+  const octokit = deps.makeOctokit(token);
+  await postGateCommentDeterministically(octokit, ref, run.issue, message);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // OPEN PR — the deterministic finalize (NOT a model tool; idempotent).
 // ───────────────────────────────────────────────────────────────────────────
@@ -1128,6 +1178,9 @@ export function defaultBuildDeps(
     },
     async postGateComment(ctx, run, gate): Promise<{ commentId: number }> {
       return runPostGateComment(ctx, run, gate, gatePostDeps);
+    },
+    async postNotice(ctx, run, message): Promise<void> {
+      return runPostNotice(ctx, run, message, gatePostDeps);
     },
     async openPullRequest(ctx, run): Promise<{ html_url: string; number: number }> {
       return runOpenPullRequest(ctx, run, openPrDeps);

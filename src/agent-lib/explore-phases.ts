@@ -105,6 +105,11 @@ export type ExploreInput = v.InferOutput<typeof ExploreInputSchema>;
  * on the call, never global).
  */
 export const exploreAgent = defineAgent(() => ({
+  // The coordinator NEVER reasons itself — research phases delegate via
+  // `session.task({ agent: <profile> })`, each profile carrying its own model.
+  // beta.3 `initializeRootHarness` REQUIRES a model (or `model: false`) on the root
+  // agent; omitting it crashes a live `flue run` (same gotcha as `buildAgent`).
+  model: false,
   sandbox: dockerSandbox(),
   cwd: EXPLORE_CWD,
   subagents: [exploreProfile, synthesizeProfile],
@@ -219,7 +224,17 @@ function exploreBranch(run: ExploreRun): string {
 }
 
 /** The coordinator session name explore phases delegate their subagent tasks from. */
-const EXPLORE_SESSION = "explore";
+/**
+ * Per-phase session name — labels the dashboard pipeline node by phase (`read`,
+ * `ask-0`, `synthesize`, …) instead of one opaque shared `explore` session +
+ * anonymous `task:explore:<uuid>` children. Colons → dashes so the derived
+ * `task:<session>:<uuid>` stays unambiguous. Phases share the coordinator harness
+ * (the /workspace checkout persists); only the session thread differs. (Mirrors
+ * build's `phaseSession`.)
+ */
+function explorePhaseSession(phase: string): string {
+  return phase.replace(/:/g, "-");
+}
 
 /** Harnesses whose /workspace already holds the cloned checkout (clone-once-per-invocation). */
 const clonedExploreHarnesses = new WeakSet<FlueHarness>();
@@ -267,7 +282,7 @@ async function runResearchPhase(
   const profileName = phaseKind === "synthesize" ? SYNTHESIZE_PROFILE_NAME : EXPLORE_PROFILE_NAME;
 
   await ensureExploreCheckout(ctx.harness, run, token);
-  const session = await ctx.harness.session(EXPLORE_SESSION);
+  const session = await ctx.harness.session(explorePhaseSession(phase));
   const prompt = renderPhasePrompt(input, run, phase);
   const tools: ToolDefinition[] = [...githubReadTools(ref, octokit), ...webTools()];
   const taskRunner = {

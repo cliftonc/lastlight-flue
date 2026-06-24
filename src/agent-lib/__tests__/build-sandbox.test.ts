@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import type { SandboxFactory } from "@flue/runtime";
+import type { FlueHarness, SandboxFactory } from "@flue/runtime";
 import {
   withBuildSandbox,
   withPrFixSandbox,
   closeBuildWorkspace,
   resetBuildWorkspacesForTests,
+  cloneRepoIntoHarness,
   BUILD_IMAGE,
   type BuildContainer,
   type BuildSandboxOps,
@@ -49,6 +50,55 @@ function makeContainer(
   };
   return { container, execCalls, removed: () => removed };
 }
+
+describe("cloneRepoIntoHarness — post-clone dependency install (installDeps)", () => {
+  /** A fake harness recording every shell command; clone/checkout succeed by default. */
+  function fakeHarness(opts: { installExitCode?: number } = {}) {
+    const shellCalls: { command: string; env?: Record<string, string> }[] = [];
+    const harness = {
+      async shell(command: string, options?: { env?: Record<string, string> }) {
+        shellCalls.push({ command, env: options?.env });
+        // The install script enables corepack + runs the PM install; let the caller
+        // pick its exit code, everything else succeeds.
+        const isInstall = command.includes("corepack enable");
+        return {
+          stdout: "",
+          stderr: isInstall ? "boom" : "",
+          exitCode: isInstall ? (opts.installExitCode ?? 0) : 0,
+        };
+      },
+    } as unknown as FlueHarness;
+    return { harness, shellCalls };
+  }
+
+  const SPEC_BASE = { owner: "octocat", repo: "widget", branch: "lastlight/42" };
+
+  it("runs corepack + a lockfile-aware install when installDeps is set", async () => {
+    const fh = fakeHarness();
+    await cloneRepoIntoHarness(fh.harness, { ...SPEC_BASE, installDeps: true }, TOKEN);
+
+    const install = fh.shellCalls.find((c) => c.command.includes("corepack enable"));
+    expect(install).toBeDefined();
+    expect(install!.command).toContain("pnpm install --frozen-lockfile");
+    expect(install!.command).toContain("yarn install --immutable");
+    expect(install!.command).toContain("npm ci");
+    // The corepack download prompt is suppressed so the install can't hang.
+    expect(install!.env).toMatchObject({ COREPACK_ENABLE_DOWNLOAD_PROMPT: "0" });
+  });
+
+  it("does NOT install when installDeps is unset (read-only clone)", async () => {
+    const fh = fakeHarness();
+    await cloneRepoIntoHarness(fh.harness, { ...SPEC_BASE }, TOKEN);
+    expect(fh.shellCalls.some((c) => c.command.includes("corepack enable"))).toBe(false);
+  });
+
+  it("a failed install does NOT throw — the clone still completes (best-effort)", async () => {
+    const fh = fakeHarness({ installExitCode: 1 });
+    await expect(
+      cloneRepoIntoHarness(fh.harness, { ...SPEC_BASE, installDeps: true }, TOKEN),
+    ).resolves.toBeUndefined();
+  });
+});
 
 describe("withBuildSandbox — shared per-run workspace (created once, reused, closed at run end)", () => {
   it("creates the container (named + labelled, baked token), clones, checks out -B the branch, yields the sandbox, and REGISTERS it (no per-call removal)", async () => {

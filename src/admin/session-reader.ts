@@ -449,10 +449,19 @@ export function derivePhases(events: RawStreamEvent[]): RunPhase[] {
       order.push(opId);
     }
     if (ts) phase.endedAt = ts;
-    // The session name (phase label) is authoritative on agent_start.
+    // The session name (phase label) is authoritative on agent_start. A SUBAGENT task
+    // runs in a `task:<parentSession>:<uuid>` session (build/explore delegate each
+    // phase via `session.task({ agent })`); label it by the PARENT session — which we
+    // name for the phase (`architect`/`executor`/`reviewer-0`/…) — not the opaque task
+    // id. A direct single-agent phase (no task wrapper) keeps its own session name.
     if (type === 'agent_start') {
       const sess = (data as { session?: unknown }).session;
-      if (typeof sess === 'string' && sess) phase.name = sess;
+      const parent = (data as { parentSession?: unknown }).parentSession;
+      if (typeof sess === 'string' && sess.startsWith('task:') && typeof parent === 'string' && parent) {
+        phase.name = parent;
+      } else if (typeof sess === 'string' && sess) {
+        phase.name = sess;
+      }
     }
     if (type === 'agent_end' && (data as { isError?: unknown }).isError) {
       phase.isError = true;
@@ -460,7 +469,16 @@ export function derivePhases(events: RawStreamEvent[]): RunPhase[] {
     if (type === 'message_end') phase.messageCount += 1;
     if (type === 'tool') phase.toolCount += 1;
   }
-  return order.map((opId) => acc.get(opId)!);
+  // Drop the coordinator's task-DISPATCH parent ops: a `session.task()` call emits its
+  // own operation on the coordinator session that never runs an agent (no agent_start →
+  // name stays 'default') and carries no messages/tools — pure plumbing that would
+  // otherwise clutter the pipeline with an empty `default` node before every real phase.
+  // (Kept: a genuine `default` op that DID produce messages/tools — e.g. a single-agent
+  // workflow with an unnamed session.) Re-index so positions stay contiguous.
+  return order
+    .map((opId) => acc.get(opId)!)
+    .filter((p) => !(p.name === 'default' && p.messageCount === 0 && p.toolCount === 0))
+    .map((p, index) => ({ ...p, index }));
 }
 
 function serializeError(error: unknown): string {

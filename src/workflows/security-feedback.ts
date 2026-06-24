@@ -50,6 +50,7 @@
  * with NO live model and NO live GitHub.
  */
 import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
@@ -366,6 +367,6 @@ export default defineWorkflow({
   async run({ harness, input, log }) {
     // The result is JSON-serializable; cast to JsonValue so Flue snapshots it.
     // The typed `SecurityFeedbackResult` is preserved on the testable core for tests.
-    return (await runSecurityFeedback({ harness, input, log })) as unknown as JsonValue;
+    return jsonSafe(await runSecurityFeedback({ harness, input, log })) as unknown as JsonValue;
   },
 });

@@ -21,12 +21,9 @@
  * spawning `flue run explore --payload {…resumedGate}` (the cross-process re-entry
  * Spike-3 proved). NO LIVE SIDE EFFECTS in the default path here this slice.
  */
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { ExploreRunStore } from "./explore-run-store.ts";
 import type { ExploreInput, ExploreResult } from "./agent-lib/explore-phases.ts";
-
-const exec = promisify(execFile);
+import { spawnFlueRun } from "./agent-lib/spawn-flue-run.ts";
 
 /** Re-invoke the explore workflow for an app runId, carrying the parked reply gate. */
 export type ExploreReinvoker = (input: ExploreInput) => Promise<ExploreResult | void>;
@@ -43,9 +40,7 @@ const defaultStorePath = () =>
 /** Default production re-invoker: spawn a fresh `flue run explore` with the gate token. */
 function defaultReinvoke(input: ExploreInput): ExploreReinvoker {
   return async () => {
-    await exec("pnpm", ["exec", "flue", "run", "explore", "--input", JSON.stringify(input)], {
-      timeout: 600_000,
-    });
+    await spawnFlueRun("explore", input);
   };
 }
 

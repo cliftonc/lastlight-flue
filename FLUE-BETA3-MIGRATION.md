@@ -128,11 +128,17 @@ alongside.)
 ### 4b. Coordinator agent (new — in `build-phases.ts` or `build.ts`)
 ```ts
 export const buildAgent = defineAgent(() => ({
+  model: false, // REQUIRED: the coordinator only delegates (session.task); beta.3
+                // initializeRootHarness rejects a root agent with no model. `false`
+                // = "this agent makes no LLM calls itself" (each profile has its own).
   sandbox: dockerSandbox(),
   cwd: BUILD_WORKSPACE,
   subagents: [guardrailsProfile, architectProfile, executorProfile, buildReviewerProfile, fixProfile],
 }));
 ```
+> ⚠️ A coordinator agent (build, explore) MUST set `model: false` — it crashes a live `flue run`
+> with "defineAgent() requires a model" otherwise. Unit tests inject a fake harness so they never
+> hit `initializeRootHarness`; this only surfaces on a real run.
 
 ### 4c. `build-phases.ts` rewrite (1052 lines — the bulk)
 - `BuildDeps.runPhase` / `postGateComment` / `openPullRequest` take `BuildRunCtx { harness, input, log }`,

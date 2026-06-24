@@ -59,6 +59,7 @@
  * so the whole flow runs with NO live model, NO live GitHub, and NO live Docker.
  */
 import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import { Octokit } from "octokit";
 import * as v from "valibot";
 import {
@@ -303,6 +304,6 @@ export default defineWorkflow({
   agent: securityAgent,
   input: SecurityReviewInputSchema,
   async run({ harness, input, log }) {
-    return (await runSecurityReview({ harness, input, log })) as unknown as JsonValue;
+    return jsonSafe(await runSecurityReview({ harness, input, log })) as unknown as JsonValue;
   },
 });

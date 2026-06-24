@@ -45,6 +45,7 @@
  * runs with NO live model / git / GitHub / Docker.
  */
 import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import { Octokit } from "octokit";
 import * as v from "valibot";
 import {
@@ -290,6 +291,6 @@ export default defineWorkflow({
   agent: fixAgent,
   input: PrFixInputSchema,
   async run({ harness, input, log }) {
-    return (await runPrFix({ harness, input, log })) as unknown as JsonValue;
+    return jsonSafe(await runPrFix({ harness, input, log })) as unknown as JsonValue;
   },
 });

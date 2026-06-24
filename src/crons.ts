@@ -1,5 +1,4 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawnFlueRun } from './agent-lib/spawn-flue-run.ts';
 import { Cron, scheduledJobs } from 'croner';
 import { getRuntimeConfig, loadConfig, type LastLightConfig } from './config.ts';
 
@@ -40,8 +39,6 @@ import { getRuntimeConfig, loadConfig, type LastLightConfig } from './config.ts'
 // `src/agents/` — so Flue's discovery does NOT pick it up as an entry (no
 // phantom workflow/agent). It is wired in by import from `src/app.ts`.
 
-const exec = promisify(execFile);
-
 /** The injectable invoke seam: fire one workflow run with a JSON payload. */
 export type CronInvoker = (
   workflow: string,
@@ -55,11 +52,7 @@ export type CronInvoker = (
  * a fake; `startCrons` is VITEST-inert).
  */
 export const defaultCronInvoker: CronInvoker = async (workflow, payload) => {
-  await exec(
-    'pnpm',
-    ['exec', 'flue', 'run', workflow, '--input', JSON.stringify(payload)],
-    { timeout: 600_000 },
-  );
+  await spawnFlueRun(workflow, payload);
 };
 
 /** A registered cron job definition (pre-scheduling). */
