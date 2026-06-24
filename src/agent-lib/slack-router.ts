@@ -19,6 +19,8 @@
  * testable). Lives in `src/agent-lib/` (NOT discovered).
  */
 import type { LastLightEvent } from "../events.ts";
+import type { RoutableEvent } from "./event-enrich.ts";
+import { buildWorkflowInput } from "./workflow-input.ts";
 import {
   classifyComment,
   screenForInjection,
@@ -44,7 +46,7 @@ export interface SlackRouterDeps {
   /** Single-shot LLM seam for the classifier + injection screener. */
   run: PromptRunner;
   /** Reply-gate lookup by the thread conversationKey (default: none). */
-  pendingReplyGate?: (ev: LastLightEvent) => Promise<PendingReplyGate | null>;
+  pendingReplyGate?: (ev: RoutableEvent) => Promise<PendingReplyGate | null>;
   /** Test hooks to override the classifier/screener directly. */
   classify?: (body: string) => Promise<ClassificationResult>;
   screen?: (body: string) => Promise<ScreenResult>;
@@ -64,7 +66,7 @@ export interface SlackRouterDeps {
  * a Slack thread always at least converses.
  */
 export async function routeEvent(
-  ev: LastLightEvent,
+  ev: RoutableEvent,
   deps: SlackRouterDeps,
 ): Promise<SlackRouteDecision> {
   if (ev.type !== "message") {
@@ -97,27 +99,27 @@ export async function routeEvent(
   const [{ intent }, screened] = await Promise.all([classify(ev.body), screen(ev.body)]);
   const body = screened.flagged ? `${flagPrefix(screened.reason)}${ev.body}` : ev.body;
 
-  // A clear command diverts to a workflow; otherwise CHAT (the safe default).
-  if (intent === "explore") {
-    return {
-      action: "workflow",
-      workflow: "explore",
-      payload: { reply: body, sender: ev.sender, triggerId: ev.conversationKey, source: "slack" },
-    };
+  // A clear command diverts to a workflow; otherwise CHAT (the safe default). The
+  // shared `buildWorkflowInput` maps the enriched event → the workflow's `--input`
+  // (runId/owner/repo derived once, identically to the GitHub channel).
+  //
+  // explore + security-review NEED a concrete repo (the explorer clones it; the scan
+  // targets it). A Slack message naming no repo resolves to EXPLORE_DEFAULT_REPO at
+  // enrich time; when that's also unset (`resolvedRepo === null`) we DON'T crash the
+  // channel — we fall through to CHAT, the safe default, so the thread still converses.
+  if (intent === "explore" && ev.resolvedRepo) {
+    return { action: "workflow", workflow: "explore", payload: buildWorkflowInput("explore", ev, { body }) };
   }
-  if (intent === "security") {
+  if (intent === "security" && ev.resolvedRepo) {
     return {
       action: "workflow",
       workflow: "security-review",
-      payload: { sender: ev.sender, source: "slack", conversationKey: ev.conversationKey },
+      payload: buildWorkflowInput("security-review", ev),
     };
   }
   if (intent === "question") {
-    return {
-      action: "workflow",
-      workflow: "answer",
-      payload: { question: body, sender: ev.sender, conversationKey: ev.conversationKey, source: "slack" },
-    };
+    // answer resolves its own fallback repo internally, so it needs no repo guard.
+    return { action: "workflow", workflow: "answer", payload: buildWorkflowInput("answer", ev, { body }) };
   }
 
   // Default — chat. The per-thread conversation key IS the durable session id.

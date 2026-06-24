@@ -42,6 +42,13 @@ export type EventType = v.InferOutput<typeof EventType>;
 export const LastLightEvent = v.object({
   /** Dedup id — the provider delivery id (GitHub `deliveryId`). */
   id: v.string(),
+  /**
+   * The triggering comment's stable id (GitHub `comment.id`), present on
+   * `comment.created` events. Distinct from `id`: a webhook redelivery gets a
+   * fresh delivery guid, but the comment id is stable — so it's the dedup key
+   * the comment workflows (issue-comment / pr-comment) re-invoke against.
+   */
+  commentId: v.optional(v.union([v.number(), v.string()])),
   source: v.picklist(["github", "slack"]),
   type: EventType,
   /** owner/repo full name (managed-repo allowlist key). */

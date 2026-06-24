@@ -26,8 +26,13 @@ function harness() {
   };
   const dispatch: DispatchDeps = { invokeWorkflow };
   const isManagedRepo = (repo: string | undefined) => repo === "cliftonc/lastlight";
-  return { invokeWorkflow, router, dispatch, isManagedRepo, dedupe: new DeliveryDedupe() };
+  // Ack seam is injected so tests never mint a live token / hit GitHub.
+  const ack = vi.fn(async () => {});
+  return { invokeWorkflow, router, dispatch, isManagedRepo, ack, dedupe: new DeliveryDedupe() };
 }
+
+/** A no-op ack for inline-opts tests (keeps the live reaction seam out of tests). */
+const noopAck = async () => {};
 
 describe("handleDelivery — full webhook pipeline (offline, no side effects)", () => {
   it("issue.opened in a managed repo → invokes issue-triage exactly once", async () => {
@@ -44,10 +49,14 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
       router: h.router,
       dispatch: h.dispatch,
       isManagedRepo: h.isManagedRepo,
+      ack: h.ack,
     });
     expect(res).toMatchObject({ status: "accepted", workflow: "issue-triage" });
     expect(h.invokeWorkflow).toHaveBeenCalledTimes(1);
     expect(h.invokeWorkflow).toHaveBeenCalledWith("issue-triage", expect.objectContaining({ issueNumber: 1 }));
+    // ACK: a non-comment admit reacts on the issue itself (no commentId on the event).
+    expect(h.ack).toHaveBeenCalledTimes(1);
+    expect(h.ack).toHaveBeenCalledWith(expect.objectContaining({ issueNumber: 1, commentId: undefined }));
   });
 
   it("DEDUPE: a redelivery with the same deliveryId is processed once", async () => {
@@ -62,8 +71,8 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
       },
       "same-id",
     );
-    const first = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
-    const second = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
+    const first = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo, ack: h.ack });
+    const second = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo, ack: h.ack });
     expect(first.status).toBe("accepted");
     expect(second.status).toBe("duplicate");
     expect(h.invokeWorkflow).toHaveBeenCalledTimes(1);
@@ -77,9 +86,10 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
       repository: { full_name: "stranger/unmanaged" },
       issue: { number: 3, title: "t", body: "b", labels: [] },
     });
-    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
+    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo, ack: h.ack });
     expect(res.status).toBe("filtered");
     expect(h.invokeWorkflow).not.toHaveBeenCalled();
+    expect(h.ack).not.toHaveBeenCalled(); // ACK: nothing admitted → no reaction
   });
 
   it("SCREEN: a bot-authored PR does NOT trigger pr-review", async () => {
@@ -90,7 +100,7 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
       repository: { full_name: "cliftonc/lastlight" },
       pull_request: { number: 4, title: "t", body: "", labels: [], user: { login: BOT } },
     });
-    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
+    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo, ack: h.ack });
     expect(res.status).toBe("filtered");
     expect(h.invokeWorkflow).not.toHaveBeenCalled();
   });
@@ -103,7 +113,7 @@ describe("handleDelivery — full webhook pipeline (offline, no side effects)", 
       repository: { full_name: "cliftonc/lastlight" },
       issue: { number: 5, title: "t", body: "", labels: [] },
     });
-    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo });
+    const res = await handleDelivery(d, key, { botLogin: BOT, dedupe: h.dedupe, router: h.router, dispatch: h.dispatch, isManagedRepo: h.isManagedRepo, ack: h.ack });
     expect(res.status).toBe("filtered");
     expect(h.invokeWorkflow).not.toHaveBeenCalled();
   });
@@ -139,9 +149,77 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       },
       dispatch: { invokeWorkflow },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res).toMatchObject({ status: "accepted", workflow: "build" });
     expect(invokeWorkflow).toHaveBeenCalledWith("build", expect.objectContaining({ issue: 11 }));
+  });
+
+  it("ACK: a comment admitted to a workflow reacts on the triggering comment (commentId threaded)", async () => {
+    const ack = vi.fn(async () => {});
+    const d = delivery(
+      "issue_comment",
+      {
+        action: "created",
+        sender: { login: "alice" },
+        repository: { full_name: "cliftonc/lastlight" },
+        issue: { number: 11, title: "T", pull_request: undefined },
+        comment: { body: "@last-light what do you think?", author_association: "OWNER", id: 98765 },
+      },
+      "c-ack",
+    );
+    const res = await handleDelivery(d, key, {
+      botLogin: BOT,
+      router: {
+        run: async () => { throw new Error("no LLM"); },
+        classify: async () => ({ intent: "chat" }),
+        screen: async () => ({ flagged: false }),
+      },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}) },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack,
+    });
+    expect(res).toMatchObject({ status: "accepted", workflow: "issue-comment" });
+    expect(ack).toHaveBeenCalledWith(expect.objectContaining({ issueNumber: 11, commentId: 98765 }));
+  });
+
+  it("ACK: fires BEFORE the classifier (early, like Slack's defaultAck)", async () => {
+    const order: string[] = [];
+    const ack = vi.fn(async () => { order.push("ack"); });
+    const classify = vi.fn(async () => { order.push("classify"); return { intent: "chat" as const }; });
+    const d = delivery(
+      "issue_comment",
+      {
+        action: "created",
+        sender: { login: "alice" },
+        repository: { full_name: "cliftonc/lastlight" },
+        issue: { number: 11, title: "T", pull_request: undefined },
+        comment: { body: "@last-light what do you think?", author_association: "OWNER", id: 5 },
+      },
+      "c-order",
+    );
+    await handleDelivery(d, key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM"); }, classify, screen: async () => ({ flagged: false }) },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}) },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack,
+    });
+    // The 👀 must land before the (slow) classifier runs — not after the route decision.
+    expect(order).toEqual(["ack", "classify"]);
+  });
+
+  it("ACK: a declined (non-maintainer) @mention does NOT react", async () => {
+    const ack = vi.fn(async () => {});
+    const res = await handleDelivery(comment("@last-light build me a feature", "NONE", "rando"), key, {
+      botLogin: BOT,
+      router: { run: async () => { throw new Error("no LLM on a decline"); } },
+      dispatch: { invokeWorkflow: vi.fn(async () => {}), reply: vi.fn(async () => {}) },
+      isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack,
+    });
+    expect(res.status).toBe("reply");
+    expect(ack).not.toHaveBeenCalled(); // a decline posts a comment; no 👀
   });
 
   it("explicit @last-light approve bypasses the classifier (LLM never called)", async () => {
@@ -152,6 +230,7 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       router: { run },
       dispatch: { invokeWorkflow: vi.fn(async () => {}), resumeGate },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("resume");
     expect(run).not.toHaveBeenCalled(); // explicit command → deterministic, no LLM
@@ -165,6 +244,7 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       router: { run: async () => { throw new Error("no LLM on a decline"); } },
       dispatch: { invokeWorkflow, reply },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("reply");
     expect(reply).toHaveBeenCalledTimes(1);
@@ -183,6 +263,7 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: { invokeWorkflow, reply },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("filtered");
     expect(reply).not.toHaveBeenCalled(); // never reply to the bot → no loop
@@ -203,6 +284,7 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: { invokeWorkflow: vi.fn(async () => {}), reply },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("filtered");
     expect(reply).not.toHaveBeenCalled();
@@ -215,6 +297,7 @@ describe("handleDelivery — classifier + decline-reply (offline, no live LLM/Gi
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: { invokeWorkflow: vi.fn(async () => {}), reply },
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("ignore");
     expect(reply).not.toHaveBeenCalled();
@@ -272,6 +355,7 @@ describe("github channel — @approve/@reject gate correlation (offline, no resu
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: dispatchWithGateLookup(resumeFake),
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("resume");
     expect(resumeFake).toHaveBeenCalledWith("build-run-7", "approve");
@@ -288,6 +372,7 @@ describe("github channel — @approve/@reject gate correlation (offline, no resu
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: dispatchWithGateLookup(resumeFake),
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(resumeFake).toHaveBeenCalledWith("build-run-7", "reject");
   });
@@ -300,6 +385,7 @@ describe("github channel — @approve/@reject gate correlation (offline, no resu
       router: { run: async () => { throw new Error("no LLM"); } },
       dispatch: dispatchWithGateLookup(resumeFake),
       isManagedRepo: (r) => r === "cliftonc/lastlight",
+      ack: noopAck,
     });
     expect(res.status).toBe("resume"); // the route decision is resume…
     expect(resumeFake).not.toHaveBeenCalled(); // …but nothing to resolve → no-op

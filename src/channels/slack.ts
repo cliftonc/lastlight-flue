@@ -48,16 +48,18 @@ import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenEvent, SlackEventDedupe } from "../agent-lib/slack-screener.ts";
 import { toLastLightEvent } from "../agent-lib/slack-mapper.ts";
+import { enrichEvent } from "../agent-lib/event-enrich.ts";
 import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
 import { recordThreadActivity } from "../agent-lib/record-thread.ts";
 import { slackPosterFromConfig } from "../slack-client.ts";
-import { showSlackThinking } from "../agent-lib/slack-thinking.ts";
+import { showSlackThinking, updateSlackStatus } from "../agent-lib/slack-thinking.ts";
 import {
   routeEvent,
   routeCommand,
   dispatchRoute,
   type SlackRouterDeps,
   type SlackDispatchDeps,
+  type SlackRouteDecision,
   type PendingReplyGate,
 } from "../agent-lib/slack-router.ts";
 import type { LastLightEvent } from "../events.ts";
@@ -148,6 +150,63 @@ function defaultGateLookup(storePath?: string) {
   };
 }
 
+/**
+ * Default ACK seam: show the "Thinking…" indicator for a freshly-admitted message,
+ * addressed by the thread conversation key. Tries the Assistant-pane status
+ * (anchored on the thread root); falls back to a 👀 reaction on the user's actual
+ * message (`ev.id` = the Slack message ts) when the Assistant API isn't available.
+ * Fire-and-forget + best-effort — it never delays the <3s ack, and is INERT when no
+ * `SLACK_BOT_TOKEN` is configured (the poster is undefined → no-op, e.g. under tests).
+ */
+function defaultAck(ev: LastLightEvent): void {
+  const poster = slackPosterFromConfig();
+  if (!poster) return;
+  void showSlackThinking(poster, ev.conversationKey, ev.id);
+}
+
+/**
+ * Map a routing decision → the live status it should show. A workflow divert gets a
+ * route-specific message + loader lines; CHAT keeps the generic rotating "Thinking…"
+ * (returns null → no change). Pure — the channel applies it best-effort over the poster.
+ */
+export function routeStatusText(
+  decision: SlackRouteDecision,
+): { text: string; loaders?: string[] } | null {
+  if (decision.action !== "workflow") return null; // chat → keep the generic loader.
+  switch (decision.workflow) {
+    case "explore":
+      return {
+        text: "🧭 Exploring the idea…",
+        loaders: ["Reading the repo…", "Shaping the idea…", "Mapping the design space…", "Drafting clarifying questions…"],
+      };
+    case "answer":
+      return {
+        text: "📚 Researching an answer…",
+        loaders: ["Reading the repo…", "Gathering context…", "Drafting an answer…"],
+      };
+    case "security-review":
+      return {
+        text: "🔒 Running a security review…",
+        loaders: ["Cloning the repo…", "Scanning for vulnerabilities…", "Triaging findings…"],
+      };
+    default:
+      return { text: `⚙️ Starting ${decision.workflow}…` };
+  }
+}
+
+/**
+ * Default route-status seam: refine the live thread status to the route-specific
+ * message once the router has decided. Best-effort + INERT without a bot token
+ * (poster undefined → no-op, e.g. under tests). Chat keeps the generic indicator.
+ */
+function defaultNoteRoute(ev: LastLightEvent, decision: SlackRouteDecision): void {
+  const status = routeStatusText(decision);
+  if (!status) return;
+  const poster = slackPosterFromConfig();
+  if (!poster) return;
+  void updateSlackStatus(poster, ev.conversationKey, status.text, status.loaders);
+}
+
 /** Production dispatch seams: dispatch the chat agent, spawn `flue run` workflows. */
 function defaultDispatchDeps(): SlackDispatchDeps {
   return {
@@ -159,17 +218,10 @@ function defaultDispatchDeps(): SlackDispatchDeps {
       // recorder seam): a write failure never blocks the dispatch, and it's a no-op
       // under tests unless a fake recorder is injected.
       recordThreadActivity(id);
-      // Show the "Thinking…" indicator the instant the turn is admitted: the
-      // Assistant-pane status (anchored on the thread root = `id`'s thread ts), or
-      // a 👀 reaction on the user's actual message when the Assistant API isn't
-      // available (a regular channel). Fire-and-forget + best-effort so it never
-      // delays dispatch / the <3s ack. The relay clears it when the turn finishes.
-      const poster = slackPosterFromConfig();
-      if (poster) {
-        const messageTs = typeof input.messageTs === "string" ? input.messageTs : undefined;
-        void showSlackThinking(poster, id, messageTs);
-      }
-      // The chat agent's instance == the thread; `id` IS the durable session key.
+      // The "Thinking…" indicator now fires once at admission in `handleEvent`
+      // (`defaultAck`), covering chat AND every workflow path — so it's no longer
+      // shown here. The chat agent's instance == the thread; `id` IS the durable
+      // session key.
       await dispatch(chatAgent, { id, input });
     },
     invokeWorkflow: defaultCronInvoker,
@@ -190,6 +242,10 @@ export async function handleEvent(
     dedupe?: SlackEventDedupe;
     router?: SlackRouterDeps;
     dispatch?: SlackDispatchDeps;
+    /** Acknowledge a freshly-admitted message (default: the "Thinking…" indicator). */
+    ack?: (ev: LastLightEvent) => void;
+    /** Refine the live status once the route is known (default: route-specific text). */
+    noteRoute?: (ev: LastLightEvent, decision: SlackRouteDecision) => void;
   } = {},
 ): Promise<{ status: string; reason?: string; workflow?: string }> {
   const ring = opts.dedupe ?? dedupe;
@@ -204,8 +260,18 @@ export async function handleEvent(
   if (!verdict.allow) return { status: "filtered", reason: verdict.reason };
 
   // (c) MAP — native SlackEvent → LastLightEvent (or null if unmapped).
-  const ev = toLastLightEvent(event, teamId, conversationKey);
-  if (!ev) return { status: "filtered", reason: "unmapped event" };
+  const mapped = toLastLightEvent(event, teamId, conversationKey);
+  if (!mapped) return { status: "filtered", reason: "unmapped event" };
+
+  // (c′) ENRICH — resolve repo + correlation id ahead of routing (event-enrich.ts).
+  const ev = enrichEvent(mapped, { defaultRepo: cfg().exploreDefaultRepo });
+
+  // (c″) ACK — the instant a real user message is admitted (BEFORE the LLM classify
+  //      step), show the "Thinking…" indicator. Moved OUT of the chat dispatch so it
+  //      now covers EVERY routed path — chat AND every workflow (explore/answer/
+  //      security). Best-effort + fire-and-forget; the chat-reply relay / the
+  //      workflow's own Slack post clears it when the turn ends.
+  (opts.ack ?? defaultAck)(ev);
 
   // (d) ROUTE — code-based; default chat, clear command → workflow.
   const routerDeps: SlackRouterDeps = opts.router ?? {
@@ -213,6 +279,12 @@ export async function handleEvent(
     pendingReplyGate: defaultPendingReplyGate(),
   };
   const decision = await routeEvent(ev, routerDeps);
+
+  // (d′) NOTE ROUTE — now that the router has decided, refine the live status from the
+  //      generic "Thinking…" to a route-specific message ("🧭 Exploring the idea…"),
+  //      so the thread reflects WHAT it's doing. Best-effort; chat keeps the generic
+  //      rotating loader. Fires before dispatch so feedback lands as early as possible.
+  (opts.noteRoute ?? defaultNoteRoute)(ev, decision);
 
   // (e) ADMIT — dispatch chat / spawn `flue run`, then ack (<3s).
   const dispatchDeps = opts.dispatch ?? defaultDispatchDeps();

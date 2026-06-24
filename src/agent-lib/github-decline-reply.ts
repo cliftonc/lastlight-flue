@@ -107,7 +107,10 @@ export async function postDeclineReply(
   deps: DeclineReplyDeps = defaultDeclineReplyDeps(),
 ): Promise<PostedReply> {
   if (!ev.owner || !ev.repoName || !ev.issueNumber) return { posted: false };
-  const token = await deps.mintToken(ev.repo ?? `${ev.owner}/${ev.repoName}`);
+  // Scope by repository NAME ("lastlight"), not the full "owner/lastlight" slug — the
+  // installation-token API 422s on a slug (mirrors the workflow mints, which pass the
+  // short name). Passing `ev.repo` (the slug) here was a latent bug.
+  const token = await deps.mintToken(ev.repoName);
   const octokit = deps.makeOctokit(token);
   return deps.post(octokit, ev, message, deps.botLogin);
 }

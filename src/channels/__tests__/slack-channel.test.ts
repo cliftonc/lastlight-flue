@@ -65,6 +65,52 @@ describe("slack channel — handleEvent pipeline (offline, no side effects)", ()
     expect(JSON.stringify(h.dispatchChat.mock.calls[0]![1])).not.toMatch(/trigger_id|response_url/);
   });
 
+  it("ACK fires once at admission for EVERY route — chat AND workflow (issue #3)", async () => {
+    const prevRepo = process.env.EXPLORE_DEFAULT_REPO;
+    process.env.EXPLORE_DEFAULT_REPO = "acme/widgets";
+    try {
+      const { handleEvent } = await import("../slack.ts");
+      const { SlackEventDedupe } = await import("../../agent-lib/slack-screener.ts");
+      const h = harness();
+      const ack = vi.fn((_ev: { conversationKey: string }) => {});
+
+      // (a) a chat turn acks…
+      await handleEvent(ev(), "T1", "EvA", key, {
+        allowedUsers: h.allowedUsers,
+        dedupe: new SlackEventDedupe(),
+        router: h.router,
+        dispatch: h.dispatch,
+        ack: ack as never,
+      });
+      // (b) …and so does a workflow divert (explore) — the indicator is no longer
+      //     bolted onto the chat dispatch, so it covers every workflow path too.
+      await handleEvent(ev({ text: "<@U_BOT> explore this", ts: "200.2" }), "T1", "EvB", key, {
+        allowedUsers: h.allowedUsers,
+        dedupe: new SlackEventDedupe(),
+        router: { ...h.router, classify: async () => ({ intent: "explore" }) },
+        dispatch: h.dispatch,
+        ack: ack as never,
+      });
+
+      expect(ack).toHaveBeenCalledTimes(2);
+      expect((ack.mock.calls[0]![0] as { conversationKey: string }).conversationKey).toBe("slack:T1:C9:100.1");
+    } finally {
+      if (prevRepo === undefined) delete process.env.EXPLORE_DEFAULT_REPO;
+      else process.env.EXPLORE_DEFAULT_REPO = prevRepo;
+    }
+  });
+
+  it("route status text: workflows get a route-specific message; chat keeps the generic loader", async () => {
+    const { routeStatusText } = await import("../slack.ts");
+    expect(routeStatusText({ action: "workflow", workflow: "explore", payload: {} })?.text).toMatch(/Exploring/);
+    expect(routeStatusText({ action: "workflow", workflow: "security-review", payload: {} })?.text).toMatch(/security review/i);
+    expect(routeStatusText({ action: "workflow", workflow: "answer", payload: {} })?.text).toMatch(/answer/i);
+    // an unmapped workflow still gets a generic "Starting <name>…"
+    expect(routeStatusText({ action: "workflow", workflow: "build", payload: {} })?.text).toMatch(/Starting build/);
+    // chat → null (keep the generic rotating "Thinking…").
+    expect(routeStatusText({ action: "chat", id: "k", input: {} })).toBeNull();
+  });
+
   it("a non-allowlisted user is dropped (filtered, no dispatch)", async () => {
     const { handleEvent } = await import("../slack.ts");
     const { SlackEventDedupe } = await import("../../agent-lib/slack-screener.ts");
@@ -106,18 +152,35 @@ describe("slack channel — handleEvent pipeline (offline, no side effects)", ()
     expect(h.dispatchChat).toHaveBeenCalledTimes(1);
   });
 
-  it("a clear explore command diverts to the explore workflow via the invoker seam", async () => {
-    const { handleEvent } = await import("../slack.ts");
-    const { SlackEventDedupe } = await import("../../agent-lib/slack-screener.ts");
-    const h = harness();
-    const res = await handleEvent(ev({ text: "<@U_BOT> explore this idea" }), "T1", "Ev9", key, {
-      allowedUsers: h.allowedUsers,
-      dedupe: new SlackEventDedupe(),
-      router: { ...h.router, classify: async () => ({ intent: "explore" }) },
-      dispatch: h.dispatch,
-    });
-    expect(res).toEqual({ status: "accepted", workflow: "explore" });
-    expect(h.invokeWorkflow).toHaveBeenCalledWith("explore", expect.objectContaining({ triggerId: "slack:T1:C9:100.1" }));
+  it("a clear explore command diverts to the explore workflow with a schema-valid input", async () => {
+    // A Slack message names no repo; the channel resolves EXPLORE_DEFAULT_REPO at
+    // enrich time so the explore input carries the required owner/repo (+ derived runId).
+    const prevRepo = process.env.EXPLORE_DEFAULT_REPO;
+    process.env.EXPLORE_DEFAULT_REPO = "acme/widgets";
+    try {
+      const { handleEvent } = await import("../slack.ts");
+      const { SlackEventDedupe } = await import("../../agent-lib/slack-screener.ts");
+      const h = harness();
+      const res = await handleEvent(ev({ text: "<@U_BOT> explore this idea" }), "T1", "Ev9", key, {
+        allowedUsers: h.allowedUsers,
+        dedupe: new SlackEventDedupe(),
+        router: { ...h.router, classify: async () => ({ intent: "explore" }) },
+        dispatch: h.dispatch,
+      });
+      expect(res).toEqual({ status: "accepted", workflow: "explore" });
+      expect(h.invokeWorkflow).toHaveBeenCalledWith(
+        "explore",
+        expect.objectContaining({
+          triggerId: "slack:T1:C9:100.1",
+          runId: "slack:T1:C9:100.1",
+          owner: "acme",
+          repo: "widgets",
+        }),
+      );
+    } finally {
+      if (prevRepo === undefined) delete process.env.EXPLORE_DEFAULT_REPO;
+      else process.env.EXPLORE_DEFAULT_REPO = prevRepo;
+    }
   });
 });
 

@@ -93,6 +93,7 @@ export function toLastLightEvent(
 
   return {
     id: delivery.deliveryId,
+    commentId: payload.comment?.id,
     source: "github",
     type,
     repo,

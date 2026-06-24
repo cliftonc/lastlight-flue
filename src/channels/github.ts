@@ -36,10 +36,13 @@ import { ExploreRunStore } from "../explore-run-store.ts";
 import { resume as resumeBuild } from "../resume.ts";
 import { screenDelivery, DeliveryDedupe } from "../agent-lib/github-screener.ts";
 import { toLastLightEvent } from "../agent-lib/github-mapper.ts";
+import { enrichEvent } from "../agent-lib/event-enrich.ts";
 import { createClassifierRunner } from "../agent-lib/classify-llm.ts";
 import { postDeclineReply } from "../agent-lib/github-decline-reply.ts";
+import { postAckReaction } from "../agent-lib/github-ack-reaction.ts";
 import {
   routeEvent,
+  willActOn,
   dispatchRoute,
   type RouterDeps,
   type DispatchDeps,
@@ -177,6 +180,8 @@ export async function handleDelivery(
     dispatch?: DispatchDeps;
     /** Managed-repo predicate (default: config-backed). Injected in tests. */
     isManagedRepo?: (repo: string | undefined) => boolean;
+    /** Ack seam: react 👀 on an admitted event (default: live reaction). Injected in tests. */
+    ack?: (ev: LastLightEvent) => Promise<void>;
   } = {},
 ): Promise<{ status: string; reason?: string; workflow?: string }> {
   const botLogin = opts.botLogin ?? cfg().botLogin;
@@ -192,8 +197,23 @@ export async function handleDelivery(
   if (!verdict.allow) return { status: "filtered", reason: verdict.reason };
 
   // (c) MAP — native delivery → LastLightEvent (or null if unmapped).
-  const ev = toLastLightEvent(delivery, conversationKey);
-  if (!ev) return { status: "filtered", reason: "unmapped event" };
+  const mapped = toLastLightEvent(delivery, conversationKey);
+  if (!mapped) return { status: "filtered", reason: "unmapped event" };
+
+  // (c′) ENRICH — stamp `resolvedRepo` + `correlationId` ahead of the route split,
+  //      so the shared input builder sees a fully-resolved event (event-enrich.ts).
+  const ev = enrichEvent(mapped, { defaultRepo: cfg().exploreDefaultRepo });
+
+  // (c″) ACK — react 👀 as EARLY as possible: right after enrich, BEFORE the (slow,
+  //      LLM) classifier and the blocking `flue run`. The GitHub analogue of Slack's
+  //      defaultAck "Thinking…". Gated by a cheap deterministic predicate (no LLM,
+  //      no gate lookup) so we react only to events we'll act on — structural issue/
+  //      PR events and maintainer @mentions — never an unrelated comment or one we'll
+  //      decline. Best-effort: a failed reaction must never block admission.
+  if (willActOn(ev)) {
+    const ack = opts.ack ?? defaultAck;
+    await ack(ev);
+  }
 
   // (d) ROUTE — code-based classifier → workflow + payload.
   const routerDeps: RouterDeps = opts.router ?? {
@@ -221,6 +241,21 @@ export async function handleDelivery(
  */
 function defaultPromptRunner() {
   return createClassifierRunner();
+}
+
+/**
+ * Production ack: react 👀 on the admitted event over a SCOPED issues-write token
+ * (owner/repo closed over; the "eyes" content is a fixed literal — never model-
+ * selectable). Best-effort: a missing GitHub App / reaction error is swallowed so a
+ * failed courtesy reaction never 500s the webhook (mirrors the decline-reply seam).
+ */
+async function defaultAck(ev: LastLightEvent): Promise<void> {
+  try {
+    await postAckReaction(ev);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[channels/github] ack reaction failed: ${msg}`);
+  }
 }
 
 /**

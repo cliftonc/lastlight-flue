@@ -43,7 +43,7 @@ describe("postDeclineReply — router-emitted decline (offline, mocked GitHub)",
     const { deps: d, post, mintToken } = deps();
     const res = await postDeclineReply(ev(), "only maintainers can do that", d);
     expect(res).toMatchObject({ posted: true });
-    expect(mintToken).toHaveBeenCalledWith("cliftonc/repo"); // downscoped to the repo
+    expect(mintToken).toHaveBeenCalledWith("repo"); // scoped by short repo NAME (not the slug)
     expect(post).toHaveBeenCalledTimes(1);
     const [, passedEv, message, botLogin] = post.mock.calls[0]!;
     expect(passedEv).toMatchObject({ owner: "cliftonc", repoName: "repo", issueNumber: 9 });
@@ -51,10 +51,10 @@ describe("postDeclineReply — router-emitted decline (offline, mocked GitHub)",
     expect(botLogin).toBe(BOT);
   });
 
-  it("derives owner/name when ev.repo is absent", async () => {
+  it("scopes by the short repo name (independent of the full ev.repo slug)", async () => {
     const { deps: d, mintToken } = deps();
     await postDeclineReply(ev({ repo: undefined }), "nope", d);
-    expect(mintToken).toHaveBeenCalledWith("cliftonc/repo");
+    expect(mintToken).toHaveBeenCalledWith("repo");
   });
 
   it("NO reply (silent) when the event has no issue target", async () => {

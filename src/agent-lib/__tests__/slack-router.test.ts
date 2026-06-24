@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { LastLightEvent } from "../../events.ts";
+import { enrichEvent, type RoutableEvent } from "../event-enrich.ts";
 import {
   routeEvent,
   routeCommand,
@@ -9,18 +10,25 @@ import {
 } from "../slack-router.ts";
 
 const KEY = "slack:T1:C9:100.1";
+/** The workspace default repo a repo-less Slack message resolves to (EXPLORE_DEFAULT_REPO). */
+const DEFAULT_REPO = "acme/widgets";
 
-function ev(over: Partial<LastLightEvent> = {}): LastLightEvent {
-  return {
-    id: "m-1",
-    source: "slack",
-    type: "message",
-    sender: "U_ALICE",
-    senderIsBot: false,
-    body: "hello",
-    conversationKey: KEY,
-    ...over,
-  };
+function ev(over: Partial<LastLightEvent> = {}): RoutableEvent {
+  // The channel enriches every mapped event before routing (resolving the workspace
+  // default repo for a repo-less Slack message) — mirror that here.
+  return enrichEvent(
+    {
+      id: "m-1",
+      source: "slack",
+      type: "message",
+      sender: "U_ALICE",
+      senderIsBot: false,
+      body: "hello",
+      conversationKey: KEY,
+      ...over,
+    },
+    { defaultRepo: DEFAULT_REPO },
+  );
 }
 
 /** A router with no live LLM: classify/screen are injected fakes. */
@@ -61,10 +69,18 @@ describe("slack router — chat is the default route", () => {
 });
 
 describe("slack router — command intents divert to workflows", () => {
-  it("an explore intent → explore workflow with the thread triggerId (no Slack trigger_id)", async () => {
+  it("an explore intent → explore workflow with a SCHEMA-VALID input (runId/owner/repo derived)", async () => {
     const d = await routeEvent(ev({ body: "help me think through a design" }), router({ classify: async () => ({ intent: "explore" }) }));
     expect(d).toMatchObject({ action: "workflow", workflow: "explore" });
-    if (d.action === "workflow") expect(d.payload.triggerId).toBe(KEY);
+    if (d.action === "workflow") {
+      // The fields the explore input schema REQUIRES — previously omitted, which is
+      // what made admission fail with `action_input_validation`.
+      expect(d.payload.runId).toBe(KEY); // stable correlation id = conversationKey
+      expect(d.payload.owner).toBe("acme"); // resolved from EXPLORE_DEFAULT_REPO
+      expect(d.payload.repo).toBe("widgets");
+      expect(d.payload.commentBody).toBe("help me think through a design");
+      expect(d.payload.triggerId).toBe(KEY); // thread key, never a Slack trigger_id
+    }
   });
 
   it("a question intent → answer workflow", async () => {

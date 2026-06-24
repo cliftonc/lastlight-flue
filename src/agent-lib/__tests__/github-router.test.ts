@@ -1,11 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
+import * as v from "valibot";
 import type { LastLightEvent } from "../../events.ts";
+import { enrichEvent, type RoutableEvent } from "../event-enrich.ts";
 import {
   routeEvent,
   dispatchRoute,
   type RouterDeps,
   type DispatchDeps,
 } from "../github-router.ts";
+import { IssueCommentInputSchema } from "../../workflows/issue-comment.ts";
+import { PrCommentInputSchema } from "../../workflows/pr-comment.ts";
 
 /** A throwing runner — proves deterministic routes never call the LLM. */
 const noLlm: RouterDeps = {
@@ -14,8 +18,10 @@ const noLlm: RouterDeps = {
   },
 };
 
-function ev(overrides: Partial<LastLightEvent>): LastLightEvent {
-  return {
+function ev(overrides: Partial<LastLightEvent>): RoutableEvent {
+  // The channel enriches every mapped event before routing — mirror that here so the
+  // router sees the same `resolvedRepo` / `correlationId` it does in production.
+  return enrichEvent({
     id: "d1",
     source: "github",
     type: "issue.opened",
@@ -31,7 +37,7 @@ function ev(overrides: Partial<LastLightEvent>): LastLightEvent {
     authorAssociation: "OWNER",
     conversationKey: "github:cliftonc/repo#1",
     ...overrides,
-  };
+  });
 }
 
 describe("routeEvent — deterministic routes (ZERO LLM)", () => {
@@ -178,6 +184,39 @@ describe("routeEvent — comment path", () => {
       deps,
     );
     expect(d).toMatchObject({ action: "workflow", workflow: "security-feedback" });
+  });
+
+  it("comment-route payloads satisfy their workflow input schemas (incl. commentId)", async () => {
+    // Regression: the router used to omit `commentId`, which both schemas require —
+    // admission then died with `action_input_validation`. Parse the actual payload
+    // against the actual workflow schema so any future drift fails here, not in prod.
+    const chatDeps: RouterDeps = {
+      run: noLlm.run,
+      classify: async () => ({ intent: "chat" }),
+      screen: async () => ({ flagged: false }),
+    };
+    const dIssue = await routeEvent(
+      ev({ ...base, body: "@last-light what do you think?", commentId: 12345 }),
+      chatDeps,
+    );
+    expect(dIssue).toMatchObject({ workflow: "issue-comment" });
+    const issuePayload = (dIssue as { payload: unknown }).payload;
+    expect(() => v.parse(IssueCommentInputSchema, issuePayload)).not.toThrow();
+    expect((issuePayload as { commentId: unknown }).commentId).toBe(12345);
+
+    const qDeps: RouterDeps = {
+      run: noLlm.run,
+      classify: async () => ({ intent: "question" }),
+      screen: async () => ({ flagged: false }),
+    };
+    const dPr = await routeEvent(
+      ev({ ...base, body: "@last-light does this consider X?", prNumber: 9, commentId: "c-abc" }),
+      qDeps,
+    );
+    expect(dPr).toMatchObject({ workflow: "pr-comment" });
+    const prPayload = (dPr as { payload: unknown }).payload;
+    expect(() => v.parse(PrCommentInputSchema, prPayload)).not.toThrow();
+    expect((prPayload as { commentId: unknown }).commentId).toBe("c-abc");
   });
 
   it("screener flag prefixes the commentBody passed to the workflow", async () => {

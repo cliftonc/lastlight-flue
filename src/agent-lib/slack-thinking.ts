@@ -60,6 +60,28 @@ export async function showSlackThinking(
 }
 
 /**
+ * Update the live thread status to a NEW message (best-effort) — e.g. the router has
+ * decided the route, so the generic "Thinking…" becomes "🧭 Exploring the idea…".
+ * Same anchor as {@link showSlackThinking} (the thread root). No reaction fallback:
+ * the 👀 ack (if any) was already placed at admission; this only refines the
+ * Assistant-pane status when it's available, and silently no-ops otherwise.
+ */
+export async function updateSlackStatus(
+  poster: SlackPoster,
+  conversationKey: string,
+  status: string,
+  loadingMessages?: string[],
+): Promise<void> {
+  const loc = parseSlackConversationKey(conversationKey);
+  if (!loc) return;
+  try {
+    await poster.setStatus(loc.channelId, loc.threadTs, status, loadingMessages);
+  } catch {
+    /* best-effort — the Assistant status may be unavailable (a regular channel). */
+  }
+}
+
+/**
  * Clear the "Thinking…" status once the turn ends (best-effort). Posting the reply
  * already clears it in the Assistant pane; this is the explicit backstop. The 👀
  * fallback reaction is intentionally left in place (it acknowledges the message was

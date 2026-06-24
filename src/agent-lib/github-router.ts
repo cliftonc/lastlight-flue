@@ -19,6 +19,8 @@
  * Lives in `src/agent-lib/` (NOT discovered). Imported by `src/channels/github.ts`.
  */
 import type { LastLightEvent } from "../events.ts";
+import type { RoutableEvent } from "./event-enrich.ts";
+import { buildWorkflowInput } from "./workflow-input.ts";
 import { isMaintainer, hasBotMention } from "./github-screener.ts";
 import {
   classifyComment,
@@ -58,7 +60,7 @@ export interface RouterDeps {
   /** Single-shot LLM seam for the classifier + screener (NL comments only). */
   run: PromptRunner;
   /** Reply-gate lookup by conversationKey (default: none → no short-circuit). */
-  pendingReplyGate?: (ev: LastLightEvent) => Promise<PendingReplyGate | null>;
+  pendingReplyGate?: (ev: RoutableEvent) => Promise<PendingReplyGate | null>;
   /** Test hooks to override the classifier/screener directly. */
   classify?: (body: string, ctx?: { issueTitle?: string; isPullRequest?: boolean }) => Promise<ClassificationResult>;
   screen?: (body: string) => Promise<ScreenResult>;
@@ -77,13 +79,39 @@ function declineMessage(sender: string): string {
 }
 
 /**
+ * Cheap, LLM-free predicate: will this event be acted on, so the channel can ack 👀
+ * EARLY — right after enrich, BEFORE the slow classifier in routeEvent (the GitHub
+ * analogue of Slack's defaultAck "Thinking…")? Mirrors routeEvent's deterministic
+ * gates: structural issue/PR events always act; a comment must @mention the bot AND
+ * come from a maintainer (a non-maintainer @mention is declined, an un-mentioned
+ * comment is ignored — neither earns a reaction). The rare explore reply-gate resume
+ * (an un-mentioned reply consumed by a paused run) is NOT covered here — it still
+ * routes, just without the early ack (the gate lookup is intentionally kept out of
+ * this synchronous predicate).
+ */
+export function willActOn(ev: RoutableEvent): boolean {
+  switch (ev.type) {
+    case "issue.opened":
+    case "issue.reopened":
+    case "pr.opened":
+    case "pr.synchronize":
+    case "pr.reopened":
+      return true;
+    case "comment.created":
+      return hasBotMention(ev.body) && isMaintainer(ev.authorAssociation);
+    default:
+      return false;
+  }
+}
+
+/**
  * Route a normalized event → a decision. Deterministic for issue/PR events (NO
  * LLM); the comment path adds: reply-gate short-circuit → mention gate → maintainer
  * gate → approve/reject regex → security-review regex → parallel classify∥screen →
  * intent dispatch. Pure-ish: the only effects are the injected LLM/gate lookups.
  */
 export async function routeEvent(
-  ev: LastLightEvent,
+  ev: RoutableEvent,
   deps: RouterDeps,
 ): Promise<RouteDecision> {
   const t = target(ev);
@@ -176,7 +204,7 @@ export async function routeEvent(
         return {
           action: "workflow",
           workflow: "security-review",
-          payload: { owner: t.owner, repo: t.repo, sender: ev.sender, source: ev.source },
+          payload: buildWorkflowInput("security-review", ev),
         };
       }
 
@@ -200,6 +228,7 @@ export async function routeEvent(
             repo: t.repo,
             prNumber: ev.prNumber,
             issueNumber: ev.issueNumber,
+            commentId: ev.commentId,
             title: ev.title,
             body: ev.body,
             sender: ev.sender,
@@ -246,14 +275,9 @@ export async function routeEvent(
         return {
           action: "workflow",
           workflow: "explore",
-          payload: {
-            owner: t.owner,
-            repo: t.repo,
-            issue: ev.issueNumber,
-            sender: ev.sender,
-            commentBody,
-            triggerId: ev.conversationKey,
-          },
+          // Shared builder: derives the `runId` (= conversationKey) the explore input
+          // schema requires — the inline payload here used to omit it (latent break).
+          payload: buildWorkflowInput("explore", ev, { body: commentBody }),
         };
       }
       // question / chat / approve / reject (already handled) → issue-comment.
@@ -264,6 +288,7 @@ export async function routeEvent(
           owner: t.owner,
           repo: t.repo,
           issueNumber: ev.issueNumber,
+          commentId: ev.commentId,
           title: ev.title,
           body: ev.body,
           sender: ev.sender,
