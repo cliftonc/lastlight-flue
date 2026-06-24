@@ -33,6 +33,7 @@
  * supplied `harness`. The app-owned `BuildRunStore` gate/durability is UNCHANGED.
  */
 import { defineWorkflow, type JsonValue } from '@flue/runtime';
+import { jsonSafe } from '../agent-lib/json-safe.ts';
 import { BuildRunStore, MAX_RESTART_RESUMES, type GateName } from '../build-run-store.ts';
 import {
   type BuildInput,
@@ -105,6 +106,37 @@ function gatePing(gate: string, run: BuildRun): string {
 }
 
 /**
+ * Explain a no-op re-trigger of an already-terminal run with a one-off issue comment.
+ * Fires ONLY on a genuine user comment (`triggerType === 'comment'`) — a boot/resume
+ * re-invoke (`boot`/`resume`) must stay silent so recovery never spams the issue.
+ * Best-effort: any failure (no `postNotice` dep, token mint, transport) is swallowed so
+ * the durable no-op return is unaffected.
+ */
+async function noteTerminalReTrigger(
+  ctx: BuildRunCtx,
+  run: BuildRun,
+  deps: BuildDeps,
+): Promise<void> {
+  if (ctx.input.triggerType !== 'comment' || !deps.postNotice) return;
+  const message =
+    run.status === 'complete'
+      ? `🔁 The build for this issue already **completed**` +
+        (run.scratch.prUrl ? ` — see ${run.scratch.prUrl}` : '') +
+        `. Re-triggering a finished issue is a no-op; reopen this issue or open a new ` +
+        `one to start another build.`
+      : `⚠️ The build for this issue is in a **failed** state` +
+        (run.failReason ? ` (\`${run.failReason}\`)` : '') +
+        `, so I won't re-run it automatically. A maintainer needs to reset it to retry.`;
+  try {
+    await deps.postNotice(ctx, run, message);
+  } catch (err: unknown) {
+    ctx.log.warn('build: terminal re-trigger notice failed (continuing)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * The testable core. Drives the full durable control flow over an injected
  * `BuildRunStore` + `BuildDeps`. Production wraps this in `run()` with the default
  * store + stubbed deps; tests pass a temp-sqlite store + fake phase bodies.
@@ -118,9 +150,19 @@ export async function runBuild(
   const id = input.runId;
   let run = store.getOrCreate(id, seedFrom(input));
 
-  // Already-terminal: a duplicate signal against a finished run is a no-op.
-  if (run.status === 'complete') return { status: 'complete' };
-  if (run.status === 'failed') return { status: 'failed', reason: run.failReason ?? undefined };
+  // Already-terminal: a duplicate signal against a finished run is a no-op — but a
+  // USER re-trigger (a fresh @mention) of a finished issue is otherwise SILENT, so
+  // from GitHub it looks like the bot ignored the request. Post a one-off explanatory
+  // comment (best-effort; ONLY on a genuine user comment, never on boot/resume re-
+  // invokes — those must stay silent to avoid spamming the issue on every recovery).
+  if (run.status === 'complete') {
+    await noteTerminalReTrigger(ctx, run, deps);
+    return { status: 'complete' };
+  }
+  if (run.status === 'failed') {
+    await noteTerminalReTrigger(ctx, run, deps);
+    return { status: 'failed', reason: run.failReason ?? undefined };
+  }
 
   // ── BREAKER: every (re-)invoke bumps restart_count; > cap → terminalize. ──────
   // (Bump only on a resumed re-entry, not the very first fresh invoke, so a normal
@@ -313,7 +355,7 @@ export default defineWorkflow({
   async run({ harness, input, log }): Promise<JsonValue> {
     const store = new BuildRunStore(storePath());
     try {
-      return (await runBuild({ harness, input, log }, store)) as unknown as JsonValue;
+      return jsonSafe(await runBuild({ harness, input, log }, store)) as unknown as JsonValue;
     } finally {
       store.close();
     }

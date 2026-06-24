@@ -384,4 +384,19 @@ describe('filterEventsByOperation + derivePhases (run-history pipeline)', () => 
   it('returns no phases for a run with only run-level events', () => {
     expect(derivePhases([ev({ type: 'run_start' }, '0_0'), ev({ type: 'run_end' }, '0_1')])).toHaveLength(0);
   });
+
+  it('labels a subagent task by its parent (phase) session and drops the empty dispatch parent', () => {
+    // Mirrors a build phase: a `session.task()` dispatch op on the coordinator (no
+    // agent_start, no messages) + the child subagent op running in `task:architect:<id>`
+    // with parentSession='architect'.
+    const stream = [
+      ev({ type: 'operation_start', operationId: 'dispatch', session: 'architect', operationKind: 'task', timestamp: 't0' }, '0_0'),
+      ev({ type: 'agent_start', operationId: 'child', session: 'task:architect:abc123', parentSession: 'architect', timestamp: 't1' }, '0_1'),
+      ev({ type: 'message_end', operationId: 'child', message: { role: 'assistant', content: 'plan' }, timestamp: 't2' }, '0_2'),
+      ev({ type: 'agent_end', operationId: 'child', timestamp: 't3' }, '0_3'),
+    ];
+    const phases = derivePhases(stream);
+    expect(phases).toHaveLength(1);
+    expect(phases[0]).toMatchObject({ operationId: 'child', name: 'architect', index: 0, messageCount: 1 });
+  });
 });

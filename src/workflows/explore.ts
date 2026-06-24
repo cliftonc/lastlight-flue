@@ -36,6 +36,7 @@
  * `ctx.init`→the supplied `harness`. The app-owned `ExploreRunStore` gate is UNCHANGED.
  */
 import { defineWorkflow, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import {
   ExploreRunStore,
   MAX_RESTART_RESUMES,
@@ -288,7 +289,7 @@ export default defineWorkflow({
   async run({ harness, input, log }): Promise<JsonValue> {
     const store = new ExploreRunStore(storePath());
     try {
-      return (await runExplore({ harness, input, log }, store)) as unknown as JsonValue;
+      return jsonSafe(await runExplore({ harness, input, log }, store)) as unknown as JsonValue;
     } finally {
       store.close();
     }

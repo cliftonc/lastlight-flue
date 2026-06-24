@@ -125,8 +125,11 @@ describe("routeEvent — comment path", () => {
     expect(d).toMatchObject({
       action: "workflow",
       workflow: "build",
-      payload: { issue: 1, triggerType: "comment" },
+      // `runId` (= correlationId = conversationKey) is REQUIRED by BuildInputSchema;
+      // omitting it crashed admission with `action_input_validation`.
+      payload: { runId: (d as any).payload.conversationKey, issue: 1, triggerType: "comment" },
     });
+    expect((d as any).payload.runId).toBeTruthy();
   });
 
   it("maintainer NL 'explore' intent → explore workflow", async () => {

@@ -67,6 +67,7 @@ function recordingDeps(opts: {
   const phases: string[] = [];
   const gateAsks: string[] = [];
   const prOpens: string[] = [];
+  const notices: string[] = [];
   const gates = { post_architect: true, post_reviewer: false, ...opts.gates };
   let gateCommentId = 9000;
   const deps: BuildDeps = {
@@ -84,6 +85,9 @@ function recordingDeps(opts: {
       gateAsks.push(gate);
       return { commentId: gateCommentId++ };
     },
+    async postNotice(_c, _r, message) {
+      notices.push(message);
+    },
     async openPullRequest(_c, r) {
       prOpens.push(r.id);
       return { html_url: `https://gh/pr/${r.issue}`, number: 314 };
@@ -91,7 +95,7 @@ function recordingDeps(opts: {
     gateEnabled: (g) => gates[g],
     parseVerdict: defaultBuildDeps().parseVerdict,
   };
-  return { deps, phases, gateAsks, prOpens };
+  return { deps, phases, gateAsks, prOpens, notices };
 }
 
 describe('build — durable control flow + post_architect gate', () => {
@@ -187,6 +191,39 @@ describe('build — durable control flow + post_architect gate', () => {
     expect(t.gateAsks).toEqual([]); // never asked
     expect(t.phases).toEqual(['guardrails', 'architect', 'executor', 'reviewer:0']);
     expect(t.prOpens).toEqual([INPUT.runId]);
+  });
+
+  it('a USER re-trigger of a COMPLETE run posts an explanatory notice (no phases re-run)', async () => {
+    const t = recordingDeps({ gates: { post_architect: false } });
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // complete (opens PR)
+    expect(store.get(INPUT.runId)!.status).toBe('complete');
+
+    const res = await runBuild(ctx({ ...INPUT, triggerType: 'comment' }), store, t.deps);
+    expect(res.status).toBe('complete');
+    // No phase re-ran; exactly one notice posted, referencing the PR.
+    expect(t.phases).toEqual(['guardrails', 'architect', 'executor', 'reviewer:0']);
+    expect(t.notices).toHaveLength(1);
+    expect(t.notices[0]).toMatch(/already \*\*completed\*\*/);
+    expect(t.notices[0]).toContain('https://gh/pr/42');
+  });
+
+  it('a BOOT/resume re-invoke of a terminal run stays SILENT (no notice spam)', async () => {
+    const t = recordingDeps({ gates: { post_architect: false } });
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // complete
+
+    await runBuild(ctx({ ...INPUT, triggerType: 'boot', resumedGate: 'boot' }), store, t.deps);
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // no triggerType at all
+    expect(t.notices).toEqual([]);
+  });
+
+  it('a USER re-trigger of a FAILED run posts the failed-state notice', async () => {
+    const t = recordingDeps({ guardrails: 'BLOCKED — missing tooling.' });
+    await runBuild(ctx({ ...INPUT }), store, t.deps); // fails at guardrails
+    expect(store.get(INPUT.runId)!.status).toBe('failed');
+
+    await runBuild(ctx({ ...INPUT, triggerType: 'comment' }), store, t.deps);
+    expect(t.notices).toHaveLength(1);
+    expect(t.notices[0]).toMatch(/\*\*failed\*\* state/);
   });
 });
 

@@ -160,12 +160,18 @@ export class DockerContainer {
    * `/workspace` via `harness.shell`/`harness.fs`.
    */
   static async createEphemeral(
-    opts: { image?: string; ttlSeconds?: number; labels?: Record<string, string> } = {},
+    opts: {
+      image?: string;
+      ttlSeconds?: number;
+      labels?: Record<string, string>;
+      env?: Record<string, string>;
+    } = {},
   ): Promise<DockerContainer> {
     const image = opts.image ?? DEFAULT_IMAGE;
     const ttl = Math.max(60, Math.floor(opts.ttlSeconds ?? 3600));
     const args = ['run', '-d', '--rm', '--workdir', WORKSPACE];
     for (const [k, val] of Object.entries(opts.labels ?? {})) args.push('--label', `${k}=${val}`);
+    for (const [k, val] of Object.entries(opts.env ?? {})) args.push('-e', `${k}=${val}`);
     args.push(image, 'sleep', String(ttl));
     const res = await runDocker(args, { timeoutMs: 120_000 });
     if (res.exitCode !== 0) {
@@ -297,6 +303,14 @@ export interface DockerSandboxOptions {
   ttlSeconds?: number;
   /** Extra Docker labels (a `lastlight.run=<runId>` label is always added). */
   labels?: Record<string, string>;
+  /**
+   * Env baked at `docker run` (`-e k=v`) — inherited by EVERY process in the
+   * container. Used to raise the Node heap for memory-heavy builds
+   * (`NODE_OPTIONS=--max-old-space-size=…`). Do NOT pass secrets here (it lands in
+   * the container env for the whole run + shows in `docker inspect`); per-run tokens
+   * stay scoped to individual `harness.shell` calls.
+   */
+  env?: Record<string, string>;
 }
 
 /**
@@ -320,6 +334,7 @@ export function dockerSandbox(opts: DockerSandboxOptions = {}): SandboxFactory {
         image: opts.image,
         ttlSeconds: opts.ttlSeconds,
         labels: { "lastlight.run": id, ...(opts.labels ?? {}) },
+        env: opts.env,
       });
       const api = new DockerSandboxApi(container);
       return createSandboxSessionEnv(api, WORKSPACE);

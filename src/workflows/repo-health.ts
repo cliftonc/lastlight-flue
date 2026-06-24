@@ -43,6 +43,7 @@
  * pass fakes so the whole flow runs with NO live model and NO live GitHub.
  */
 import { defineWorkflow, type FlueHarness, type FlueLogger, type JsonValue } from "@flue/runtime";
+import { jsonSafe } from "../agent-lib/json-safe.ts";
 import * as v from "valibot";
 import { Octokit } from "octokit";
 import {
@@ -264,6 +265,6 @@ export default defineWorkflow({
   agent: healthAgent,
   input: RepoHealthInputSchema,
   async run({ harness, input, log }) {
-    return (await runRepoHealth({ harness, input, log })) as unknown as JsonValue;
+    return jsonSafe(await runRepoHealth({ harness, input, log })) as unknown as JsonValue;
   },
 });

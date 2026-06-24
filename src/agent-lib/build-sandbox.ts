@@ -65,6 +65,64 @@ export interface HarnessCloneSpec {
   branch: string;
   /** Strip the tokenized remote after clone (read-only flows that never push). */
   scrubRemote?: boolean;
+  /**
+   * Install dependencies after checkout so the agent lands in a READY repo
+   * (`node_modules/.bin` populated). Build opts in — its executor runs the repo's
+   * build/test/typecheck gate, which needs deps installed; without this the executor
+   * hit `tsc: not found` and flailed until the run timed out. Read-only flows
+   * (explore/security-review) leave it off. Best-effort: a failed install warns and
+   * continues (the env may be incomplete) rather than aborting the clone.
+   */
+  installDeps?: boolean;
+}
+
+/** Wall-clock cap for the post-clone dependency install (kept well under the run cap). */
+const DEP_INSTALL_TIMEOUT_MS = 8 * 60_000;
+
+/**
+ * Install JS dependencies in the harness `/workspace` after checkout. Enables
+ * `corepack` (so the repo's pinned pnpm/yarn from `packageManager` is on PATH — the
+ * base `node:*` image ships only npm), then installs with the package manager implied
+ * by the lockfile (frozen for reproducibility, falling back to a normal install if the
+ * lockfile is out of sync). Best-effort: a non-zero exit WARNS (it does not throw) so a
+ * registry hiccup or a depless repo never aborts a build before the agent runs.
+ */
+export async function installDepsInHarness(
+  harness: FlueHarness,
+  log?: { warn(msg: string, meta?: unknown): void },
+): Promise<void> {
+  // `corepack enable` activates the pinned pnpm/yarn; COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+  // suppresses the first-run download prompt. Detection is lockfile-first (matches what
+  // the repo actually committed); `--frozen`/`ci` keep the install reproducible, with a
+  // plain install fallback so a stale lockfile degrades instead of hard-failing.
+  const script = [
+    'corepack enable >/dev/null 2>&1 || true',
+    'if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile || pnpm install',
+    'elif [ -f yarn.lock ]; then yarn install --immutable || yarn install',
+    'elif [ -f package-lock.json ]; then npm ci || npm install',
+    'elif [ -f package.json ]; then npm install',
+    'else echo "lastlight: no package.json in /workspace — skipping dependency install"',
+    'fi',
+  ].join('\n');
+  let res: { exitCode: number; stderr: string };
+  try {
+    res = await harness.shell(script, {
+      cwd: BUILD_WORKSPACE,
+      env: { COREPACK_ENABLE_DOWNLOAD_PROMPT: '0' },
+      timeoutMs: DEP_INSTALL_TIMEOUT_MS,
+    });
+  } catch (err) {
+    log?.warn('build: dependency install errored (continuing; env may be incomplete)', {
+      reason: String(err),
+    });
+    return;
+  }
+  if (res.exitCode !== 0) {
+    log?.warn('build: dependency install failed (continuing; env may be incomplete)', {
+      exitCode: res.exitCode,
+      stderr: res.stderr.slice(-800),
+    });
+  }
 }
 
 /**
@@ -106,6 +164,10 @@ export async function cloneRepoIntoHarness(
     // Read-only flow: remove the token from the persisted remote URL.
     const tokenless = `https://github.com/${spec.owner}/${spec.repo}.git`;
     await harness.shell(`git remote set-url origin ${shellArg(tokenless)}`, { cwd: BUILD_WORKSPACE });
+  }
+  if (spec.installDeps) {
+    // Land the agent in a READY repo (deps installed). Best-effort — never aborts the clone.
+    await installDepsInHarness(harness);
   }
 }
 
