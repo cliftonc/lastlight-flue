@@ -114,9 +114,8 @@ export async function configureGitAuth(config: {
   const token = await getInstallationToken(config);
 
   if (!shouldWriteGlobalGitConfig()) {
-    console.log(`[git-auth] Minted GitHub App token (expires: ${token.expiresAt}). ` +
-      `Global git config left untouched; sandboxes receive the token via GIT_TOKEN. ` +
-      `Set LASTLIGHT_WRITE_GLOBAL_GIT=1 to also write ~/.gitconfig.`);
+    // Default path: global git config left untouched; sandboxes receive the token via
+    // GIT_TOKEN. Set LASTLIGHT_WRITE_GLOBAL_GIT=1 to also write ~/.gitconfig.
     return token;
   }
 
