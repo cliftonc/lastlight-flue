@@ -1,39 +1,45 @@
-Create a pull request for the work on branch {{branch}}.
+You are writing the pull-request title and description for the completed work on
+branch `{{branch}}` of `{{owner}}/{{repo}}` (issue #{{issueNumber}}).
 
-Use the MCP tool github_create_pull_request with the following:
-- owner: {{owner}}
-- repo: {{repo}}
-- head: {{branch}}
-- base: main
-- title: A concise title describing the change (reference #{{issueNumber}})
-- body: A markdown body that includes EXACTLY these sections in order:
+You do NOT open the PR yourself — the harness creates it deterministically from the
+title and body you produce. Your job is to author a clear, accurate title and body.
 
-  Closes #{{issueNumber}}
+First, gather context from the branch (your cwd is the repo root, checked out at
+`{{branch}}`):
+- Run `ls -1 {{issueDir}}/` to see which handoff artifacts exist.
+- Read `{{issueDir}}/executor-summary.md` for what was implemented and the
+  test/lint/typecheck results.
+- Read `{{issueDir}}/reviewer-verdict.md` (if present) for the review outcome.
+- Skim the actual diff (`git diff origin/{{base}}...HEAD` or the changed files) so the
+  summary reflects what truly changed — do not invent changes.
 
-  ## Summary
-  (3-6 bullet points describing what changed)
+Then output EXACTLY this format, with no extra commentary before or after:
 
-  ## Planning and execution docs
-  - [Guardrails report]({{branchUrl guardrails-report.md}})
-  - [Architect plan]({{branchUrl architect-plan.md}})
-  - [Executor summary]({{branchUrl executor-summary.md}})
-  - [Reviewer verdict]({{branchUrl reviewer-verdict.md}})
-  - [Status]({{branchUrl status.md}})
+PR_TITLE: <a concise, descriptive title referencing #{{issueNumber}}>
+PR_BODY:
+Closes #{{issueNumber}}
 
-  Before adding each link above, run `ls -1 {{issueDir}}/`
-  on the branch and OMIT any line whose file doesn't exist on disk. Use the
-  exact full https URLs above as written — do NOT shorten to relative paths,
-  they will not render in the PR description.
+## Summary
+(3–6 bullet points describing what actually changed, grounded in the diff and the
+executor summary)
 
-  ## Test results
-  (paste the actual test/lint/typecheck output from executor-summary.md){{#if !review.approved}}
+## Planning and execution docs
+- [Guardrails report]({{branchUrl guardrails-report.md}})
+- [Architect plan]({{branchUrl architect-plan.md}})
+- [Executor summary]({{branchUrl executor-summary.md}})
+- [Reviewer verdict]({{branchUrl reviewer-verdict.md}})
+- [Status]({{branchUrl status.md}})
 
-Note: There are unresolved reviewer issues after {{review.cycles}} fix cycles. See reviewer-verdict.md on the branch.{{/if}}
+OMIT any doc line above whose file did NOT appear in `ls -1 {{issueDir}}/`. Use the
+exact full https URLs as written — do not shorten to relative paths.
 
-Do NOT post a comment with the PR link — the harness adds it to the status
-checklist on the issue automatically. Just create the PR.
+## Test results
+(paste the actual test/lint/typecheck output quoted in executor-summary.md){{#if reviewerOpenIssues}}
 
-Update status.md: current_phase = complete, add pr_number.
-git add .lastlight/ && git commit -m "status: PR created for #{{issueNumber}}" && git push origin HEAD
+> ⚠ There are unresolved reviewer issues after the fix cycles. See reviewer-verdict.md
+> on the branch.{{/if}}
 
-OUTPUT: The PR number and URL (so the harness can link the PR from the checklist).
+Rules:
+- Everything after `PR_BODY:` (to the end of your output) is used verbatim as the PR
+  description, so include only the description there.
+- Do NOT wrap the output in code fences. Do NOT post a comment or open the PR.

@@ -95,7 +95,7 @@ The production invoker calls beta.3's in-process `invoke(workflow, { input })` (
 
 | Workflow | What it does |
 |---|---|
-| `build` | Multi-phase durable: guardrails → architect → **[approve gate]** → executor → reviewer-loop(review → **[gate]** → fix → recheck) → PR. App-owned `BuildRunStore`. |
+| `build` | Multi-phase durable: guardrails → architect → **[approve gate]** → executor → reviewer-loop(review → **[gate]** → fix → recheck) → PR. App-owned `BuildRunStore`. The finalize PR is **opened deterministically** (scoped token, bound ref), but its **title + body are authored by the `pr` LLM subagent** (`src/agent-lib/pr-author.ts`/`pr-author-prompt.ts`, prompt `src/prompts/pr.md`), with a deterministic `renderPrTitle`/`renderPrBody` fallback if authoring fails. |
 | `explore` | Multi-phase durable: read/research → Socratic ask-loop(ask → **[reply gate]** → fold human answer) → synthesize → publish spec. `ExploreRunStore`. Slack origin (no issue) publishes a new issue to `EXPLORE_DEFAULT_REPO`. |
 | `answer` | Single-phase sourced answer to a direct question; GitHub: posts + `question`-labels the issue; Slack: replies in-thread. All input fields optional (origin derived internally). |
 | `pr-review` | Single-phase formal PR review (`VERDICT:` marker) + deterministic comment post. |
@@ -114,7 +114,7 @@ Scheduled fan-outs (cron, `src/crons.ts`): repo-health, security-review, issue-t
 
 - **Testable seams everywhere.** A workflow's `run()` is a thin wrapper over a `run*(ctx, store, deps)` core with an injected `deps` (phase runner, gate poster, publisher) and a real store on temp SQLite. Tests drive the whole loop with **no live model, web, GitHub, or Slack**. Match this when adding a workflow.
 - **All user-authored text is untrusted** — wrap it (`wrapUntrusted` / `flagPrefix`) before it reaches a model prompt. The injection screener prefixes flagged bodies.
-- **Deterministic egress.** Posting back (comments, labels, Slack replies, the explore spec) is **application code with a bound ref + scoped token**, never a model-selectable write tool. Read tools are injected per-call, scoped to the resolved repo.
+- **Deterministic egress.** Posting back (comments, labels, Slack replies, the explore spec, the build PR open) is **application code with a bound ref + scoped token**, never a model-selectable write tool. Read tools are injected per-call, scoped to the resolved repo. A model may **author** egress *text* (e.g. the build PR title/body) — that prose is parsed and posted by deterministic code; the model still never holds the write tool or picks owner/repo/head/base.
 - **Scoped tokens.** GitHub access is minted per-run via the GitHub App, downscoped to the target repo + the workflow's permission profile (`src/engine/profiles.ts`, `src/engine/git-auth.ts`).
 - **Sandboxes** are per-run self-terminating Docker containers (`src/sandboxes/docker.ts`); the agent initializer is async/per-run and there's no teardown hook (the container `--rm`s itself).
 - **Config is fail-open / positive-enable** (`src/config.ts`): a bad JSON layer warns and degrades; gates default closed.

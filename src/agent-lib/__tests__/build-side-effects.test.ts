@@ -110,4 +110,61 @@ describe("runOpenPullRequest — mint → default-branch → render → idempote
     const body = ((pullsCreate.mock.calls[0] as unknown[])[0] as { body: string }).body;
     expect(body).toContain("unresolved reviewer issues after 2 fix cycle");
   });
+
+  it("LLM author seam → PR uses the AGENT-written title + body, opened deterministically", async () => {
+    const { octokit, pullsCreate } = octokitWith();
+    const run = { ...RUN, scratch: { "verdict:0": "VERDICT: APPROVED" } };
+    const authorTitleBody = vi.fn(async () => ({
+      title: "Add retry/backoff to the webhook ingest path (#42)",
+      body: "Closes #42\n\n## Summary\n- Smarter PR text written by the model",
+    }));
+    const deps: OpenPrDeps = {
+      mintToken: async () => "ghs_pr",
+      makeOctokit: () => octokit,
+      authorTitleBody,
+    };
+
+    await runOpenPullRequest(ctx(), run, deps);
+
+    // The seam saw the bound ref + base + approved flag (head/base are never model-chosen).
+    const seamArgs = authorTitleBody.mock.calls[0] as unknown[];
+    expect((seamArgs[2] as { owner: string; repo: string })).toMatchObject({ owner: "cliftonc", repo: "widget" });
+    expect((seamArgs[5] as { base: string; approved: boolean })).toEqual({ base: "main", approved: true });
+    // pulls.create used the agent's title/body verbatim; the open itself stays deterministic.
+    const call = (pullsCreate.mock.calls[0] as unknown[])[0] as { head: string; base: string; title: string; body: string };
+    expect(call.head).toBe("lastlight/42");
+    expect(call.base).toBe("main");
+    expect(call.title).toBe("Add retry/backoff to the webhook ingest path (#42)");
+    expect(call.body).toContain("Smarter PR text written by the model");
+  });
+
+  it("LLM author returns null → falls back to the deterministic render", async () => {
+    const { octokit, pullsCreate } = octokitWith();
+    const run = { ...RUN, scratch: { "verdict:0": "VERDICT: APPROVED" } };
+    const deps: OpenPrDeps = {
+      mintToken: async () => "ghs_pr",
+      makeOctokit: () => octokit,
+      authorTitleBody: async () => null,
+    };
+    await runOpenPullRequest(ctx(), run, deps);
+    const call = (pullsCreate.mock.calls[0] as unknown[])[0] as { title: string; body: string };
+    expect(call.title).toBe("Build #42 (lastlight/42)");
+    expect(call.body).toContain("Closes #42");
+  });
+
+  it("LLM author throws → best-effort fallback to the deterministic render (no crash)", async () => {
+    const { octokit, pullsCreate } = octokitWith();
+    const run = { ...RUN, scratch: { "verdict:0": "VERDICT: APPROVED" } };
+    const deps: OpenPrDeps = {
+      mintToken: async () => "ghs_pr",
+      makeOctokit: () => octokit,
+      authorTitleBody: async () => {
+        throw new Error("model unavailable");
+      },
+    };
+    const res = await runOpenPullRequest(ctx(), run, deps);
+    expect(res).toEqual({ html_url: "https://gh/pull/314", number: 314 });
+    const call = (pullsCreate.mock.calls[0] as unknown[])[0] as { title: string };
+    expect(call.title).toBe("Build #42 (lastlight/42)");
+  });
 });

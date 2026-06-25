@@ -17,6 +17,8 @@ import { dockerSandbox } from '../sandboxes/docker.ts';
 import { architectProfile, ARCHITECT_PROFILE_NAME } from './architect.ts';
 import { executorProfile, EXECUTOR_PROFILE_NAME } from './executor.ts';
 import { guardrailsProfile, GUARDRAILS_PROFILE_NAME } from './guardrails.ts';
+import { prAuthorProfile, PR_AUTHOR_PROFILE_NAME } from './pr-author.ts';
+import { renderPrAuthorPrompt, parsePrAuthoring } from './pr-author-prompt.ts';
 import {
   buildReviewerProfile,
   buildFixProfile,
@@ -154,6 +156,7 @@ export const buildAgent = defineAgent(() => ({
     executorProfile,
     buildReviewerProfile,
     buildFixProfile,
+    prAuthorProfile,
   ],
 }));
 
@@ -993,13 +996,67 @@ export async function runPostNotice(
 export interface OpenPrDeps {
   mintToken(run: BuildRun): Promise<string>;
   makeOctokit(token: string): Octokit;
+  /**
+   * AUTHOR the PR title + body via the LLM `pr` subagent (reading the branch's handoff
+   * artifacts + diff). Optional: when absent (tests / CLI) or when it returns `null`,
+   * the open-PR step falls back to the deterministic `renderPrTitle`/`renderPrBody`. The
+   * PR is ALWAYS opened deterministically — this only chooses who writes the text.
+   */
+  authorTitleBody?(
+    ctx: BuildRunCtx,
+    run: BuildRun,
+    ref: RepoRef,
+    octokit: Octokit,
+    token: string,
+    info: { base: string; approved: boolean },
+  ): Promise<{ title: string; body: string } | null>;
 }
 
-/** Default open-PR deps: real token mint + Octokit (deterministic API calls). */
+/**
+ * The real PR-author run: ensure the branch is checked out into the shared harness
+ * workspace (idempotent — a PR-only resume gets a fresh clone), render the prompt, and
+ * delegate to the `pr` subagent profile with READ-ONLY GitHub tools. Returns the parsed
+ * `{ title, body }`, or `null` when the agent's output is unusable (caller falls back to
+ * the deterministic render). Never opens the PR; never holds a write tool.
+ */
+async function authorPrTitleBody(
+  ctx: BuildRunCtx,
+  run: BuildRun,
+  ref: RepoRef,
+  octokit: Octokit,
+  token: string,
+  info: { base: string; approved: boolean },
+): Promise<{ title: string; body: string } | null> {
+  await ensureBuildCheckout(ctx.harness, run, token);
+  const prompt = renderPrAuthorPrompt({
+    owner: run.owner,
+    repo: run.repo,
+    issue: run.issue,
+    branch: run.branch,
+    base: info.base,
+    reviewerOpenIssues: !info.approved,
+  });
+  const text = await runPhaseTask(
+    ctx,
+    PR_AUTHOR_PROFILE_NAME,
+    'pr',
+    prompt,
+    githubReadTools(ref, octokit),
+  );
+  const { title, body } = parsePrAuthoring(text);
+  if (!title || !body) return null;
+  return { title, body };
+}
+
+/**
+ * Default open-PR deps: real token mint + Octokit (deterministic API calls) + the LLM
+ * PR-author seam.
+ */
 export function defaultOpenPrDeps(): OpenPrDeps {
   return {
     mintToken: mintRepoWriteToken,
     makeOctokit: (token) => new Octokit({ auth: token }),
+    authorTitleBody: authorPrTitleBody,
   };
 }
 
@@ -1018,7 +1075,7 @@ const PR_ARTIFACT_FILES = [
  * come from the bound run + the repo's default branch, NEVER the model.
  */
 export async function runOpenPullRequest(
-  _ctx: BuildRunCtx,
+  ctx: BuildRunCtx,
   run: BuildRun,
   deps: OpenPrDeps = defaultOpenPrDeps(),
 ): Promise<{ html_url: string; number: number }> {
@@ -1031,20 +1088,35 @@ export async function runOpenPullRequest(
   const lastVerdict = run.scratch[`verdict:${lastCycle}`] ?? '';
   const approved = /VERDICT:\s*APPROVED/i.test(lastVerdict);
 
-  const body = renderPrBody({
-    issue: run.issue,
-    branch: run.branch,
-    links: {
-      owner: run.owner,
-      repo: run.repo,
+  // The LLM `pr` subagent authors the title + body (reading the branch artifacts + diff).
+  // It is best-effort: a missing seam, an unusable output (→ null), or a thrown error
+  // falls back to the deterministic render, so a finalize NEVER fails on PR prose.
+  let authored: { title: string; body: string } | null = null;
+  if (deps.authorTitleBody) {
+    try {
+      authored = await deps.authorTitleBody(ctx, run, ref, octokit, token, { base, approved });
+    } catch (err) {
+      ctx.log.warn?.(`build pr: LLM PR authoring failed, using deterministic body: ${String(err)}`);
+    }
+  }
+
+  const title =
+    authored?.title ?? renderPrTitle(run.issue, run.branch);
+  const body =
+    authored?.body ??
+    renderPrBody({
+      issue: run.issue,
       branch: run.branch,
-      issueDir: issueDirFor(run.issue),
-      files: PR_ARTIFACT_FILES,
-    },
-    approved,
-    cycles: run.reviewerCycle,
-  });
-  const title = renderPrTitle(run.issue, run.branch);
+      links: {
+        owner: run.owner,
+        repo: run.repo,
+        branch: run.branch,
+        issueDir: issueDirFor(run.issue),
+        files: PR_ARTIFACT_FILES,
+      },
+      approved,
+      cycles: run.reviewerCycle,
+    });
 
   const pr = await openPullRequestDeterministically(octokit, ref, {
     branch: run.branch,
