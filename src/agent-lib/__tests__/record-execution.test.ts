@@ -3,6 +3,8 @@ import {
   recordExecution,
   runPhasePrompt,
   setExecutionRecorder,
+  setPhaseRetryConfig,
+  isTransientModelError,
   toExecutionRow,
   type PromptUsageResponse,
 } from '../record-execution.ts';
@@ -100,5 +102,66 @@ describe('runPhasePrompt', () => {
     const session = { prompt: async () => usage() };
     const res = await runPhasePrompt(session, 'do it', { runId: 'r', workflow: 'w', phase: 'p' });
     expect(res.text).toBe('hello');
+  });
+});
+
+describe('isTransientModelError', () => {
+  it('flags the OpenAI 500 body, 429s, 5xx status, and dropped sockets', () => {
+    expect(isTransientModelError(new Error('prompt failed: An error occurred while processing your request'))).toBe(true);
+    expect(isTransientModelError(new Error('429 Too Many Requests'))).toBe(true);
+    expect(isTransientModelError({ status: 503 })).toBe(true);
+    expect(isTransientModelError(new Error('socket hang up'))).toBe(true);
+    expect(isTransientModelError({ status: 500, message: 'x' })).toBe(true);
+  });
+
+  it('does NOT flag deterministic / client errors', () => {
+    expect(isTransientModelError(new Error('action_input_validation: bad field'))).toBe(false);
+    expect(isTransientModelError({ status: 400 })).toBe(false);
+    expect(isTransientModelError(new Error('unknown workflow "nope"'))).toBe(false);
+  });
+});
+
+describe('runPhasePrompt — transient retry', () => {
+  afterEach(() => setPhaseRetryConfig({ maxAttempts: 3, baseDelayMs: 2000, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) }));
+
+  it('retries a transient model error and succeeds on a later attempt', async () => {
+    const slept: number[] = [];
+    setPhaseRetryConfig({ maxAttempts: 3, baseDelayMs: 10, sleep: async (ms) => { slept.push(ms); } });
+    setExecutionRecorder(null);
+
+    let calls = 0;
+    const session = {
+      prompt: async () => {
+        calls++;
+        if (calls < 3) throw new Error('An error occurred while processing your request. request ID req_x');
+        return usage();
+      },
+    };
+    const res = await runPhasePrompt(session, 'synthesize', { runId: 'r', workflow: 'explore', phase: 'synthesize' });
+    expect(res.text).toBe('hello');
+    expect(calls).toBe(3);
+    expect(slept).toEqual([10, 20]); // exponential backoff
+  });
+
+  it('gives up after maxAttempts and rethrows the transient error', async () => {
+    setPhaseRetryConfig({ maxAttempts: 2, baseDelayMs: 1, sleep: async () => {} });
+    setExecutionRecorder(null);
+    let calls = 0;
+    const session = { prompt: async () => { calls++; throw new Error('503 service unavailable'); } };
+    await expect(
+      runPhasePrompt(session, 'x', { runId: 'r', workflow: 'explore', phase: 'synthesize' }),
+    ).rejects.toThrow(/service unavailable/);
+    expect(calls).toBe(2);
+  });
+
+  it('does NOT retry a non-transient error (fails fast)', async () => {
+    setPhaseRetryConfig({ maxAttempts: 3, baseDelayMs: 1, sleep: async () => {} });
+    setExecutionRecorder(null);
+    let calls = 0;
+    const session = { prompt: async () => { calls++; throw new Error('action_input_validation'); } };
+    await expect(
+      runPhasePrompt(session, 'x', { runId: 'r', workflow: 'build', phase: 'architect' }),
+    ).rejects.toThrow(/action_input_validation/);
+    expect(calls).toBe(1);
   });
 });

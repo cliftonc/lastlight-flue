@@ -125,10 +125,85 @@ export function recordExecution(rec: PhaseRecordCtx, res: PromptUsageResponse): 
   }
 }
 
+// ── Transient model-error retry ───────────────────────────────────────────────
+//
+// A long multi-phase run (build/explore can be 5+ min) must not die on a single
+// PROVIDER-SIDE blip — an OpenAI 500 ("An error occurred while processing your
+// request"), a 429 rate limit, a 503, or a dropped socket. `runPhasePrompt` is the
+// ONE seam every workflow phase funnels through (build, explore, pr-review,
+// issue-triage), so a bounded retry-with-backoff here makes ALL of them resilient.
+// We retry ONLY transient errors (never a validation / deterministic failure), capped
+// at a few attempts. Re-running a phase task is acceptable: a thrown task committed no
+// result, so re-issuing is the same recovery a re-invoke would do — minus the hard fail.
+
+/** Lower-cased substrings that mark a retryable, server-side model/provider error. */
+const TRANSIENT_SIGNATURES = [
+  'an error occurred while processing your request', // OpenAI 5xx body
+  'internal server error',
+  'service unavailable',
+  'temporarily unavailable',
+  'overloaded',
+  'rate limit',
+  'too many requests',
+  'timeout',
+  'timed out',
+  'econnreset',
+  'etimedout',
+  'enetunreach',
+  'socket hang up',
+  'fetch failed',
+  'bad gateway',
+  'gateway timeout',
+  'connection error',
+];
+
+/** Whether an error from `session.prompt` is a transient provider blip worth retrying. */
+export function isTransientModelError(err: unknown): boolean {
+  const status =
+    (err as { status?: number } | null)?.status ??
+    (err as { statusCode?: number } | null)?.statusCode;
+  if (typeof status === 'number' && (status === 408 || status === 429 || status >= 500)) {
+    return true;
+  }
+  const parts = [
+    err instanceof Error ? err.message : String(err ?? ''),
+    (err as { cause?: unknown } | null)?.cause instanceof Error
+      ? ((err as { cause: Error }).cause.message)
+      : '',
+  ]
+    .join(' ')
+    .toLowerCase();
+  return TRANSIENT_SIGNATURES.some((s) => parts.includes(s));
+}
+
+/** Retry policy for transient phase-prompt errors. `sleep` is a seam (tests pass a no-op). */
+export interface PhaseRetryConfig {
+  /** Total attempts INCLUDING the first (so 3 = 1 try + 2 retries). */
+  maxAttempts: number;
+  /** First backoff delay; doubles each retry. */
+  baseDelayMs: number;
+  /** Backoff sleep — overridable so tests don't actually wait. */
+  sleep(ms: number): Promise<void>;
+}
+
+let phaseRetryConfig: PhaseRetryConfig = {
+  maxAttempts: 3,
+  baseDelayMs: 2000,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/** Override the retry policy (tests inject a no-op `sleep` / fewer attempts). Returns prev. */
+export function setPhaseRetryConfig(patch: Partial<PhaseRetryConfig>): PhaseRetryConfig {
+  const prev = phaseRetryConfig;
+  phaseRetryConfig = { ...phaseRetryConfig, ...patch };
+  return prev;
+}
+
 /**
  * The shared phase-prompt seam: run `session.prompt(prompt, opts?)`, record its
  * usage (non-fatal), and return the full response. Workflow phases adopt this in
- * place of a bare `session.prompt` to get cost/token stats for free.
+ * place of a bare `session.prompt` to get cost/token stats for free — and a bounded
+ * retry on transient provider errors (see above), so a single 500 can't kill a run.
  */
 export async function runPhasePrompt<T extends PromptUsageResponse>(
   session: { prompt(text: string, opts?: unknown): Promise<T> },
@@ -136,7 +211,21 @@ export async function runPhasePrompt<T extends PromptUsageResponse>(
   rec: PhaseRecordCtx,
   opts?: unknown,
 ): Promise<T> {
-  const res = await session.prompt(prompt, opts);
-  recordExecution(rec, res);
-  return res;
+  const { maxAttempts, baseDelayMs, sleep } = phaseRetryConfig;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await session.prompt(prompt, opts);
+      recordExecution(rec, res);
+      return res;
+    } catch (err) {
+      if (attempt >= maxAttempts || !isTransientModelError(err)) throw err;
+      const delay = baseDelayMs * 2 ** (attempt - 1);
+      console.warn(
+        `[phase-retry] ${rec.workflow}/${rec.phase} transient model error ` +
+          `(attempt ${attempt}/${maxAttempts}, retrying in ${delay}ms): ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      await sleep(delay);
+    }
+  }
 }
