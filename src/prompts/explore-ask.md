@@ -30,6 +30,16 @@ _(no questions answered yet — this is the first round)_
 
 ## Your task
 
+{{#if !scratch.socratic.qa}}
+**This is the FIRST round, and the maintainer explicitly asked to explore
+this together — so you MUST ask at least one clarifying question now. Do NOT
+output READY on this round.** Even a fairly well-specified issue has a
+high-stakes fork, a hidden constraint, or a scope boundary worth pinning down
+before you draft. Find the most valuable one and ask it (with your
+recommended answer). READY only becomes available from the next round, once a
+question has been answered.
+
+{{/if}}
 One of two things, depending on whether you have enough signal to write a
 good spec:
 
@@ -78,6 +88,9 @@ If you discover new relevant code, **append it to
 
 ### If you DO have enough signal
 
+(Only available from the second round on — never on the first round, which
+must always ask a question.)
+
 Output the literal word `READY` on its own line at the very end of your
 message, optionally preceded by a short "I think I have enough to write
 this up — moving to draft." note. The `READY` marker ends the loop and
@@ -85,6 +98,8 @@ advances to the synthesis phase.
 
 ## Rules
 
+- On the FIRST round (no Q&A yet), NEVER output READY — always ask at least
+  one genuine clarifying question first.
 - Never ask the same question twice — check the accumulated Q&A first.
 - Ask **one** primary question per turn (plus an optional tightly-coupled
   follow-up). Never dump a list of unrelated questions.

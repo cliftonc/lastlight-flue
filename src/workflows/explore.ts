@@ -186,17 +186,26 @@ export async function runExplore(
     if (store.shouldRunPhase(run, askPhase)) {
       await reporter.insertStep(askRow(askPhase, "running"), "synthesize");
       const a = await deps.runPhase(ctx, run, askPhase);
-      questionText = a.text;
       const ready = deps.isReady(a.text);
+      // A READY round carries NO question (the agent's text is just the "moving to
+      // draft" note) — store an empty question so it never re-seeds as a Clarify row.
+      questionText = ready ? "" : a.text;
       // Record this round's question into the Socratic transcript so the next ask sees
-      // it (and the synthesize phase has the full Q&A). READY rounds carry no question.
+      // it (and the synthesize phase has the full Q&A). READY rounds add nothing.
       if (!ready) store.appendSocraticTurn(id, { question: questionText });
       store.markPhaseDone(id, askPhase, { [`question:${round}`]: clip(questionText) });
-      // READY → the round resolves; otherwise it parks awaiting the human's reply.
-      await reporter.step(askPhase, ready ? "done" : "awaiting");
-      if (ready) store.setSocraticReady(id, true);
+      if (ready) {
+        // The round asked NOTHING — render it honestly as "skipped" with a reason,
+        // NEVER a misleading "done" (which surfaced as "✅ Clarify (round N)" on the
+        // issue even though no question was ever posted). Then resolve the loop.
+        await reporter.step(askPhase, "skipped", "no clarifying question needed");
+        store.setSocraticReady(id, true);
+        run = store.get(id)!;
+        break;
+      }
+      // Not ready → the round parks awaiting the human's reply.
+      await reporter.step(askPhase, "awaiting");
       run = store.get(id)!;
-      if (ready) break;
     } else {
       questionText = run.scratch[`question:${round}`] ?? "";
       if (run.socratic.ready) break;

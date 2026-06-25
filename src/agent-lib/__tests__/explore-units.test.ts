@@ -16,6 +16,7 @@ import {
   type PublishRef,
 } from "../../explore-publish.ts";
 import { renderReplyGateComment, postReplyGateQuestion } from "../../explore-github-post.ts";
+import { buildExploreModel } from "../explore-notify.ts";
 
 // Phase 5 — explore UNIT tests (offline): prompt untrusted-wrapping, web-tool gating,
 // deterministic publish (bound ref + dedup + security), reply-gate post.
@@ -91,6 +92,21 @@ describe("explore prompts — untrusted wrapping (security)", () => {
     });
     expect(out).toContain("no questions answered yet");
     expect(out).not.toContain(UNTRUSTED_OPEN); // nothing untrusted to wrap yet
+    // The first round MUST ask — READY is forbidden until a question is answered.
+    expect(out).toContain("MUST ask at least one clarifying question");
+    expect(out).toContain("output READY on this round");
+  });
+
+  it("omits the mandatory-first-question gate once a Q&A round has happened", () => {
+    const out = renderExploreAskPrompt({
+      ...REF,
+      issueNumber: 7,
+      triggerId: "t",
+      iteration: 2,
+      maxIterations: 8,
+      socraticQa: "Q: which endpoints?\nA: just /v1",
+    });
+    expect(out).not.toContain("MUST ask at least one clarifying question");
   });
 
   it("exploreIssueDir uses issue-N for GitHub and a slug for Slack origins", () => {
@@ -122,6 +138,43 @@ describe("explore — READY marker detection", () => {
   it("does NOT fire on the word 'ready' in prose", () => {
     expect(isReadyMarker("I'm not ready to answer that yet.")).toBe(false);
     expect(isReadyMarker("Q: are you READY for this design?")).toBe(false);
+  });
+});
+
+describe("explore resume re-seed — only rounds that actually asked re-attach", () => {
+  const base = {
+    id: "github:v1:owner:cliftonc:repo:lastlight:issue:129",
+    owner: "cliftonc",
+    repo: "lastlight",
+    issue: 129,
+    triggerId: "t",
+    conversationKey: null,
+    socratic: { qa: "", ready: true },
+    socraticIter: 0,
+    pendingGate: null,
+    restartCount: 0,
+    status: "active" as const,
+    failReason: null,
+  };
+
+  it("re-seeds a Clarify row for a round that asked a question", () => {
+    const run = {
+      ...base,
+      phasesDone: { read: true, "ask:0": true } as Record<string, true>,
+      scratch: { "question:0": "Token bucket or sliding window?" },
+    };
+    const labels = buildExploreModel(run).steps.map((s) => s.label);
+    expect(labels).toContain("Clarify (round 1)");
+  });
+
+  it("does NOT re-seed a Clarify row for a READY round that asked nothing", () => {
+    const run = {
+      ...base,
+      phasesDone: { read: true, "ask:0": true } as Record<string, true>,
+      scratch: { "question:0": "" }, // READY round stores an empty question
+    };
+    const labels = buildExploreModel(run).steps.map((s) => s.label);
+    expect(labels).not.toContain("Clarify (round 1)");
   });
 });
 

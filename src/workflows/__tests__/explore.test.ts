@@ -339,7 +339,8 @@ describe("explore — Phase 8 progress reporter wiring", () => {
       "step:read:running",
       "step:read:done",
       "insert:ask:0:running",
-      "step:ask:0:done",
+      // A READY round asked nothing → honest "skipped", never a misleading "done".
+      "step:ask:0:skipped",
       "step:synthesize:running",
       "step:synthesize:done",
       "step:publish:running",

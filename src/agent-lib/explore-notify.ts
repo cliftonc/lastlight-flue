@@ -27,10 +27,13 @@ export function askRow(phase: string, status: StepStatus): ProgressStep {
   return { key: phase, label: round ? `Clarify (round ${round})` : phase, status };
 }
 
-/** The `ask:N` phase keys present in a run's `phasesDone`, in round order. */
+/** The `ask:N` phase keys present in a run's `phasesDone`, in round order — but ONLY
+ * the rounds that ACTUALLY asked a question. A READY round stores an empty
+ * `question:<round>` and must NOT re-seed as a misleading "Clarify (round N)" row. */
 function doneAskPhases(run: ExploreRun): string[] {
   return Object.keys(run.phasesDone)
     .filter((k) => /^ask:\d+$/.test(k))
+    .filter((k) => (run.scratch[`question:${k.split(":")[1]}`] ?? "").trim() !== "")
     .sort((a, b) => Number(a.split(":")[1]) - Number(b.split(":")[1]));
 }
 
