@@ -46,5 +46,11 @@ export async function invokeFlueRun(
   // callers (crons/resume), so their offline tests never drag it in. See workflow-registry.
   const { resolveWorkflow } = await import('./workflow-registry.ts');
   const def = resolveWorkflow(workflow);
-  return (invoke as InvokeFn)(def, { input });
+  // SERIALIZATION PARITY with the old cross-process path: `flue run --input <JSON>` round-
+  // tripped the payload through `JSON.stringify`, which SILENTLY DROPS `undefined` fields
+  // (e.g. an optional `reopened`/`branch` a router leaves unset). In-process `invoke()`
+  // instead asserts STRICT JSON and THROWS on any `undefined`. Replicate the old strip with
+  // a JSON round-trip so existing router payloads stay valid.
+  const normalizedInput = JSON.parse(JSON.stringify(input ?? null));
+  return (invoke as InvokeFn)(def, { input: normalizedInput });
 }

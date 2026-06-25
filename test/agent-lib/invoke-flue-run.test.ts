@@ -35,6 +35,21 @@ describe('invokeFlueRun', () => {
     expect(receipt).toEqual({ runId: 'run-123' });
   });
 
+  it('strips undefined fields from input (JSON parity with the old spawn path)', async () => {
+    const fakeDef = { __wf: 'issue-comment' };
+    resolveWorkflowMock.mockReturnValue(fakeDef);
+    invokeMock.mockResolvedValue({ runId: 'r' });
+
+    await invokeFlueRun('issue-comment', {
+      a: 1,
+      reopened: undefined,
+      nested: { b: undefined, c: 2 },
+    });
+
+    // `reopened` and `nested.b` (both undefined) are dropped, matching JSON.stringify.
+    expect(invokeMock).toHaveBeenCalledWith(fakeDef, { input: { a: 1, nested: { c: 2 } } });
+  });
+
   it('propagates an unknown-workflow error from the registry and never calls invoke', async () => {
     resolveWorkflowMock.mockImplementation((name: string) => {
       throw new Error(`invokeFlueRun: unknown workflow "${name}" (known: build)`);
